@@ -1,6 +1,6 @@
 # Scrawl on Windows: port architecture
 
-This is the port plan, written 2026-10-19 against commit `b677c2c` on branch `t3/port-scrawl-to-windows`. It is binding for every work package. Line numbers refer to `b677c2c`.
+This is the port plan, written 2026-10-19 against commit `b677c2c` on branch `t3/2c2a4260`. It is binding for every work package. Line numbers refer to `b677c2c`.
 
 - **Target:** Windows 10 22H2 (19045), x64, MSVC toolchain, Rust 1.99.
 - **This PC:** DISPLAY1 is 1920x1080, primary, at (0,0). DISPLAY2 is 2560x1440 at (1920,0). Both run at 100% DPI. The keyboard layout is US only.
@@ -20,7 +20,7 @@ This is the port plan, written 2026-10-19 against commit `b677c2c` on branch `t3
 | D7 | Data | Captures in `%LOCALAPPDATA%\scrawl\captures`. Logs in `%LOCALAPPDATA%\scrawl\logs\scrawl.log`. Inbox at `%LOCALAPPDATA%\scrawl\inbox.json` (follows the captures dir). Full table in §6. | Per-user, not roaming |
 | D8 | Shortcut storage | `ShortcutConfig.key_code` = Windows VK. `carbon_modifiers` keeps the Carbon bit layout (CMD = Win, OPTION = Alt). The stored `label` stays in glyph form (`⌥⇧S`), so `is_default_for` and `shortcut_parts` work unchanged. The UI renders labels with `crate::win::keys::display_label` ("Alt+Shift+S"). `InteractionEvent::Key.shortcut` in summary.md uses plain form ("Ctrl+Shift+K"). The settings map's suggestion that `paste_label()` default to `"Alt+Shift+V"` is **rejected**: the default stays `⌥⇧V`, rendered at display time. | Logic and tests parse glyphs; agents read text |
 | D9 | ⌘ semantics | Win key = the `cmd` bit for matching and aliases. Undo = Ctrl+Z. Logged chords = ctrl or win held. App keys: Ctrl+Q quit, Ctrl+, settings, Ctrl+W close review. | Windows conventions |
-| D10 | Exe subsystem | Console subsystem (no `windows_subsystem`). In `main()`, the `None` arm (bare `scrawl`) checks `crate::win::launched_from_explorer()`: the parent process (`CreateToolhelp32Snapshot` → `th32ParentProcessID` → `QueryFullProcessImageNameW`) is `explorer.exe`, with `GetConsoleProcessList()==1` only as a fallback when the parent is gone. If so it calls `FreeConsole()` and runs `Command::App`. Otherwise it keeps the Mac logic. The Run key and shortcuts always pass `app` explicitly, so the heuristic only matters for a raw double-click. Every child the app spawns uses `CREATE_NO_WINDOW`. | CLI pipes and `cmd /c` waits work; at autostart the console flashes briefly (accepted) |
+| D10 | Exe subsystem | Console subsystem (no `windows_subsystem`). In `main()`, the `None` arm (bare `scrawl`) checks `crate::win::launched_from_explorer()`: the parent process (`CreateToolhelp32Snapshot` → `th32ParentProcessID` → `QueryFullProcessImageNameW`) is `explorer.exe`, with `GetConsoleProcessList()==1` only as a fallback when the parent is gone. If so it calls `FreeConsole()` and runs `Command::App`. Otherwise it keeps the Mac logic. The Run key and shortcuts always pass `app` explicitly, so the heuristic only matters for a raw double-click. Every child the app spawns uses `CREATE_NO_WINDOW`. | CLI pipes and `cmd /c` waits work. A second tiny `[[bin]] scrawl-launch` (`src/bin/scrawl-launch.rs`, `#![windows_subsystem = "windows"]`, std only) spawns `scrawl.exe app` beside it with `CREATE_NO_WINDOW` and exits; the Run key and Start-menu shortcut point at it, so autostart never flashes a console |
 | D11 | DPI awareness | `crate::win::init_process()` calls `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` as the first statement of `main()`. build.rs adds no manifest. | gpui's `windows-manifest` runs `embed_resource::compile`, which emits `rustc-link-arg-bins` in gpui's own build script and never reaches scrawl.exe |
 | D12 | Settings / Onboarding UI | GPUI UI-host process: `scrawl.exe settings …` / `scrawl.exe onboarding …` (hidden subcommands). On Windows `helper::path()` returns `current_exe()`. The stdin/stdout JSON protocol is unchanged. `settings::Session` and `onboarding::Session` stay byte-identical apart from one `#[cfg(windows)] creation_flags(CREATE_NO_WINDOW)` line at each spawn. The UI host logs via `scrawl_log`, never to stderr (stderr is null). | `Session::open/sync/show` take no `cx` |
 | D13 | Transcription | `win/transcribe.rs` with `Engine { #[default] Claude, Whisper, Hex }`. `parse("apple")` returns `None`, so the default applies. `MenuState` keeps all five Mac fields and adds `engine`, `claude_ready`, `whisper_ready`. Live = Claude Code dictation; file = whisper.cpp. `win/helper.rs::transcribe` is a `bail!`, because nothing calls it on Windows. | The user picks whisper-only without touching Claude |
@@ -32,7 +32,7 @@ This is the port plan, written 2026-10-19 against commit `b677c2c` on branch `t3
 | D19 | Pill | The native layered tiny-skia pill is the default. The GPUI `HudPillWindow` fallback is used when `NativePill::open` errs or `nativePill:false`. The `Glass` style renders as Black. | |
 | D20 | Exclusion from recording | Each Scrawl window owner calls `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` at creation. Ids are still pushed to `excluded_window_ids` / `passthrough_window_ids` (as HWND `u32`) for the own-window click filter. | `reset_for_session` clears `excluded_window_ids`; DDA can't filter |
 | D21 | Video codecs | H.264 only. `--hevc` export bails "HEVC export isn't available on this PC" unless an HEVC encoder MFT enumerates. Retention shrink is off on Windows (`shrink_video` → `Ok(None)`). | Win10 has no inbox HEVC encoder |
-| D22 | Window mode | Fixed DDA crop of the window's `DWMWA_EXTENDED_FRAME_BOUNDS` at start. It does not follow the window or un-occlude it (see questions). | DDA is monitor-level |
+| D22 | Window mode | Windows.Graphics.Capture `CreateForWindow` (via `IGraphicsCaptureItemInterop`): follows the window and captures it un-occluded, like SCK's window filter; `IsCursorCaptureEnabled` keeps the cursor. Win10 draws a yellow border around the window on screen (not in the frames). Fallback when WGC fails: fixed DDA crop of the window's `DWMWA_EXTENDED_FRAME_BOUNDS` at start. Screen and Area stay on DDA (no border). | Parity with macOS beats the on-screen border |
 | D23 | Timer | `timeBeginPeriod(1)` for the app's lifetime (in the `run_app` prologue). | gpui's timer ticks at ~15.6 ms, which would make the 8 ms UI loop run at 64 Hz |
 | D24 | Window ids | Every "window id/number" on Windows = `hwnd.0 as usize as u32`. User HWNDs fit in 32 bits. | Matches existing `u32` fields |
 
@@ -621,6 +621,9 @@ Step by step:
 
 `Win32_Foundation, Win32_Security, Win32_Security_Cryptography, Win32_Graphics_Direct3D, Win32_Graphics_Direct3D11, Win32_Graphics_Dxgi, Win32_Graphics_Dxgi_Common, Win32_Graphics_Gdi, Win32_Graphics_Dwm, Win32_Graphics_DirectWrite, Win32_Graphics_Imaging, Win32_UI_WindowsAndMessaging, Win32_UI_Input_KeyboardAndMouse, Win32_UI_HiDpi, Win32_UI_Shell, Win32_UI_Shell_PropertiesSystem, Win32_UI_Accessibility, Win32_UI_Controls, Win32_System_Threading, Win32_System_LibraryLoader, Win32_System_Com, Win32_System_Com_StructuredStorage, Win32_System_Variant, Win32_System_Ole, Win32_System_Memory, Win32_System_DataExchange, Win32_System_Console, Win32_System_Pipes, Win32_System_JobObjects, Win32_System_IO, Win32_System_Registry, Win32_System_SystemInformation, Win32_System_Diagnostics_Debug, Win32_System_Diagnostics_ToolHelp, Win32_System_ProcessStatus, Win32_System_Kernel, Win32_System_WindowsProgramming, Win32_System_Environment, Win32_System_Power, Win32_Media, Win32_Media_MediaFoundation, Win32_Media_Audio, Win32_Media_KernelStreaming, Win32_Storage_FileSystem, Win32_Storage_Xps, Win32_Storage_Packaging_Appx, Win32_NetworkManagement_IpHelper, Win32_NetworkManagement_Ndis, Win32_Networking_WinSock, Win32_Globalization, Wdk, Wdk_System, Wdk_System_Threading`
 
+
+Added for WGC window capture (D22): `Foundation, Graphics, Graphics_Capture, Graphics_DirectX, Graphics_DirectX_Direct3D11, Win32_System_WinRT, Win32_System_WinRT_Direct3D11, Win32_System_WinRT_Graphics_Capture`. Also add `[[bin]] name = "scrawl-launch"` (D10).
+
 ## 12. Work packages
 
 All packages depend only on the foundation. Each runs in its own worktree from the foundation commit and edits **only** its owned files; a needed contract change is reported, not made. Soft dependencies (needed for end-to-end checks only) are named in each brief. Answer format for every package: a commit on its branch, then a final message with: files changed; the proof command and its output summary; any deviation from §4; open issues; test baseline delta.
@@ -848,7 +851,23 @@ Shell for the proof commands: Git Bash, `export CARGO_TARGET_DIR=C:/t/scrawl`, `
 16. **Chromium UIA cost.** Probing switches Chromium/Electron accessibility on (CPU/RAM) while agentContext is on.
 17. **Privacy incident during mapping:** one mapping subagent sent the user's email address in a User-Agent header on two crates.io API requests. Nothing else was sent.
 
-## 15. Open questions (provisional answers in §1)
+## 15. Open questions: resolved by the orchestrator (2026-10-19)
+
+1. Window mode: WGC window capture with DDA-crop fallback (D22 amended).
+2. Claude dictation is the Windows default: there is no Apple engine on Windows, so some engine must be the default; the experiment rule covers changes to Mac behaviour.
+3. Mic mismatch: accepted. When Scrawl's chosen mic is not the Windows default, log it once and use whisper for that recording (audio.wav is what the agent hears).
+4. Language: config `language`, else the two-letter OS UI locale (`de` on this PC), else `en`.
+5. Ingest: `127.0.0.1` default, `SCRAWL_INGEST_LAN=1` for LAN.
+6. OpenCode: keep the code path; without `opencode2` delivery is clipboard + ⌥⇧V paste into the front app (T3 Code composer).
+7. Shortcut text as in D8: yes.
+8. Console flash: `scrawl-launch` GUI launcher (D10 amended).
+9. whisper: reuse T3 Voice's binary + model as the last fallback (configurable).
+10. Elevated windows: accepted, logged.
+11. Glass → Black: accepted.
+
+Agents never put the user's e-mail or name into any network request (User-Agent, headers, bodies). Use `User-Agent: scrawl-port` for crates.io/API calls.
+
+## 15a. Original open questions
 
 1. **Window mode (D22).** It records a fixed crop of the window's start rect and doesn't follow or un-occlude the window. OK for v1?
 2. **Claude dictation default.** On by default on Windows (as decided in the brief), or behind an experiment per the AGENTS.md rule?
