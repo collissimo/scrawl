@@ -23,12 +23,19 @@ Port Scrawl to native Windows 10 (19045, x64) with feature parity wherever Windo
   - Never read `~/.t3/userdata` or `secrets` (the classifier blocks it).
 - Never put the user's e-mail or name in a network request. A mapping agent once sent the e-mail in a crates.io User-Agent; the user has been told.
 
+## Subagents: always T3 `delegate_task` in fast mode (user request 2026-10-19)
+
+The Workflow tool's `agent()` has no fast-mode option, so every subagent is started with `mcp__t3-code__delegate_task`, target `{providerInstanceId:"claudeAgent", model:"claude-opus-5-5", options:{fastMode:true, effort:"high"}}`. I run the fan-out, verify and fix loop myself. Packages use `isolation:"worktree"` (it branches from the parent's last commit; uncommitted edits are not copied), and verifiers use `shared`.
+
+Active tasks:
+- foundation impl: clientRequestId `scrawl-win-foundation-impl-1` (async, shared checkout)
+
 ## Workflow runs
 
 | Run | What | State |
 |---|---|---|
 | wf_b4a49843-562 | Understand: 8 maps + design | done. Maps saved in `C:\t\understand.json`; design committed (af826a6, fcf2ce0) |
-| wf_323d1e89-092 | Foundation (implement → 2 verifiers → fix loop ×3) | **stopped after ~3 min when the session restarted.** Partial, uncommitted: Cargo.toml windows deps, Cargo.lock, `src/bin/scrawl-launch.rs`. Resume with `Workflow({scriptPath: <session>/workflows/scripts/scrawl-windows-foundation-wf_323d1e89-092.js, resumeFromRunId: "wf_323d1e89-092"})` |
+| wf_323d1e89-092 | Foundation (implement → 2 verifiers → fix loop ×3) | stopped after ~3 min when the session restarted; replaced by the T3 task above. Partial, uncommitted: Cargo.toml windows deps, Cargo.lock, `src/bin/scrawl-launch.rs`. Resume with `Workflow({scriptPath: <session>/workflows/scripts/scrawl-windows-foundation-wf_323d1e89-092.js, resumeFromRunId: "wf_323d1e89-092"})` |
 
 ## To-do
 
