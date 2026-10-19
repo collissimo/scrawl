@@ -37,6 +37,20 @@ Active tasks:
 | wf_b4a49843-562 | Understand: 8 maps + design | done. Maps saved in `C:\t\understand.json`; design committed (af826a6, fcf2ce0) |
 | wf_323d1e89-092 | Foundation (implement → 2 verifiers → fix loop ×3) | stopped after ~3 min when the session restarted; replaced by the T3 task above. Partial, uncommitted: Cargo.toml windows deps, Cargo.lock, `src/bin/scrawl-launch.rs`. Resume with `Workflow({scriptPath: <session>/workflows/scripts/scrawl-windows-foundation-wf_323d1e89-092.js, resumeFromRunId: "wf_323d1e89-092"})` |
 
+## Test fixtures
+
+- `C:/t/fixtures/speech-de.wav` (Hedda, ~9 s) and `speech-en.wav` (Zira): 16 kHz mono, rendered with SAPI and never played aloud.
+- `whisper-cli.exe` in `~/.t3/projects/t3-voice/vendor/whisper-cpu/Release` works.
+  - Command: `-m ggml-large-v3-turbo.bin -f X.wav -l de -t 8 -ml 1 -sow -oj -np -of <prefix>`.
+  - Takes 10.4 s for 9 s of audio on the CPU.
+  - The JSON `transcription[]` has `offsets{from,to}` in ms, one word each. The first entry's text is empty: drop it.
+
+## Package-phase rules (to add to every package brief)
+
+- No global input injection (SendInput or simulated hotkeys) and no `scrawl app` while packages run in parallel on Collin's desktop. Interactive checks happen in the sequential integration phase.
+- P1 override: D22 was amended, so use WGC for Window mode. The §12 "ruled out: WGC" line is stale.
+- Each package gets its own target dir `C:/t/scrawl-pN`, seeded by copying `C:/t/scrawl` after the foundation build.
+
 ## To-do
 
 - [x] Toolchain, GPUI probe, fork
