@@ -1379,7 +1379,7 @@ impl Host for AppHost<'_> {
 pub fn transcription_changed() {
     crate::speech_model::ensure();
     #[cfg(target_os = "windows")]
-    if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Claude {
+    if crate::win::claude_dictation::wanted() {
         crate::win::claude_dictation::warm();
     }
 }

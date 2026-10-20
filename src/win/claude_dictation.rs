@@ -165,7 +165,14 @@ fn remove_stale_files(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let stale = match file_pid(&name.to_string_lossy()) {
-            Some(None) => true,
+            // The old shared names have no owner to ask: an older Scrawl running beside this
+            // one may still use them, so they go only once a day old.
+            Some(None) => entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(24 * 60 * 60)),
             Some(Some(pid)) => pid != own && !process_running(pid),
             None => false,
         };
@@ -352,7 +359,7 @@ impl Session {
     /// Starts holding the dictation key and returns once Claude Code is listening. `on_hearing`
     /// runs the moment it is (to note how much of the recording it missed) and returns false
     /// when that was too late (the recording had already stopped). `give_up` ends the wait
-    /// early. Any failure leaves the session broken: dictation may still start a moment later.
+    /// early; the prompt is then emptied. Any other failure leaves the session broken.
     pub fn begin(&self, give_up: &AtomicBool, mut on_hearing: impl FnMut() -> bool) -> Result<()> {
         self.wait_editor_back();
         self.holding.store(true, Ordering::Release);
@@ -369,10 +376,19 @@ impl Session {
             std::thread::sleep(Duration::from_millis(20));
         }
         self.holding.store(false, Ordering::Release);
-        self.broken.store(true, Ordering::Release);
         if late || give_up.load(Ordering::Acquire) {
+            // Nothing of this recording is wanted: throw away a dictation the key started
+            // anyway, let the screen settle and empty the prompt, so the session can serve the
+            // next recording. Only a failure there leaves it broken.
+            let _ = self.write(ESC);
+            let cleared = self.wait_settled(SETTLE_TIMEOUT).is_ok()
+                && self.capture(CAPTURE_TIMEOUT).is_ok();
+            if !cleared {
+                self.broken.store(true, Ordering::Release);
+            }
             bail!("the recording ended before Claude Code was listening");
         }
+        self.broken.store(true, Ordering::Release);
         bail!(
             self.state()
                 .error
@@ -385,15 +401,13 @@ impl Session {
     /// leaves the session broken.
     pub fn end(&self) -> Result<String> {
         self.holding.store(false, Ordering::Release);
-        self.wait_settled(SETTLE_TIMEOUT)
+        // The error is read before Ctrl+G: the editor's placeholder then hides the footer.
+        let error = self
+            .wait_settled(SETTLE_TIMEOUT)
             .inspect_err(|_| self.broken.store(true, Ordering::Release))?;
         let text = self.capture(CAPTURE_TIMEOUT)?.trim().to_owned();
         if text.is_empty() {
-            bail!(
-                self.state()
-                    .error
-                    .unwrap_or_else(|| "No speech detected".into())
-            );
+            bail!(error.unwrap_or_else(|| "No speech detected".into()));
         }
         Ok(text)
     }
@@ -411,12 +425,14 @@ impl Session {
         self.clear_prompt();
     }
 
-    fn wait_settled(&self, timeout: Duration) -> Result<()> {
+    /// Waits for the screen to settle; returns the dictation error showing then, if any.
+    fn wait_settled(&self, timeout: Duration) -> Result<Option<String>> {
         let started = Instant::now();
         let mut settle = Settle::new(started);
         while started.elapsed() < timeout {
-            if settle.observe(&self.rows(), Instant::now()) {
-                return Ok(());
+            let rows = self.rows();
+            if settle.observe(&rows, Instant::now()) {
+                return Ok(State::of(&rows).error);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -580,8 +596,12 @@ fn pool() -> std::sync::MutexGuard<'static, Slot> {
     POOL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn wanted() -> bool {
-    crate::transcribe::Engine::preferred() == crate::transcribe::Engine::Claude && available()
+/// Whether recordings use Claude Code dictation now, so a session is worth keeping warm: the
+/// engine, `claude` on PATH, and no reason to skip it (`skip_reason`).
+pub fn wanted() -> bool {
+    crate::transcribe::Engine::preferred() == crate::transcribe::Engine::Claude
+        && available()
+        && skip_reason().is_none()
 }
 
 /// Starts a session in the background unless one is ready or starting.
@@ -703,17 +723,24 @@ fn acquire(give_up: &AtomicBool) -> Result<Session> {
                 warm();
                 slot = pool();
             }
-            Slot::InUse => {
-                *slot = Slot::InUse;
-                bail!("the Claude Code session is busy with another recording");
-            }
-            Slot::Starting => {
-                *slot = Slot::Starting;
+            // Starting, or still finishing the last recording (a discard or a no-speech stop
+            // returns before the session has emptied its prompt): wait for it.
+            busy @ (Slot::Starting | Slot::InUse) => {
+                let starting = matches!(busy, Slot::Starting);
+                *slot = busy;
                 if give_up.load(Ordering::Acquire) {
-                    bail!("the recording ended before the Claude Code session was ready");
+                    bail!(if starting {
+                        "the recording ended before the Claude Code session was ready"
+                    } else {
+                        "the recording ended while the Claude Code session was busy with the last one"
+                    });
                 }
                 if Instant::now() > deadline {
-                    bail!("the Claude Code session took too long to start");
+                    bail!(if starting {
+                        "the Claude Code session took too long to start"
+                    } else {
+                        "the Claude Code session is busy with another recording"
+                    });
                 }
                 slot = CHANGED
                     .wait_timeout(slot, Duration::from_millis(100))
@@ -870,9 +897,7 @@ fn dictate(
     released: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<Heard> {
-    if let Some(reason) = unsupported_language(&crate::handoff::transcription_language())
-        .or_else(other_microphone)
-    {
+    if let Some(reason) = skip_reason() {
         static LOGGED: Mutex<Option<String>> = Mutex::new(None);
         let mut logged = LOGGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if logged.as_deref() != Some(reason.as_str()) {
@@ -932,6 +957,11 @@ impl std::fmt::Display for Skipped {
 }
 
 impl std::error::Error for Skipped {}
+
+/// Why this recording can't use Claude Code dictation, if it can't.
+fn skip_reason() -> Option<String> {
+    unsupported_language(&crate::handoff::transcription_language()).or_else(other_microphone)
+}
 
 /// Why Claude Code can't dictate `language`, if it can't: it would dictate English instead
 /// (Settings and the tray grey the choice out, but a hand-edited config can still pick it).
