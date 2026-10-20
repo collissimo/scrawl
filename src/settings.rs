@@ -1369,11 +1369,18 @@ impl Host for AppHost<'_> {
     }
 
     fn transcription_changed(&mut self) {
-        crate::speech_model::ensure();
-        #[cfg(target_os = "windows")]
-        if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Claude {
-            crate::win::claude_dictation::warm();
-        }
+        transcription_changed();
+    }
+}
+
+/// After the transcriber or the language changed (Settings, the tray): fetches the speech model
+/// for it now, and starts Claude Code's session when it's the engine, so the next recording
+/// doesn't wait for either.
+pub fn transcription_changed() {
+    crate::speech_model::ensure();
+    #[cfg(target_os = "windows")]
+    if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Claude {
+        crate::win::claude_dictation::warm();
     }
 }
 
