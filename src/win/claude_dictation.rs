@@ -130,6 +130,10 @@ impl Session {
             serde_json::json!({
                 "voice": {"enabled": true, "mode": "hold", "autoSubmit": false},
                 "language": language,
+                // The fullscreen renderer never finishes starting in a pseudo console (it asks
+                // the terminal questions conhost doesn't answer), and a failed start makes the
+                // user's own next `claude` fall back to the classic renderer.
+                "tui": "default",
             })
             .to_string(),
         )
@@ -488,11 +492,7 @@ pub fn watch() {
         .spawn(|| {
             loop {
                 if wanted() {
-                    let failed_recently = LAST_FAILURE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_some_and(|at| at.elapsed() < RETRY_AFTER);
-                    if !failed_recently {
+                    if !failed_recently() {
                         warm();
                     }
                 } else {
@@ -503,7 +503,8 @@ pub fn watch() {
         });
 }
 
-/// The warm session, else a new one (waiting for one that is starting). `give_up` ends the wait.
+/// The warm session, else one started in the background and waited for. `give_up` (the
+/// recording ended) stops the wait at once; the session goes on starting for the next one.
 fn acquire(give_up: &AtomicBool) -> Result<Session> {
     let deadline = Instant::now() + START_TIMEOUT + Duration::from_secs(5);
     let language = crate::handoff::transcription_language();
@@ -515,17 +516,12 @@ fn acquire(give_up: &AtomicBool) -> Result<Session> {
                 return Ok(session);
             }
             Slot::Ready(_) | Slot::Empty => {
-                *slot = Slot::InUse;
-                drop(slot);
-                let started = Session::start(&language);
-                if started.is_err() {
-                    let mut slot = pool();
-                    if matches!(&*slot, Slot::InUse) {
-                        *slot = Slot::Empty;
-                    }
-                    CHANGED.notify_all();
+                if failed_recently() {
+                    bail!("the Claude Code session failed to start less than a minute ago");
                 }
-                return started;
+                drop(slot);
+                warm();
+                slot = pool();
             }
             Slot::InUse => {
                 *slot = Slot::InUse;
@@ -546,6 +542,13 @@ fn acquire(give_up: &AtomicBool) -> Result<Session> {
             }
         }
     }
+}
+
+fn failed_recently() -> bool {
+    LAST_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|at| at.elapsed() < RETRY_AFTER)
 }
 
 /// Puts a session back for the next recording; a dead one is replaced, and one no longer
