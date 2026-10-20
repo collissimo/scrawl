@@ -29,11 +29,24 @@ Upstream `kitlangton/scrawl` main ships native Windows support. Hona's PR #3 was
 - Fixtures: `C:/t/fixtures/speech-de.wav` and `speech-en.wav` (SAPI, 16 kHz mono, never played aloud).
 - Subagents: T3 `delegate_task`, `claudeAgent` / `claude-opus-5-5`, options `{fastMode:true}`. Keep tasks small and commit often: one 15-minute monolithic agent lost the night to a DNS outage.
 
+## Active subagents (T3 delegate_task, fastMode, isolation worktree), started 2026-10-20 ~17:00
+
+Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own target dir `C:/t/scrawl-<id>`.
+
+- A: German file transcription (Parakeet TDT v3), clientRequestId `scrawl-win-A-german-1`
+- B: Claude Code dictation engine, clientRequestId `scrawl-win-B-claude-1`
+- C: Windows video export, clientRequestId `scrawl-win-C-export-1`
+
+Stopped agents from the old plan are obsolete and must not be resumed: T3 "Scrawl Windows: foundation commit" and the workflow "foundation".
+
+Build: `cmd //c 'C:	\cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and Ninja, because the VS 18 generator isn't found. If cmake complains "generator does not match", delete `<target>/debug/build/transcribe-cpp-sys-*/out/build`.
+
 ## To-do
 
 - [x] Confirm the official zip runs here.
-- [ ] Build `origin/main` from source on this PC (CMake), run cargo test.
-- [ ] Check transcribe.cpp for Parakeet v3 / German.
+- [x] Build `origin/main` from source (1m48s): 312 tests pass, 0 fail.
+- [x] `language` config + `handoff::transcription_language()` (commit 5162612).
+- [x] transcribe.cpp supports Parakeet/Whisper; HF has `handy-computer/parakeet-tdt-0.6b-v3-gguf` (multilingual) → task A
 - [ ] Engine: Claude dictation (live) + German file fallback. Tests. A real check needs Collin's voice.
 - [ ] Video export via Media Foundation.
 - [ ] Real-use checks: app, tray, Alt+Shift+S, ink, paste, review window; fix what breaks.
