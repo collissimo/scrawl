@@ -66,10 +66,13 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] Build `origin/main` from source (1m48s): 312 tests pass, 0 fail.
 - [x] `language` config + `handoff::transcription_language()` (commit 5162612).
 - [x] transcribe.cpp supports Parakeet/Whisper; HF has `handy-computer/parakeet-tdt-0.6b-v3-gguf` (multilingual) → task A
-- [x] Engine: Claude dictation (live) + German file fallback (tasks A+B). [ ] Real voice test by Collin.
+- [x] Engine: Claude dictation (live) + German file fallback (tasks A+B). [x] Collin's real voice test (2026-10-20): 25 s of German, text correct, 5 keyframes, ink fine. Drift: "Follow-Knopf" landed under #4, though it was circled in #3, because word times are estimated.
 - [x] Video export via Media Foundation (task C).
 - [ ] Real-use checks: app, tray, Alt+Shift+S, ink, paste, review window; fix what breaks.
-- [ ] Push to `fork`, open a PR against collissimo/scrawl main, link it in T3, report in German.
+- [x] PR https://github.com/collissimo/scrawl/pull/1, linked in T3. Merge only after Collin approves.
+- [ ] Bring the fork's `main` up to upstream main (a7d44aa → 6449367, fast-forward), so the PR shows only our 42 commits. This needs Collin's OK: it is a push to the default branch.
+- [ ] Collin tests Alt+Shift+V (pastes the image and the text), and whether the Settings Language menu scrolls.
+- [ ] Possible improvement, if Collin wants it: run Parakeet alongside Claude and align Claude's text to Parakeet's measured word times (fixes the keyframe drift).
 
 ## Lessons
 
