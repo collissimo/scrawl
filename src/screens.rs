@@ -150,8 +150,12 @@ pub fn pill_origin(screen: &Screen, width: f64, panel_y: f64) -> [f64; 2] {
     ]
 }
 
+#[cfg(windows)]
+pub use crate::win::screens::{current, displays};
+
 /// Every active display from CoreGraphics (any thread). `visible` is the whole frame and
 /// `safe_top` 0: only `NSScreen` knows the menu bar and the notch (`current`).
+#[cfg(target_os = "macos")]
 pub fn displays() -> Vec<Screen> {
     use core_graphics::display::CGDisplay;
     let ids = CGDisplay::active_displays().unwrap_or_default();
@@ -188,6 +192,7 @@ pub fn displays() -> Vec<Screen> {
 
 /// Every screen with its menu bar, Dock and notch, from `NSScreen` (main thread only; falls
 /// back to `displays` elsewhere).
+#[cfg(target_os = "macos")]
 pub fn current() -> Vec<Screen> {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSScreen;
