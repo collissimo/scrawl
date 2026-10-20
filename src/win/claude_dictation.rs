@@ -1246,6 +1246,54 @@ mod tests {
         assert!(cancelled.load(Ordering::Acquire) && released.load(Ordering::Acquire));
     }
 
+    /// How long finishing takes on a real recording with Parakeet installed, with a stand-in
+    /// Claude Code that answers 1.1 s after the stop (as the real one does), once with text and
+    /// once failing. Run with `SCRAWL_CONFIG` naming `"language"`, `SCRAWL_MODELS_DIR` and
+    /// `SCRAWL_TIMING_WAV` (a 16 kHz mono WAV) set, `-- --ignored --nocapture finish_timings`.
+    #[test]
+    #[ignore]
+    fn finish_timings() {
+        let wav = PathBuf::from(std::env::var_os("SCRAWL_TIMING_WAV").expect("SCRAWL_TIMING_WAV"));
+        let bytes = std::fs::read(&wav).unwrap();
+        let samples = crate::audio::decode_wav_16k(&bytes).unwrap();
+        let text = std::env::var("SCRAWL_TIMING_TEXT").unwrap_or_else(|_| "Hallo Welt.".into());
+        for claude_answers in [true, false] {
+            let (take, _released, _cancelled, answer) = test_take();
+            let text = text.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1_100));
+                let _ = answer.send(if claude_answers {
+                    Ok(Heard {
+                        text,
+                        from_sample: 0,
+                    })
+                } else {
+                    Err(anyhow!("the Claude Code session stopped while recording"))
+                });
+            });
+            let audio = crate::audio::RecordedAudio {
+                sample_count: samples.len(),
+                duration_ms: samples.len() as u64 / 16,
+                wav_bytes: bytes.clone(),
+                live: crate::live_transcribe::Slot::new(Some(
+                    crate::live_transcribe::Live::claude(take),
+                )),
+            };
+            let started = Instant::now();
+            let transcript = crate::transcribe::transcribe(Some(&wav), Some(&audio));
+            println!(
+                "finish timing: Claude {}, {} ms of audio, finished in {} ms: source {}, model {:?}, estimated {}, {} words",
+                if claude_answers { "answers" } else { "fails" },
+                audio.duration_ms,
+                started.elapsed().as_millis(),
+                transcript.source,
+                transcript.model,
+                transcript.estimated,
+                transcript.words.len()
+            );
+        }
+    }
+
     /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`.
     #[test]
     fn dictated_text_reaches_the_summary_under_the_keyframe_it_was_said_at() {
