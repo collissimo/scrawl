@@ -170,7 +170,7 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
             source: "offline".into(),
             missing: Some(crate::speech_model::missing(
                 why,
-                &language,
+                model_language(&language),
                 status.error.as_deref(),
             )),
             ..Default::default()
