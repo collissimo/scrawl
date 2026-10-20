@@ -78,7 +78,13 @@ struct Cli {
 }
 
 fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
-    crate::transcribe::Engine::parse(name).ok_or_else(|| "expected `apple` or `hex`".to_owned())
+    crate::transcribe::Engine::parse(name).ok_or_else(|| {
+        if cfg!(target_os = "windows") {
+            "expected `apple`, `hex` or `claude`".to_owned()
+        } else {
+            "expected `apple` or `hex`".to_owned()
+        }
+    })
 }
 
 /// `scrawl hex status`: connection, models and what the next recording would use.
@@ -311,6 +317,19 @@ enum Command {
     Mic {
         #[command(subcommand)]
         command: MicCommand,
+    },
+    /// Check Claude Code dictation: start a hidden session, take typed text back out through its
+    /// editor hook, hold dictation for 2 s (records the default microphone), then cancel one.
+    #[cfg(target_os = "windows")]
+    #[command(name = "dictation-selftest", hide = true)]
+    DictationSelftest,
+    /// Claude Code's `$EDITOR` for the hidden dictation session: hands the prompt to Scrawl.
+    #[cfg(target_os = "windows")]
+    #[command(name = "claude-editor", hide = true)]
+    ClaudeEditor {
+        /// The prompt file; the last argument, as editors are given it.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<PathBuf>,
     },
     /// Check the Hex transcriber: is it running, which models are ready, which one Scrawl uses.
     Hex {
@@ -1918,6 +1937,19 @@ fn main() -> Result<()> {
             mic::save_in(&handoff::default_config_path(), &id, &inputs)?;
             mic_list();
             Ok(())
+        }
+        #[cfg(target_os = "windows")]
+        Command::DictationSelftest => {
+            if win::claude_dictation::selftest()? {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
+        #[cfg(target_os = "windows")]
+        Command::ClaudeEditor { args } => {
+            let file = args.last().context("No file to edit")?;
+            win::claude_dictation::editor_main(file)
         }
         Command::Hex {
             command: HexCommand::Status,
