@@ -80,7 +80,8 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
   - An opt-in "delete the video after each capture".
   - A note that the Recycle Bin only frees space once it's emptied.
 - [x] Tests no longer write to the real `scrawl.log` (`cfg!(test)` in `scrawl_log`).
-- Collin switched back to `transcriber: apple` himself (2026-10-20). Open offer: log Parakeet's text next to Claude's for comparison (after F3).
+- Collin's decision (2026-10-20): Parakeet (`apple`) is the default transcriber, and Claude Code dictation is only a low-priority extra.
+- [x] German spoken cues (jetzt, hier, schau, guck, …) in `keyframes::spoken_cue` (a127e09). On his capture, "Ich scroll jetzt hier …" now gets its own keyframe.
 
 ## Lessons
 
