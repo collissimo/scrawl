@@ -20,7 +20,7 @@ use platform::{
     set_status_text,
 };
 #[cfg(target_os = "windows")]
-pub(crate) use platform::{gpui_display_for, hwnd_of, set_app_icon};
+pub(crate) use platform::{gpui_display_for, hwnd_of, raise_floating_windows, set_app_icon};
 
 use crate::audio::AudioRecorder;
 use crate::capture::{
@@ -1410,6 +1410,12 @@ impl ScrawlCoordinator {
         // Window and Area: the chips stay up while the capsule morphs into the picker.
         // The recording's overlay becomes the picker's (moved if the picker opens on another
         // display), so the border never swaps windows (as the picker → recording path does).
+        if let Some(ref ov) = overlay {
+            scrawl_log(format!(
+                "ink overlay on display {:?} goes over to the picker",
+                ov.screen()
+            ));
+        }
         self.picker_metal_overlay = overlay;
         self.open_picker(Some(mode), false, cx);
         if self.is_selecting() && chips_shown && !self.reduced_motion {
@@ -2556,7 +2562,18 @@ impl ScrawlCoordinator {
             pill.place_on([f.x + f.width / 2.0, f.y + f.height / 2.0]);
         }
         let metal_overlay = self.picker_metal_overlay.take().map(|mut overlay| {
-            overlay.move_to(target_rect);
+            if !overlay.move_to(target_rect) {
+                scrawl_log(format!(
+                    "ink overlay stays on display {:?} for the target {target_rect:?}",
+                    overlay.screen()
+                ));
+            }
+            // `reset_for_session` cleared the list it was on.
+            self.telemetry
+                .excluded_window_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(overlay.window_number());
             overlay
         });
         let metal_overlay = metal_overlay.or_else(|| {
@@ -2935,6 +2952,7 @@ impl ScrawlCoordinator {
                     if let Some(dest) = bundle.destination.clone() {
                         coord.send_completed(dir.clone(), dest, cx);
                     }
+                    crate::retention::after_capture(&dir);
                     coord.set_review_bundle((dir.clone(), bundle), coord.completed_note.clone());
                     if let Some((judgement, url)) = judged {
                         coord.act_on_route(dir, judgement, url, cx);
@@ -5327,6 +5345,9 @@ pub fn run_app(
         platform::start_updates();
         crate::retention::start();
         crate::hex::watch();
+        // Claude Code dictation keeps a session warm while it is the engine.
+        #[cfg(target_os = "windows")]
+        crate::win::claude_dictation::watch();
         crate::speech_model::ensure();
         let menu_rx = install_status_bar();
 

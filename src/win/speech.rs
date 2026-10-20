@@ -1,9 +1,11 @@
 //! On-device transcription on Windows, with measured word timings: Parakeet through
 //! `transcribe.cpp`, the engine Hex uses. It loads a model Hex has already installed
-//! (`%APPDATA%\voice-control\models`), else Scrawl's own copy of Hex's Parakeet Unified English
-//! (`%LOCALAPPDATA%\Scrawl\models`), which `install` downloads once in the background and checks
-//! against its SHA-256. Like the Hex client, it transcribes each speech island on its own; unlike
-//! it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
+//! (`%APPDATA%\voice-control\models`), else Scrawl's own copy (`%LOCALAPPDATA%\Scrawl\models`),
+//! which `install` downloads once in the background and checks against its SHA-256. English
+//! (`handoff::transcription_language`) uses Hex's Parakeet Unified English; another language
+//! that Parakeet TDT 0.6b v3 speaks (25 European languages, `languages::PARAKEET_V3`) needs that
+//! multilingual model, and one it doesn't stays on the English model (`model_language`). Like
+//! the Hex client, it transcribes each speech island on its own; unlike it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
 //! here") can cut keyframes.
 
 use std::path::{Path, PathBuf};
@@ -19,8 +21,7 @@ const KHZ: u64 = 16;
 /// Silence kept around each clip, so first and last words aren't clipped.
 const CLIP_PAD_MS: u64 = 200;
 
-/// The model Scrawl downloads when Hex hasn't installed one: the same file, revision and
-/// checksum as Hex's `PARAKEET_UNIFIED_ENGLISH_ARTIFACT`.
+/// A model Scrawl downloads when Hex hasn't installed one that speaks the language.
 pub struct Artifact {
     pub filename: &'static str,
     pub url: &'static str,
@@ -28,12 +29,43 @@ pub struct Artifact {
     pub sha256: &'static str,
 }
 
+/// English: the same file, revision and checksum as Hex's `PARAKEET_UNIFIED_ENGLISH_ARTIFACT`.
 pub const PARAKEET: Artifact = Artifact {
     filename: "parakeet-unified-en-0.6b-Q8_0.gguf",
     url: "https://huggingface.co/handy-computer/parakeet-unified-en-0.6b-gguf/resolve/7e948f21b7bdbac698d3318db9d350f1096f3b6c/parakeet-unified-en-0.6b-Q8_0.gguf",
     bytes: 731_357_568,
     sha256: "4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795",
 };
+
+/// Every other language: Parakeet TDT 0.6b v3 (bg, cs, da, de, el, en, es, et, fi, fr, hr, hu,
+/// it, lt, lv, mt, nl, pl, pt, ro, ru, sk, sl, sv, uk), Q8_0 like the English one.
+pub const PARAKEET_V3: Artifact = Artifact {
+    filename: "parakeet-tdt-0.6b-v3-Q8_0.gguf",
+    url: "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/d8d8c32cb2017c57e5307767343e97870f8a7f53/parakeet-tdt-0.6b-v3-Q8_0.gguf",
+    bytes: 739_508_576,
+    sha256: "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7",
+};
+
+/// The language the model has to speak for recordings in `language`: the language itself when
+/// Parakeet v3 covers it, else English. v3 can't transcribe Japanese either, so a Japanese
+/// setting keeps the English model (English speech still comes out right) instead of
+/// downloading 740 MB that would guess the language.
+pub fn model_language(language: &str) -> &str {
+    if crate::win::languages::parakeet_v3_supports(language) {
+        language
+    } else {
+        "en"
+    }
+}
+
+/// The model Scrawl downloads for `language`.
+pub fn artifact_for(language: &str) -> &'static Artifact {
+    if model_language(language) == "en" {
+        &PARAKEET
+    } else {
+        &PARAKEET_V3
+    }
+}
 
 fn models_dir() -> PathBuf {
     crate::hex::support_dir().join("models")
@@ -67,12 +99,33 @@ fn verified_in(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Hex's installed models (verified downloads), Hex's chosen one first, then Parakeet ones;
-/// then the one Scrawl downloaded.
-pub fn installed_models() -> Vec<PathBuf> {
-    let mut models = hex_models();
-    models.extend(verified_in(&own_models_dir()));
-    models
+/// The installed models (verified downloads) that can transcribe `language`, best first.
+pub fn installed_models(language: &str) -> Vec<PathBuf> {
+    models_for(&hex_models(), &verified_in(&own_models_dir()), language)
+}
+
+/// Hex's models (its chosen one first, then Parakeet ones), then Scrawl's own, the language's
+/// `artifact_for` first, so English keeps Parakeet Unified English when v3 is there too. Every
+/// model speaks English; another language needs one whose name says it's multilingual
+/// (Parakeet v3, Whisper), so Parakeet Unified English and Parakeet v2 never get German speech.
+pub fn models_for(hex: &[PathBuf], own: &[PathBuf], language: &str) -> Vec<PathBuf> {
+    let language = model_language(language);
+    let wanted = artifact_for(language).filename;
+    let mut own = own.to_vec();
+    own.sort_by_key(|path| path.file_name().is_none_or(|name| name != wanted));
+    hex.iter()
+        .chain(&own)
+        .filter(|path| language == "en" || multilingual(path))
+        .cloned()
+        .collect()
+}
+
+fn multilingual(path: &Path) -> bool {
+    let name = model_name(path).to_ascii_lowercase();
+    let english_only = name
+        .split(['-', '_', '.'])
+        .any(|part| part == "en" || part == "v2");
+    !english_only && (name.contains("v3") || name.contains("whisper"))
 }
 
 fn hex_models() -> Vec<PathBuf> {
@@ -103,7 +156,9 @@ fn model_name(path: &Path) -> String {
 }
 
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
-    let Some(path) = installed_models().into_iter().next() else {
+    let language = crate::handoff::transcription_language();
+    let candidates = installed_models(&language);
+    if candidates.is_empty() {
         // The background download hasn't finished (or failed): the bundle is transcribed again
         // once it has.
         let status = crate::speech_model::current();
@@ -115,12 +170,12 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
             source: "offline".into(),
             missing: Some(crate::speech_model::missing(
                 why,
-                "en",
+                model_language(&language),
                 status.error.as_deref(),
             )),
             ..Default::default()
         });
-    };
+    }
     let wav =
         std::fs::read(audio).with_context(|| format!("Could not read {}", audio.display()))?;
     let samples = crate::audio::decode_wav_16k(&wav)?;
@@ -129,24 +184,32 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     if clips.is_empty() && duration_ms >= 480 {
         clips.push((0, duration_ms));
     }
-    let name = model_name(&path);
-    let mut transcript = TranscriptData {
-        source: format!("parakeet:{name}"),
-        model: Some(name),
-        estimated: false,
-        ..Default::default()
+    let named = |path: &Path| {
+        let name = model_name(path);
+        TranscriptData {
+            source: format!("parakeet:{name}"),
+            model: Some(name),
+            estimated: false,
+            ..Default::default()
+        }
     };
     if clips.is_empty() {
-        return Ok(transcript);
+        return Ok(named(&candidates[0]));
     }
 
     transcribe_cpp::disable_logging();
     transcribe_cpp::init_backends_default().context("transcribe.cpp backends")?;
-    let model = Model::load(&path).with_context(|| format!("Could not load {}", path.display()))?;
+    let (path, model, hint) = load_for(&candidates, model_language(&language))?;
+    crate::capture::scrawl_log(format!(
+        "transcribing ({language}) with {} (hint {})",
+        path.display(),
+        hint.as_deref().unwrap_or("none")
+    ));
+    let mut transcript = named(&path);
     let mut session = model.session()?;
     let options = RunOptions {
         timestamps: TimestampKind::Word,
-        language: Some("en".into()),
+        language: hint,
         ..Default::default()
     };
     let mut texts = Vec::new();
@@ -207,20 +270,46 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     Ok(transcript)
 }
 
-/// Makes sure a model is on disk: `installed` when Hex's or Scrawl's own is there, else downloads
-/// `PARAKEET` into `own_models_dir()`, reporting progress, and keeps it only if its SHA-256
-/// matches. The same lines as macOS's `scrawl-helper speech-model --install`.
+/// Loads the first candidate whose own language list (`general.languages`, when it has one)
+/// includes `language`, with the language as the hint. When every candidate lists others, the
+/// last one runs without a hint and detects the language itself.
+fn load_for(candidates: &[PathBuf], language: &str) -> Result<(PathBuf, Model, Option<String>)> {
+    let mut last = None;
+    for path in candidates {
+        let model =
+            Model::load(path).with_context(|| format!("Could not load {}", path.display()))?;
+        let languages = model.capabilities().languages;
+        if languages.is_empty() || languages.iter().any(|l| l == language) {
+            return Ok((path.clone(), model, Some(language.to_owned())));
+        }
+        crate::capture::scrawl_log(format!(
+            "{} doesn't list {language} ({})",
+            path.display(),
+            languages.join(", ")
+        ));
+        last = Some((path.clone(), model));
+    }
+    let (path, model) = last.context("no speech model")?;
+    Ok((path, model, None))
+}
+
+/// Makes sure a model for the transcription language is on disk: `installed` when Hex's or
+/// Scrawl's own is there, else downloads `artifact_for` it into `own_models_dir()`, reporting
+/// progress, and keeps it only if its SHA-256 matches. The same lines as macOS's
+/// `scrawl-helper speech-model --install`, with the language as the locale.
 pub fn install(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
+    let language = crate::handoff::transcription_language();
     let report = |status: &str, progress: Option<f64>, error: Option<String>| SpeechModelLine {
         status: status.into(),
         engine: Some("Parakeet".into()),
-        locale: Some("en".into()),
+        locale: Some(language.clone()),
         progress,
         error,
     };
-    if installed_models().is_empty() {
+    if installed_models(&language).is_empty() {
+        let artifact = artifact_for(&language);
         let mut progress = |done: f64| line(report("downloading", Some(done), None));
-        if let Err(error) = download(&PARAKEET, &own_models_dir(), &mut progress) {
+        if let Err(error) = download(artifact, &own_models_dir(), &mut progress) {
             line(report("failed", None, Some(format!("{error:#}"))));
             return Ok(());
         }
@@ -359,16 +448,138 @@ mod tests {
         assert!(verified_in(&dir).is_empty());
     }
 
-    /// Downloads the real model (731 MB) and loads it. CI's release job runs it.
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    /// Scrawl's own folder lists both downloads alphabetically: v3 before Unified English.
+    fn own_both() -> Vec<PathBuf> {
+        paths(&[
+            r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+            r"own\parakeet-unified-en-0.6b-Q8_0.gguf",
+        ])
+    }
+
+    #[test]
+    fn english_takes_hexs_models_then_scrawls_english_one() {
+        let hex = paths(&[r"hex\parakeet-tdt-0.6b-v3-Q8_0.gguf"]);
+        assert_eq!(
+            models_for(&hex, &own_both(), "en"),
+            paths(&[
+                r"hex\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+                r"own\parakeet-unified-en-0.6b-Q8_0.gguf",
+                r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+            ])
+        );
+        assert_eq!(
+            models_for(&[], &own_both(), "en")[0],
+            PathBuf::from(r"own\parakeet-unified-en-0.6b-Q8_0.gguf")
+        );
+        assert_eq!(artifact_for("en").filename, PARAKEET.filename);
+    }
+
+    #[test]
+    fn german_never_gets_an_english_only_model() {
+        let hex = paths(&[
+            r"hex\parakeet-unified-en-0.6b-Q8_0.gguf",
+            r"hex\parakeet-tdt-0.6b-v2-Q8_0.gguf",
+            r"hex\whisper-small.en-Q8_0.gguf",
+        ]);
+        let own = paths(&[r"own\parakeet-unified-en-0.6b-Q8_0.gguf"]);
+        assert!(models_for(&hex, &own, "de").is_empty());
+        assert_eq!(artifact_for("de").filename, PARAKEET_V3.filename);
+        assert_eq!(artifact_for("fr").filename, PARAKEET_V3.filename);
+    }
+
+    #[test]
+    fn german_prefers_hexs_multilingual_model_then_scrawls_own() {
+        let hex = paths(&[
+            r"hex\parakeet-unified-en-0.6b-Q8_0.gguf",
+            r"hex\parakeet-v3-Q8_0.gguf",
+        ]);
+        let picked = paths(&[
+            r"hex\parakeet-v3-Q8_0.gguf",
+            r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+        ]);
+        assert_eq!(models_for(&hex, &own_both(), "de"), picked);
+        assert_eq!(models_for(&hex, &own_both(), "fr"), picked);
+        let whisper = paths(&[r"hex\whisper-large-v3-turbo-Q8_0.gguf"]);
+        assert_eq!(models_for(&whisper, &[], "de"), whisper);
+    }
+
+    #[test]
+    fn a_language_v3_cannot_speak_keeps_the_english_model() {
+        for language in ["ja", "ko", "hi", "tr", "zh"] {
+            assert_eq!(model_language(language), "en");
+            assert_eq!(artifact_for(language).filename, PARAKEET.filename);
+            assert_eq!(
+                models_for(&[], &own_both(), language)[0],
+                PathBuf::from(r"own\parakeet-unified-en-0.6b-Q8_0.gguf")
+            );
+            let english_only = paths(&[r"own\parakeet-unified-en-0.6b-Q8_0.gguf"]);
+            assert_eq!(models_for(&[], &english_only, language), english_only);
+        }
+        assert_eq!(model_language("de"), "de");
+        assert_eq!(model_language("fi"), "fi");
+        assert_eq!(artifact_for("fi").filename, PARAKEET_V3.filename);
+    }
+
+    /// `SCRAWL_MODELS_DIR` keeps the downloads there; else a temporary folder that's removed.
+    fn download_dir(name: &str) -> (PathBuf, bool) {
+        match std::env::var_os("SCRAWL_MODELS_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => (PathBuf::from(dir), false),
+            None => (temp_dir(name), true),
+        }
+    }
+
+    /// Downloads the real English model (731 MB) and loads it. CI's release job runs it.
     #[test]
     #[ignore]
     fn downloads_and_loads_parakeet() {
-        let dir = temp_dir("parakeet");
+        let (dir, remove) = download_dir("parakeet");
         let mut last = 0.0;
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
-        assert_eq!(last, 1.0);
+        // A kept download that was already there reports no progress.
+        assert!(last == 1.0 || !remove);
         transcribe_cpp::init_backends_default().unwrap();
         Model::load(&model).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        if remove {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Downloads the real multilingual model (740 MB), checks it lists German, and runs it with
+    /// the German hint on a second of silence. CI's release job runs it.
+    #[test]
+    #[ignore]
+    fn downloads_and_loads_parakeet_v3_for_german() {
+        let (dir, remove) = download_dir("parakeet-v3");
+        let mut last = 0.0;
+        let path = download(&PARAKEET_V3, &dir, &mut |done| last = done).unwrap();
+        // A kept download that was already there reports no progress.
+        assert!(last == 1.0 || !remove);
+        assert_eq!(models_for(&[], &[path.clone()], "de"), vec![path.clone()]);
+        transcribe_cpp::init_backends_default().unwrap();
+        let (_, model, hint) = load_for(&[path], "de").unwrap();
+        let caps = model.capabilities();
+        eprintln!(
+            "languages {:?}, detects {}",
+            caps.languages, caps.supports_language_detect
+        );
+        assert_eq!(hint.as_deref(), Some("de"));
+        let options = RunOptions {
+            timestamps: TimestampKind::Word,
+            language: hint,
+            ..Default::default()
+        };
+        model
+            .session()
+            .unwrap()
+            .run(&[0.0; 16_000], &options)
+            .unwrap();
+        drop(model);
+        if remove {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

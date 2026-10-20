@@ -552,6 +552,13 @@ pub fn summary_markdown_with(
     {
         out.push_str(&format!("No transcript: {}\n", missing.reason));
     }
+    // Only Claude Code dictation (opt-in) says so; Hex's estimated times read as before.
+    if bundle.transcript.estimated
+        && bundle.transcript.source == "claude-code"
+        && !bundle.transcript.text.trim().is_empty()
+    {
+        out.push_str("Word times are estimated: a word may sit under a neighbouring keyframe.\n");
+    }
     // App events and context changes nest under the keyframe on screen when they happened.
     let mut app_events: Vec<(u64, String)> = bundle
         .events
@@ -1446,6 +1453,16 @@ mod tests {
         assert!(summary.contains("Note: Simplify it."));
         assert!(summary.contains("- #1 (0:05) “This row is too dense.”"));
         assert!(!summary.contains("No transcript"));
+
+        // Estimated word times: only Claude Code dictation says so (Hex's read as before).
+        let mut hex = bundle.clone();
+        hex.transcript.estimated = true;
+        hex.transcript.source = "hex".into();
+        let summary = summary_markdown(&hex, std::path::Path::new("/recordings/test"));
+        assert!(!summary.contains("Word times are estimated"));
+        hex.transcript.source = "claude-code".into();
+        let summary = summary_markdown(&hex, std::path::Path::new("/recordings/test"));
+        assert!(summary.contains("Word times are estimated"));
 
         // Audio but no speech model yet: the summary says so instead of staying quiet.
         let mut silent = bundle.clone();

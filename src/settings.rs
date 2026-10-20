@@ -4,7 +4,8 @@
 //! and its `0600` mode (it holds the ingest token).
 //!
 //! Panes: General (launch at login, sending dev-site captures, the two shortcuts), Recording
-//! (transcriber, video export), Storage (how long recordings are kept), Permissions (the
+//! (transcriber, video export), Storage (how long recordings are kept, deleting each capture's
+//! video), Permissions (the
 //! onboarding checklist, to fix things later), Agents (`scrawl` on PATH, the skill's install
 //! command) and About.
 //!
@@ -577,6 +578,9 @@ pub struct View {
     pub shortcuts: Vec<ShortcutView>,
     pub microphone: MicrophoneView,
     pub transcriber: TranscriberView,
+    /// The language recordings are spoken in (Windows only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<LanguageView>,
     pub video_export: bool,
     pub retention: RetentionView,
     /// How much the captures folder takes, once measured.
@@ -775,11 +779,51 @@ fn microphone_view(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriberView {
-    /// What recordings use now: "apple" or "hex".
+    /// What recordings use now: "apple", "hex" or (Windows) "claude".
     pub engine: &'static str,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub models: Vec<ModelView>,
+    /// Claude Code dictation: shown only on Windows, greyed out with the reason when `claude`
+    /// can't be found.
+    pub claude_offered: bool,
+    pub claude_title: String,
+    pub claude_enabled: bool,
+}
+
+/// The Language popup: `language` in `config.json`, English unless set.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LanguageView {
+    /// A code from `options` (`"de"`).
+    pub chosen: String,
+    pub options: Vec<LanguageOption>,
+    /// Why Parakeet transcribes it as English, when it can't speak it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LanguageOption {
+    pub id: &'static str,
+    pub title: &'static str,
+}
+
+#[cfg(target_os = "windows")]
+fn language_view(language: &str) -> Option<LanguageView> {
+    use crate::win::languages;
+    Some(LanguageView {
+        chosen: language.to_owned(),
+        options: languages::OFFERED
+            .iter()
+            .map(|&(id, title)| LanguageOption { id, title })
+            .collect(),
+        note: languages::parakeet_note(language),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn language_view(_language: &str) -> Option<LanguageView> {
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -790,12 +834,22 @@ pub struct ModelView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RetentionView {
     /// The chosen preset, or `None` for a policy written by hand.
     pub preset: Option<&'static str>,
     pub options: Vec<OptionView>,
     pub note: String,
+    /// "Delete the video after each capture" (`"keepVideo": false`).
+    pub delete_video: bool,
+    pub video_note: &'static str,
 }
+
+/// Under the "Delete the video after each capture" switch.
+pub const DELETE_VIDEO_NOTE: &str = "A minute after each capture is processed, its video is \
+    deleted for good, not to the Recycle Bin. Its frames, contact sheet, text and audio stay; \
+    zooming in, re-cutting keyframes and video export then no longer work for it. Applies to \
+    new captures.";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OptionView {
@@ -835,8 +889,8 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
     } else {
         "Trash"
     };
-    match (policy.media_days, policy.bundle_days) {
-        (None, None) => String::new(),
+    let what = match (policy.media_days, policy.bundle_days) {
+        (None, None) => return String::new(),
         (Some(media), Some(bundle)) => format!(
             "Video and audio go to the {bin} after {}, the rest of each capture after {}.",
             days(media),
@@ -844,7 +898,8 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
         ),
         (Some(media), None) => format!("Video and audio go to the {bin} after {}.", days(media)),
         (None, Some(bundle)) => format!("Captures go to the {bin} after {}.", days(bundle)),
-    }
+    };
+    format!("{what} The disk space comes back once the {bin} is emptied.")
 }
 
 fn shortcut_view(
@@ -876,8 +931,9 @@ fn shortcut_view(
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
     /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
-    /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
-    /// `retention` (a preset id).
+    /// ("default" or a device id), `transcriber` ("apple"/"hex"/"claude"), `hexModel` (an id),
+    /// `language` (a code from `LanguageView::options`), `retention` (a preset id),
+    /// `deleteVideo` (bool).
     Set {
         key: String,
         value: serde_json::Value,
@@ -941,6 +997,9 @@ pub trait Host {
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()>;
     /// Scrawl's binary and the folders `scrawl` may be linked into.
     fn command_line(&self) -> crate::command_line::Places;
+    /// The transcriber or the language changed: fetch the speech model for it now, and start
+    /// Claude Code's session if it's the engine, so the next recording doesn't wait.
+    fn transcription_changed(&mut self);
 }
 
 /// The window's own state: what it's recording, what failed, what was asked for.
@@ -1101,7 +1160,12 @@ impl Panel {
             ("transcriber", serde_json::Value::String(name)) => {
                 if let Some(engine) = crate::transcribe::Engine::parse(name) {
                     write("transcriber", engine.name().into());
+                    host.transcription_changed();
                 }
+            }
+            ("language", serde_json::Value::String(code)) if language_offered(code) => {
+                write("language", code.as_str().into());
+                host.transcription_changed();
             }
             ("hexModel", serde_json::Value::String(model)) if !model.trim().is_empty() => {
                 // Picking a Hex model is choosing Hex.
@@ -1113,11 +1177,22 @@ impl Panel {
                     .into_iter()
                     .find(|p| preset_id(*p) == id)
                 {
-                    if let Err(error) = preset.policy().save_to(&path) {
+                    let policy = crate::retention::Policy::load_from(&path).with_preset(preset);
+                    if let Err(error) = policy.save_to(&path) {
                         crate::capture::scrawl_log(format!("Saving retention failed: {error:#}"));
                     }
                     return Effect::Measure;
                 }
+            }
+            ("deleteVideo", serde_json::Value::Bool(on)) => {
+                let policy = crate::retention::Policy {
+                    keep_video: !on,
+                    ..crate::retention::Policy::load_from(&path)
+                };
+                if let Err(error) = policy.save_to(&path) {
+                    crate::capture::scrawl_log(format!("Saving keepVideo failed: {error:#}"));
+                }
+                return Effect::Measure;
             }
             _ => crate::capture::scrawl_log(format!("Settings: ignoring {key}={value}")),
         }
@@ -1160,6 +1235,10 @@ impl Panel {
             .and_then(crate::transcribe::Engine::parse)
             .unwrap_or_default();
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
+        let language = crate::handoff::language_of(&config);
+        let claude = crate::transcribe::claude_choice();
+        #[cfg(target_os = "windows")]
+        let claude = crate::win::languages::claude_choice_for(claude, &language);
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
         // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
@@ -1203,7 +1282,13 @@ impl Panel {
                 self.status(Permission::Microphone) == Status::Granted,
             ),
             transcriber: TranscriberView {
-                engine: if menu.hex_checked { "hex" } else { "apple" },
+                engine: if menu.hex_checked {
+                    "hex"
+                } else if claude.enabled && engine == crate::transcribe::Engine::Claude {
+                    "claude"
+                } else {
+                    "apple"
+                },
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
                 models: menu
@@ -1211,7 +1296,11 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
+                claude_offered: claude.offered,
+                claude_title: claude.title,
+                claude_enabled: claude.enabled,
             },
+            language: language_view(&language),
             video_export: config.video_export.unwrap_or(false),
             retention: RetentionView {
                 preset: policy.preset().map(preset_id),
@@ -1223,6 +1312,8 @@ impl Panel {
                     })
                     .collect(),
                 note: retention_note(&policy),
+                delete_video: !policy.keep_video,
+                video_note: DELETE_VIDEO_NOTE,
             },
             captures_size: self.captures_size.map(crate::retention::format_bytes),
             permissions: order
@@ -1302,6 +1393,29 @@ impl Host for AppHost<'_> {
     fn command_line(&self) -> crate::command_line::Places {
         crate::command_line::Places::system()
     }
+
+    fn transcription_changed(&mut self) {
+        transcription_changed();
+    }
+}
+
+/// After the transcriber or the language changed (Settings, the tray): fetches the speech model
+/// for it now, and starts Claude Code's session when it's the engine, so the next recording
+/// doesn't wait for either.
+pub fn transcription_changed() {
+    crate::speech_model::ensure();
+    #[cfg(target_os = "windows")]
+    if crate::win::claude_dictation::wanted() {
+        crate::win::claude_dictation::warm();
+    }
+}
+
+/// Whether the Language popup offers `code`.
+fn language_offered(code: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    return crate::win::languages::offered(code);
+    #[cfg(not(target_os = "windows"))]
+    return crate::handoff::language_code(code).as_deref() == Some(code);
 }
 
 /// From the window's helper process and its pollers.
@@ -1520,7 +1634,8 @@ impl Session {
         view["type"] = "state".into();
         // Switched from Hex to Apple Speech: get its model now, not at the first capture.
         let speech = crate::speech_model::current();
-        if view["transcriber"]["engine"] == "apple"
+        // Claude Code dictation falls back to the local model.
+        if (view["transcriber"]["engine"] == "apple" || view["transcriber"]["engine"] == "claude")
             && speech.state == crate::speech_model::State::Unknown
         {
             crate::speech_model::ensure();
@@ -1598,6 +1713,8 @@ mod tests {
         paused: Vec<bool>,
         refuse: Option<String>,
         cli: crate::command_line::Places,
+        /// How often the transcriber or the language changed.
+        changed: usize,
     }
 
     impl Host for Fake {
@@ -1624,6 +1741,9 @@ mod tests {
         }
         fn command_line(&self) -> crate::command_line::Places {
             self.cli.clone()
+        }
+        fn transcription_changed(&mut self) {
+            self.changed += 1;
         }
     }
 
@@ -1667,6 +1787,7 @@ mod tests {
                 install: vec![dir.0.join("bin")],
                 also: Vec::new(),
             },
+            changed: 0,
         }
     }
 
@@ -2041,13 +2162,33 @@ mod tests {
         let view = panel.view(&host);
         assert!(!view.auto_send && view.video_export);
         assert_eq!(view.retention.preset, Some("month"));
+        let bin = if WIN { "Recycle Bin" } else { "Trash" };
         assert_eq!(
             view.retention.note,
             format!(
-                "Video and audio go to the {} after 30 days, the rest of each capture after 90 days.",
-                if WIN { "Recycle Bin" } else { "Trash" }
+                "Video and audio go to the {bin} after 30 days, the rest of each capture after 90 days. The disk space comes back once the {bin} is emptied."
             )
         );
+        assert!(!view.retention.delete_video, "videos are kept by default");
+        // Deleting each video is its own switch: it keeps the preset, and the preset keeps it.
+        assert_eq!(
+            set(&mut panel, &mut host, "deleteVideo", true.into()),
+            Effect::Measure
+        );
+        assert_eq!(read_json(&host.path)["retention"]["keepVideo"], false);
+        let view = panel.view(&host);
+        assert!(view.retention.delete_video);
+        assert_eq!(view.retention.preset, Some("month"));
+        assert!(view.retention.video_note.contains("deleted for good"));
+        set(&mut panel, &mut host, "retention", "week".into());
+        let view = panel.view(&host);
+        assert!(view.retention.delete_video);
+        assert_eq!(view.retention.preset, Some("week"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["retention"]["deleteVideo"], true);
+        set(&mut panel, &mut host, "deleteVideo", false.into());
+        assert_eq!(read_json(&host.path)["retention"]["keepVideo"], true);
+        set(&mut panel, &mut host, "retention", "month".into());
         let config = read_json(&host.path);
         assert_eq!(config["transcriber"], "hex");
         assert_eq!(config["ingestToken"], "secret");
@@ -2056,6 +2197,102 @@ mod tests {
         set(&mut panel, &mut host, "retention", "forever".into());
         // "Forever" says it all; no caption.
         assert_eq!(panel.view(&host).retention.note, "");
+    }
+
+    #[test]
+    fn claude_code_dictation_is_a_windows_choice() {
+        let dir = TempDir::new("claude");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        panel.on(
+            Action::Set {
+                key: "transcriber".into(),
+                value: "claude".into(),
+            },
+            &mut host,
+        );
+        let view = panel.view(&host).transcriber;
+        assert_eq!(view.claude_offered, WIN);
+        let saved = read_json(&host.path);
+        if WIN {
+            assert_eq!(saved["transcriber"], "claude");
+            // Chosen only when claude.exe can be found; otherwise recordings use the local model.
+            assert_eq!(view.engine == "claude", view.claude_enabled);
+            assert!(view.claude_title.starts_with("Claude Code (dictation)"));
+        } else {
+            assert!(saved.get("transcriber").is_none());
+            assert_eq!(view.engine, "apple");
+            assert!(!view.claude_enabled);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_language_popup_writes_language_and_fetches_its_model() {
+        let dir = TempDir::new("language");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        // English unless set.
+        let view = panel.view(&host).language.unwrap();
+        assert_eq!(view.chosen, "en");
+        assert_eq!(view.options[0].title, "English");
+        assert_eq!(view.note, None);
+
+        std::fs::write(&host.path, r#"{"language":"de"}"#).unwrap();
+        let view = panel.view(&host);
+        let json = serde_json::to_value(&view).unwrap();
+        eprintln!("Language row: chosen {}, first options {} {}, note {}", json["language"]["chosen"], json["language"]["options"][0], json["language"]["options"][1], json["language"]["note"]);
+        assert_eq!(json["language"]["chosen"], "de");
+        let language = view.language.unwrap();
+        let chosen = language.options.iter().find(|o| o.id == language.chosen);
+        assert_eq!(chosen.map(|o| o.title), Some("Deutsch"));
+
+        let set = |panel: &mut Panel, host: &mut Fake, value: &str| {
+            panel.on(
+                Action::Set {
+                    key: "language".into(),
+                    value: value.into(),
+                },
+                host,
+            )
+        };
+        set(&mut panel, &mut host, "ja");
+        assert_eq!(read_json(&host.path)["language"], "ja");
+        assert_eq!(host.changed, 1);
+        let note = panel.view(&host).language.unwrap().note.unwrap();
+        assert!(note.contains("日本語"), "{note}");
+        // Not a language the popup offers: nothing is written or fetched.
+        set(&mut panel, &mut host, "zh");
+        set(&mut panel, &mut host, "German");
+        assert_eq!(read_json(&host.path)["language"], "ja");
+        assert_eq!(host.changed, 1);
+        // Choosing an engine fetches its model and warms Claude Code too (R3-9).
+        panel.on(
+            Action::Set {
+                key: "transcriber".into(),
+                value: "claude".into(),
+            },
+            &mut host,
+        );
+        assert_eq!(host.changed, 2);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn claude_code_is_greyed_out_for_a_language_it_cannot_dictate() {
+        let dir = TempDir::new("claude-fi");
+        let host = fake(&dir);
+        let panel = Panel::default();
+        std::fs::write(&host.path, r#"{"language":"fi","transcriber":"claude"}"#).unwrap();
+        let view = panel.view(&host).transcriber;
+        assert!(view.claude_offered && !view.claude_enabled);
+        // Either reason greys it out; with claude.exe on PATH it's the language.
+        if crate::win::claude_dictation::available() {
+            assert_eq!(view.claude_title, "Claude Code (dictation): no Suomi dictation");
+        }
+        assert_eq!(view.engine, "apple");
+        // Parakeet speaks Finnish: no note.
+        assert_eq!(panel.view(&host).language.unwrap().note, None);
     }
 
     #[test]
