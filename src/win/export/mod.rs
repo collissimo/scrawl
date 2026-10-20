@@ -238,13 +238,11 @@ fn render(plan: &Plan, hardware: bool, progress: &mut dyn FnMut(f32)) -> Result<
             }
         }
         #[cfg(test)]
-
         if hardware && tick == FAIL_HARDWARE_AT.load(Ordering::Relaxed) {
-
-            return Err(anyhow::anyhow!("injected: the GPU lost its session").context(EncoderFailed));
-
+            return Err(
+                anyhow::anyhow!("injected: the GPU lost its session").context(EncoderFailed)
+            );
         }
-
         writer.video(&nv12, tick).context(EncoderFailed)?;
         if (tick + 1) % PROGRESS_EVERY == 0 {
             progress((tick + 1) as f32 / total as f32);
