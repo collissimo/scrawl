@@ -674,6 +674,10 @@ fn dictate(
         give_back(session);
         return Err(error);
     }
+    crate::capture::scrawl_log(format!(
+        "Claude Code dictation: listening {} ms into the recording",
+        from_sample / 16
+    ));
     while !released.load(Ordering::Acquire) {
         if !session.is_alive() {
             give_back(session);
