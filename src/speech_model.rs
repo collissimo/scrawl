@@ -382,16 +382,16 @@ mod tests {
             ("xx".into(), Engine::Apple),
             &failed
         ));
-        // Hex to Claude Code, which falls back to the local model.
+        // The engine changed: check again.
         assert!(should_ensure(
             &mut last,
-            ("xx".into(), Engine::Claude),
+            ("xx".into(), Engine::Hex),
             &failed
         ));
         // A download for the old language finished after the change: check again.
         assert!(should_ensure(
             &mut last,
-            ("xx".into(), Engine::Claude),
+            ("xx".into(), Engine::Hex),
             &status(State::Ready, "xx-old")
         ));
     }

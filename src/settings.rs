@@ -779,16 +779,11 @@ fn microphone_view(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriberView {
-    /// What recordings use now: "apple", "hex" or (Windows) "claude".
+    /// What recordings use now: "apple" or "hex".
     pub engine: &'static str,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub models: Vec<ModelView>,
-    /// Claude Code dictation: shown only on Windows, greyed out with the reason when `claude`
-    /// can't be found.
-    pub claude_offered: bool,
-    pub claude_title: String,
-    pub claude_enabled: bool,
 }
 
 /// The Language popup: `language` in `config.json`, English unless set.
@@ -931,7 +926,7 @@ fn shortcut_view(
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum Action {
     /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
-    /// ("default" or a device id), `transcriber` ("apple"/"hex"/"claude"), `hexModel` (an id),
+    /// ("default" or a device id), `transcriber` ("apple"/"hex"), `hexModel` (an id),
     /// `language` (a code from `LanguageView::options`), `retention` (a preset id),
     /// `deleteVideo` (bool).
     Set {
@@ -997,8 +992,8 @@ pub trait Host {
     fn set_login_item(&mut self, on: bool) -> anyhow::Result<()>;
     /// Scrawl's binary and the folders `scrawl` may be linked into.
     fn command_line(&self) -> crate::command_line::Places;
-    /// The transcriber or the language changed: fetch the speech model for it now, and start
-    /// Claude Code's session if it's the engine, so the next recording doesn't wait.
+    /// The transcriber or the language changed: fetch the speech model for it now, so the next
+    /// recording doesn't wait.
     fn transcription_changed(&mut self);
 }
 
@@ -1236,9 +1231,6 @@ impl Panel {
             .unwrap_or_default();
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
         let language = crate::handoff::language_of(&config);
-        let claude = crate::transcribe::claude_choice();
-        #[cfg(target_os = "windows")]
-        let claude = crate::win::languages::claude_choice_for(claude, &language);
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
         // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
@@ -1282,13 +1274,7 @@ impl Panel {
                 self.status(Permission::Microphone) == Status::Granted,
             ),
             transcriber: TranscriberView {
-                engine: if menu.hex_checked {
-                    "hex"
-                } else if claude.enabled && engine == crate::transcribe::Engine::Claude {
-                    "claude"
-                } else {
-                    "apple"
-                },
+                engine: if menu.hex_checked { "hex" } else { "apple" },
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
                 models: menu
@@ -1296,9 +1282,6 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
-                claude_offered: claude.offered,
-                claude_title: claude.title,
-                claude_enabled: claude.enabled,
             },
             language: language_view(&language),
             video_export: config.video_export.unwrap_or(false),
@@ -1400,14 +1383,9 @@ impl Host for AppHost<'_> {
 }
 
 /// After the transcriber or the language changed (Settings, the tray): fetches the speech model
-/// for it now, and starts Claude Code's session when it's the engine, so the next recording
-/// doesn't wait for either.
+/// for it now, so the next recording doesn't wait for it.
 pub fn transcription_changed() {
     crate::speech_model::ensure();
-    #[cfg(target_os = "windows")]
-    if crate::win::claude_dictation::wanted() {
-        crate::win::claude_dictation::warm();
-    }
 }
 
 /// Whether the Language popup offers `code`.
@@ -1634,8 +1612,7 @@ impl Session {
         view["type"] = "state".into();
         // Switched from Hex to Apple Speech: get its model now, not at the first capture.
         let speech = crate::speech_model::current();
-        // Claude Code dictation falls back to the local model.
-        if (view["transcriber"]["engine"] == "apple" || view["transcriber"]["engine"] == "claude")
+        if view["transcriber"]["engine"] == "apple"
             && speech.state == crate::speech_model::State::Unknown
         {
             crate::speech_model::ensure();
@@ -2200,33 +2177,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_dictation_is_a_windows_choice() {
-        let dir = TempDir::new("claude");
-        let mut host = fake(&dir);
-        let mut panel = Panel::default();
-        panel.on(
-            Action::Set {
-                key: "transcriber".into(),
-                value: "claude".into(),
-            },
-            &mut host,
-        );
-        let view = panel.view(&host).transcriber;
-        assert_eq!(view.claude_offered, WIN);
-        let saved = read_json(&host.path);
-        if WIN {
-            assert_eq!(saved["transcriber"], "claude");
-            // Chosen only when claude.exe can be found; otherwise recordings use the local model.
-            assert_eq!(view.engine == "claude", view.claude_enabled);
-            assert!(view.claude_title.starts_with("Claude Code (dictation)"));
-        } else {
-            assert!(saved.get("transcriber").is_none());
-            assert_eq!(view.engine, "apple");
-            assert!(!view.claude_enabled);
-        }
-    }
-
-    #[test]
     #[cfg(target_os = "windows")]
     fn the_language_popup_writes_language_and_fetches_its_model() {
         let dir = TempDir::new("language");
@@ -2256,43 +2206,24 @@ mod tests {
                 host,
             )
         };
-        set(&mut panel, &mut host, "ja");
-        assert_eq!(read_json(&host.path)["language"], "ja");
+        set(&mut panel, &mut host, "fi");
+        assert_eq!(read_json(&host.path)["language"], "fi");
         assert_eq!(host.changed, 1);
-        let note = panel.view(&host).language.unwrap().note.unwrap();
-        assert!(note.contains("日本語"), "{note}");
+        assert_eq!(panel.view(&host).language.unwrap().note, None);
         // Not a language the popup offers: nothing is written or fetched.
-        set(&mut panel, &mut host, "zh");
+        set(&mut panel, &mut host, "ja");
         set(&mut panel, &mut host, "German");
-        assert_eq!(read_json(&host.path)["language"], "ja");
+        assert_eq!(read_json(&host.path)["language"], "fi");
         assert_eq!(host.changed, 1);
-        // Choosing an engine fetches its model and warms Claude Code too (R3-9).
+        // Choosing an engine fetches its model too (R3-9).
         panel.on(
             Action::Set {
                 key: "transcriber".into(),
-                value: "claude".into(),
+                value: "hex".into(),
             },
             &mut host,
         );
         assert_eq!(host.changed, 2);
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn claude_code_is_greyed_out_for_a_language_it_cannot_dictate() {
-        let dir = TempDir::new("claude-fi");
-        let host = fake(&dir);
-        let panel = Panel::default();
-        std::fs::write(&host.path, r#"{"language":"fi","transcriber":"claude"}"#).unwrap();
-        let view = panel.view(&host).transcriber;
-        assert!(view.claude_offered && !view.claude_enabled);
-        // Either reason greys it out; with claude.exe on PATH it's the language.
-        if crate::win::claude_dictation::available() {
-            assert_eq!(view.claude_title, "Claude Code (dictation): no Suomi dictation");
-        }
-        assert_eq!(view.engine, "apple");
-        // Parakeet speaks Finnish: no note.
-        assert_eq!(panel.view(&host).language.unwrap().note, None);
     }
 
     #[test]

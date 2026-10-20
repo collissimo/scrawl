@@ -77,16 +77,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// `--transcriber` for `import` and `reprocess`, which transcribe a saved file: Claude Code
-/// dictation listens to the microphone, so it can't.
 fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
-    match crate::transcribe::Engine::parse(name) {
-        Some(crate::transcribe::Engine::Claude) => {
-            Err("Claude Code dictation only runs while recording".to_owned())
-        }
-        Some(engine) => Ok(engine),
-        None => Err("expected `apple` or `hex`".to_owned()),
-    }
+    crate::transcribe::Engine::parse(name).ok_or_else(|| "expected `apple` or `hex`".to_owned())
 }
 
 /// `scrawl hex status`: connection, models and what the next recording would use.
@@ -319,19 +311,6 @@ enum Command {
     Mic {
         #[command(subcommand)]
         command: MicCommand,
-    },
-    /// Check Claude Code dictation: start a hidden session, take typed text back out through its
-    /// editor hook, hold dictation for 2 s (records the default microphone), then cancel one.
-    #[cfg(target_os = "windows")]
-    #[command(name = "dictation-selftest", hide = true)]
-    DictationSelftest,
-    /// Claude Code's `$EDITOR` for the hidden dictation session: hands the prompt to Scrawl.
-    #[cfg(target_os = "windows")]
-    #[command(name = "claude-editor", hide = true)]
-    ClaudeEditor {
-        /// The prompt file; the last argument, as editors are given it.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        args: Vec<PathBuf>,
     },
     /// Check the Hex transcriber: is it running, which models are ready, which one Scrawl uses.
     Hex {
@@ -1941,19 +1920,6 @@ fn main() -> Result<()> {
             mic_list();
             Ok(())
         }
-        #[cfg(target_os = "windows")]
-        Command::DictationSelftest => {
-            if win::claude_dictation::selftest()? {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
-        }
-        #[cfg(target_os = "windows")]
-        Command::ClaudeEditor { args } => {
-            let file = args.last().context("No file to edit")?;
-            win::claude_dictation::editor_main(file)
-        }
         Command::Hex {
             command: HexCommand::Status,
         } => {
@@ -2356,16 +2322,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn saved_files_cannot_be_transcribed_by_claude_code_dictation() {
+    fn only_on_device_transcribers_parse() {
         assert_eq!(parse_engine("hex"), Ok(transcribe::Engine::Hex));
         assert_eq!(parse_engine("apple"), Ok(transcribe::Engine::Apple));
         assert_eq!(parse_engine("whisper"), Err("expected `apple` or `hex`".to_owned()));
-        if cfg!(target_os = "windows") {
-            assert_eq!(
-                parse_engine("claude"),
-                Err("Claude Code dictation only runs while recording".to_owned())
-            );
-        }
+        assert_eq!(parse_engine("claude"), Err("expected `apple` or `hex`".to_owned()));
         let parsed = Cli::try_parse_from([
             "scrawl",
             "reprocess",

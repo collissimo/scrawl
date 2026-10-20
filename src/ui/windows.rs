@@ -556,7 +556,6 @@ const ID_UPDATES: &str = "check-updates";
 const ID_QUIT: &str = "quit";
 const INBOX_PREFIX: &str = "inbox:";
 const ID_TRANSCRIBE_LOCAL: &str = "transcriber:apple";
-const ID_TRANSCRIBE_CLAUDE: &str = "transcriber:claude";
 const LANGUAGE_PREFIX: &str = "language:";
 
 struct Tray {
@@ -570,7 +569,6 @@ struct Tray {
     dynamic: Vec<Box<dyn IsMenuItem>>,
     /// The Transcription submenu's engines.
     transcribe_local: CheckMenuItem,
-    transcribe_claude: CheckMenuItem,
     /// Its Language submenu, one row per `languages::OFFERED`.
     languages: Vec<(&'static str, CheckMenuItem)>,
     status: Option<String>,
@@ -666,15 +664,7 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
         false,
         None,
     );
-    let transcribe_claude = CheckMenuItem::with_id(
-        ID_TRANSCRIBE_CLAUDE,
-        crate::transcribe::CLAUDE_ENGINE_TITLE,
-        false,
-        false,
-        None,
-    );
     let _ = transcription.append(&transcribe_local);
-    let _ = transcription.append(&transcribe_claude);
     let language = Submenu::new("Language", true);
     let languages: Vec<(&'static str, CheckMenuItem)> = crate::win::languages::OFFERED
         .iter()
@@ -741,7 +731,6 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
             export_shown,
             dynamic: Vec::new(),
             transcribe_local,
-            transcribe_claude,
             languages,
             status: None,
             inbox: 0,
@@ -756,7 +745,6 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
 fn choose_transcriber(id: &MenuId) -> bool {
     let (key, value) = match id.as_ref() {
         ID_TRANSCRIBE_LOCAL => ("transcriber", crate::transcribe::Engine::Apple.name()),
-        ID_TRANSCRIBE_CLAUDE => ("transcriber", crate::transcribe::Engine::Claude.name()),
         other => match other.strip_prefix(LANGUAGE_PREFIX) {
             Some(code) if crate::win::languages::offered(code) => ("language", code),
             _ => return false,
@@ -770,27 +758,20 @@ fn choose_transcriber(id: &MenuId) -> bool {
     true
 }
 
-/// Ticks the engine recordings would use and the language, and greys out Claude Code without
-/// `claude` or for a language it can't dictate.
+/// Ticks the engine recordings would use and the language.
 fn refresh_transcription(tray: &Tray) {
     let preferred = crate::transcribe::Engine::preferred();
     let language = crate::handoff::transcription_language();
     for (code, item) in &tray.languages {
         item.set_checked(*code == language);
     }
-    let claude =
-        crate::win::languages::claude_choice_for(crate::transcribe::claude_choice(), &language);
     let hex = crate::transcribe::menu_state(
         preferred,
         crate::hex::cached_status().as_ref(),
         crate::handoff::hex_model().as_deref(),
     )
     .hex_checked;
-    let claude_checked = claude.enabled && preferred == crate::transcribe::Engine::Claude;
-    tray.transcribe_claude.set_text(&claude.title);
-    tray.transcribe_claude.set_enabled(claude.enabled);
-    tray.transcribe_claude.set_checked(claude_checked);
-    tray.transcribe_local.set_checked(!claude_checked && !hex);
+    tray.transcribe_local.set_checked(!hex);
 }
 
 fn menu_action(id: &MenuId) -> Option<MenuAction> {
