@@ -76,7 +76,11 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] F6 merged: experiment `speechFollowsMarks` (off by default). On his capture, #3 (the circle) now gets "hier ist der Follow-Knopf" and #5 "und hier ist eine Glühbirne." 378 tests pass. Open items:
   - Ask Collin whether to switch it on in his config (`"experiments": {"speechFollowsMarks": true}`).
   - A mark keyframe with speech loses its "marked region" text in `summary.md` (upstream behaviour; clicks keep `[clicked]`).
-- [ ] F4 (running; `C:/t/briefs/F4-full.md`, target scrawl-c, clientRequestId `scrawl-win-F4-overlay-1`): BUG from Collin. Ink stops showing on screen after a click on the other monitor, though it is still recorded. Evidence: bundle `scrawl-1792514420118-44d4-3`, log `[1792514413614]`.
+- [x] F4 merged (5fda633): an ink overlay watchdog. 386 tests pass.
+  - What it does: every 100 ms it checks the overlay. After 600 ms without drawing, or when the overlay is hidden, minimized, misplaced, not topmost or covered, it redraws and re-raises it.
+  - Diagnostics: log lines `ink overlay …`.
+  - The bug was NOT reproduced. Likely cause: a GPUI `request_animation_frame` lost on a failed `try_borrow_mut`.
+  - [ ] Collin re-tests with `C:/t/scrawl-test2/scrawl.exe`. Look in the log for "stopped drawing" / "draws again" / "is covered by". If it shows "stopped drawing" without "draws again", the next step is reopening the overlay window.
 - [ ] F5 (running; `C:/t/briefs/F5-full.md`, target scrawl-a, clientRequestId `scrawl-win-F5-video-storage-1`): Collin wants recordings to use less disk.
   - VBR at full resolution. 720p is ruled out because frames are decoded from the video.
   - An opt-in "delete the video after each capture".
