@@ -6,8 +6,9 @@
 //! Also the Win32 window helpers Scrawl's other popups use.
 
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, Corners, Edges, Hsla, IntoElement, PathBuilder, PathStyle, Pixels, Point,
@@ -16,8 +17,9 @@ use gpui::{
 };
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_NCRENDERING_POLICY,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Gdi::{
@@ -27,14 +29,16 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, LWA_ALPHA,
+    GW_HWNDPREV, GWL_EXSTYLE, GetClassNameW, GetClientRect, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LWA_ALPHA,
     PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetLayeredWindowAttributes,
     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
     WM_CLOSE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 use windows::core::{PCSTR, w};
 
-use crate::capture::SharedCaptureTelemetry;
+use super::Monitor;
+use crate::capture::{SharedCaptureTelemetry, scrawl_log};
 use crate::model::RgbaFrame;
 use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
 
@@ -181,6 +185,40 @@ struct Placement {
 pub struct InkOverlay {
     hwnd: isize,
     placement: Arc<Mutex<Placement>>,
+    /// Cleared on drop: stops the watchdog.
+    alive: Arc<AtomicBool>,
+}
+
+/// The display holding the centre of `rect` (global pixels), else the one nearest to it, as
+/// `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)` picks.
+fn display_for(monitors: &[Monitor], rect: [f64; 4]) -> Option<Monitor> {
+    let [x, y, w, h] = rect;
+    let centre = [x + w / 2.0, y + h / 2.0];
+    let distance = |m: &Monitor| {
+        let [mx, my, mw, mh] = m.rect;
+        let dx = (mx - centre[0]).max(centre[0] - (mx + mw)).max(0.0);
+        let dy = (my - centre[1]).max(centre[1] - (my + mh)).max(0.0);
+        dx.hypot(dy)
+    };
+    monitors
+        .iter()
+        .find(|m| crate::screens::contains(m.rect, centre))
+        .or_else(|| {
+            monitors
+                .iter()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+        })
+        .cloned()
+}
+
+/// Where the overlay goes for `rect`: the display holding it, or `None` when that's the one it
+/// covers already (or there's none).
+fn next_display(monitors: &[Monitor], covers: [f64; 4], rect: [f64; 4]) -> Option<Monitor> {
+    display_for(monitors, rect).filter(|m| !same_rect(m.rect, covers))
+}
+
+fn same_rect(a: [f64; 4], b: [f64; 4]) -> bool {
+    (0..4).all(|i| (a[i] - b[i]).abs() < 1.0)
 }
 
 impl InkOverlay {
@@ -191,7 +229,7 @@ impl InkOverlay {
         cx: &mut Context<T>,
     ) -> Result<Self, String> {
         let monitor = on
-            .and_then(|[x, y, w, h]| super::monitor_at(x + w / 2.0, y + h / 2.0))
+            .and_then(|rect| display_for(&super::monitors(), rect))
             .or_else(super::primary_monitor)
             .ok_or("No display")?;
         let display_id = crate::ui::gpui_display_for(&monitor, cx).map(|d| d.id());
@@ -209,6 +247,11 @@ impl InkOverlay {
         let rect = monitor.rect;
         let placement = Arc::new(Mutex::new(Placement { rect, scale }));
         let view_placement = Arc::clone(&placement);
+        // When it last drew, for the watchdog: GPUI draws it again only while each frame asks
+        // for the next one (`request_animation_frame`), and one lost request stops it for good.
+        let drawn = Arc::new(AtomicU64::new(clock_ms()));
+        let view_drawn = Arc::clone(&drawn);
+        let watch_telemetry = Arc::clone(&telemetry);
         let handle = cx
             .open_window(
                 WindowOptions {
@@ -245,6 +288,7 @@ impl InkOverlay {
                     cx.new(|_| OverlayView {
                         telemetry,
                         placement: view_placement,
+                        drawn: view_drawn,
                     })
                 },
             )
@@ -257,10 +301,24 @@ impl InkOverlay {
         // Resized on the next turn of the event loop: called from inside an update, GPUI's
         // resize callback can't reach the app and the window keeps its default layout size.
         let id = hwnd.0 as isize;
+        scrawl_log(format!(
+            "ink overlay opens on display {rect:?} (scale {scale}) for {on:?}"
+        ));
         cx.spawn(async move |_, _| place(id, rect)).detach();
+        let alive = Arc::new(AtomicBool::new(true));
+        let watchdog = Watchdog {
+            id,
+            handle,
+            telemetry: watch_telemetry,
+            placement: Arc::clone(&placement),
+            drawn,
+            alive: Arc::clone(&alive),
+        };
+        cx.spawn(async move |_, cx| watchdog.run(cx).await).detach();
         Ok(Self {
             hwnd: hwnd.0 as isize,
             placement,
+            alive,
         })
     }
 
@@ -279,23 +337,24 @@ impl InkOverlay {
     /// Moves to the display holding the centre of `rect` (global pixels). Returns whether it
     /// moved: false when it's on that display already or there's none there.
     pub fn move_to(&mut self, rect: [f64; 4]) -> bool {
-        let [x, y, w, h] = rect;
-        let Some(monitor) = super::monitor_at(x + w / 2.0, y + h / 2.0) else {
-            return false;
-        };
-        {
+        let monitor = {
             let mut placement = self
                 .placement
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if (0..4).all(|i| (placement.rect[i] - monitor.rect[i]).abs() < 1.0) {
+            let Some(monitor) = next_display(&super::monitors(), placement.rect, rect) else {
                 return false;
-            }
+            };
             *placement = Placement {
                 rect: monitor.rect,
                 scale: monitor.scale as f32,
             };
-        }
+            monitor
+        };
+        scrawl_log(format!(
+            "ink overlay moves to display {:?} (scale {}) for {rect:?}",
+            monitor.rect, monitor.scale
+        ));
         // Off the UI thread: this runs inside a GPUI update, where the resize callback can't
         // reach the app (see `open`); the window's thread handles the move from its loop.
         let id = self.hwnd;
@@ -309,6 +368,11 @@ impl InkOverlay {
 /// reach GPUI's resize and DPI handlers at once.
 pub(crate) fn place(id: isize, rect: [f64; 4]) {
     let hwnd = super::hwnd(id);
+    // A minimized window is restored first: moved while minimized, it would come back where it
+    // was before.
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    }
     let [x, y, w, h] = rect.map(|v| v.round() as i32);
     let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE) };
     // GPUI keeps a resize frame around the client area; grow the window by it so the client
@@ -337,8 +401,335 @@ fn grown_by_frame(target: [i32; 4], window: RECT, origin: POINT, client: RECT) -
     [x - left, y - top, w + left + right, h + top + bottom]
 }
 
+/// Milliseconds on a process-wide monotonic clock (never 0).
+fn clock_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// How often the watchdog looks, how long the overlay may go without drawing, and how long a
+/// repair gets before the next one.
+const WATCH_MS: u64 = 100;
+const STALL_MS: u64 = 600;
+const RETRY_MS: u64 = 1_000;
+
+/// What Windows says about the overlay's window.
+#[derive(Clone, Debug, PartialEq)]
+struct WindowState {
+    visible: bool,
+    minimized: bool,
+    topmost: bool,
+    /// Its client area (what GPUI draws into), global pixels.
+    client: [i32; 4],
+}
+
+impl std::fmt::Display for WindowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "visible={} topmost={} minimized={} client={:?}",
+            self.visible, self.topmost, self.minimized, self.client
+        )
+    }
+}
+
+fn window_state(id: isize) -> Option<WindowState> {
+    let hwnd = super::hwnd(id);
+    let (mut client, mut origin) = (RECT::default(), POINT::default());
+    unsafe {
+        GetClientRect(hwnd, &mut client).ok()?;
+        if !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return None;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        Some(WindowState {
+            visible: IsWindowVisible(hwnd).as_bool(),
+            minimized: IsIconic(hwnd).as_bool(),
+            topmost: style & WS_EX_TOPMOST.0 != 0,
+            client: [origin.x, origin.y, client.right, client.bottom],
+        })
+    }
+}
+
+/// Windows that sit above everything on purpose, at a display's edge or only briefly: the
+/// taskbars, menus and tooltips.
+const SHELL_BARS: [&str; 4] = [
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "#32768",
+    "tooltips_class32",
+];
+
+/// The first window above the overlay (in z-order) that overlaps `area` (global pixels) and
+/// isn't process `own`'s, as "class (pid N)".
+fn covering_window(id: isize, area: [f64; 4], own: u32) -> Option<String> {
+    let mut next = unsafe { GetWindow(super::hwnd(id), GW_HWNDPREV) };
+    for _ in 0..256 {
+        let above = next.ok().filter(|h| !h.is_invalid())?;
+        next = unsafe { GetWindow(above, GW_HWNDPREV) };
+        let mut cloaked = 0_u32;
+        let _ = unsafe {
+            DwmGetWindowAttribute(
+                above,
+                DWMWA_CLOAKED,
+                (&raw mut cloaked).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        let mut pid = 0_u32;
+        unsafe { GetWindowThreadProcessId(above, Some(&mut pid)) };
+        let shown = unsafe { IsWindowVisible(above).as_bool() && !IsIconic(above).as_bool() };
+        if !shown || cloaked != 0 || pid == own {
+            continue;
+        }
+        let Some(frame) = super::window_frame(above).or_else(|| window_rect(above)) else {
+            continue;
+        };
+        if !overlaps(frame, area) {
+            continue;
+        }
+        let mut buffer = [0_u16; 128];
+        let read = unsafe { GetClassNameW(above, &mut buffer) };
+        let class = String::from_utf16_lossy(&buffer[..read.max(0) as usize]);
+        if SHELL_BARS.contains(&class.as_str()) {
+            continue;
+        }
+        return Some(format!("{class} (pid {pid})"));
+    }
+    None
+}
+
+fn window_rect(hwnd: HWND) -> Option<[f64; 4]> {
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r) }.ok()?;
+    Some([r.left, r.top, r.right - r.left, r.bottom - r.top].map(f64::from))
+}
+
+fn overlaps(a: [f64; 4], b: [f64; 4]) -> bool {
+    let w = (a[0] + a[2]).min(b[0] + b[2]) - a[0].max(b[0]);
+    let h = (a[1] + a[3]).min(b[1] + b[3]) - a[1].max(b[1]);
+    w >= 1.0 && h >= 1.0
+}
+
+/// What's wrong with the overlay's window, for the display it should cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    Hidden,
+    Minimized,
+    NotTopmost,
+    /// Its client area isn't the display's rect.
+    Misplaced,
+}
+
+fn faults(state: &WindowState, display: [f64; 4]) -> Vec<Fault> {
+    let mut faults = Vec::new();
+    if !state.visible {
+        faults.push(Fault::Hidden);
+    }
+    if state.minimized {
+        faults.push(Fault::Minimized);
+    }
+    if !state.topmost {
+        faults.push(Fault::NotTopmost);
+    }
+    if (0..4).any(|i| (f64::from(state.client[i]) - display[i]).abs() > 2.0) {
+        faults.push(Fault::Misplaced);
+    }
+    faults
+}
+
+/// One look at the overlay.
+struct Look {
+    now: u64,
+    /// When it last drew.
+    drawn: u64,
+    state: Option<WindowState>,
+    /// The display it should cover, global pixels.
+    display: [f64; 4],
+    covered_by: Option<String>,
+    /// Shift ink is being drawn.
+    shift: bool,
+    pointer_on_display: bool,
+}
+
+/// What to do about a look: lines for the log, a redraw (restarting GPUI's frame requests), and
+/// putting the window back over its display on top.
+#[derive(Debug, Default, PartialEq)]
+struct Repair {
+    logs: Vec<String>,
+    redraw: bool,
+    reassert: bool,
+}
+
+/// The watchdog's memory between looks, so it logs each change once.
+#[derive(Default)]
+struct Watch {
+    logged: Option<WindowState>,
+    stalled_since: Option<u64>,
+    faults: Vec<Fault>,
+    covered_by: Option<String>,
+    /// Covering windows already named in the log.
+    named: Vec<String>,
+    last_repair: Option<u64>,
+    shift: bool,
+    pointer_on_display: bool,
+}
+
+impl Watch {
+    fn look(&mut self, look: &Look) -> Repair {
+        let mut repair = Repair::default();
+        let retry_due = self
+            .last_repair
+            .is_none_or(|t| look.now.saturating_sub(t) >= RETRY_MS);
+        let described = look
+            .state
+            .as_ref()
+            .map_or_else(|| "no window".to_owned(), ToString::to_string);
+        if look.state != self.logged {
+            repair.logs.push(format!(
+                "ink overlay window for display {:?}: {described}",
+                look.display
+            ));
+            self.logged = look.state.clone();
+        }
+
+        // GPUI draws the overlay only while each frame asks for the next; a request it drops
+        // (a paint while the app is busy) leaves the last frame up with no ink.
+        let quiet = look.now.saturating_sub(look.drawn);
+        if quiet >= STALL_MS {
+            if self.stalled_since.is_none() {
+                self.stalled_since = Some(look.drawn);
+                repair.logs.push(format!(
+                    "ink overlay stopped drawing {quiet} ms ago ({described}): redrawing it"
+                ));
+                repair.redraw = true;
+                repair.reassert = true;
+            } else if retry_due {
+                repair.redraw = true;
+                repair.reassert = true;
+            }
+        } else if let Some(since) = self.stalled_since.take() {
+            repair.logs.push(format!(
+                "ink overlay draws again after {} ms",
+                look.drawn.saturating_sub(since)
+            ));
+        }
+
+        let faults = look
+            .state
+            .as_ref()
+            .map_or_else(Vec::new, |state| faults(state, look.display));
+        if faults != self.faults {
+            if !faults.is_empty() {
+                repair.logs.push(format!(
+                    "ink overlay is {faults:?} ({described}): putting it back over {:?}",
+                    look.display
+                ));
+                repair.reassert = true;
+            }
+            self.faults = faults;
+        } else if !faults.is_empty() && retry_due {
+            repair.reassert = true;
+        }
+
+        if look.covered_by != self.covered_by {
+            if let Some(by) = &look.covered_by {
+                if !self.named.contains(by) {
+                    repair
+                        .logs
+                        .push(format!("ink overlay is covered by {by}: raising it"));
+                    self.named.push(by.clone());
+                }
+                repair.reassert = true;
+            }
+            self.covered_by = look.covered_by.clone();
+        }
+
+        // Cheap insurance where it matters: as Shift ink starts and as the pointer comes back
+        // to the overlay's display.
+        if (look.shift && !self.shift) || (look.pointer_on_display && !self.pointer_on_display) {
+            repair.reassert = true;
+        }
+        self.shift = look.shift;
+        self.pointer_on_display = look.pointer_on_display;
+        if repair.redraw || repair.reassert {
+            self.last_repair = Some(look.now);
+        }
+        repair
+    }
+}
+
+/// Watches the overlay while it's open: logs its window's state once per change, and puts it
+/// back when it stops drawing or isn't on top over its display any more.
+struct Watchdog {
+    id: isize,
+    handle: gpui::WindowHandle<OverlayView>,
+    telemetry: Arc<SharedCaptureTelemetry>,
+    placement: Arc<Mutex<Placement>>,
+    drawn: Arc<AtomicU64>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    async fn run(self, cx: &mut gpui::AsyncApp) {
+        let mut watch = Watch::default();
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(WATCH_MS))
+                .await;
+            if !self.alive.load(Ordering::Acquire) {
+                return;
+            }
+            let display = self
+                .placement
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rect;
+            let t = &self.telemetry;
+            let frame = *t
+                .target_frame
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let area = if t.active.load(Ordering::Acquire) && frame.x > -10_000.0 {
+                [frame.x, frame.y, frame.width, frame.height]
+            } else {
+                display
+            };
+            let look = Look {
+                now: clock_ms(),
+                drawn: self.drawn.load(Ordering::Acquire),
+                state: window_state(self.id),
+                display,
+                covered_by: covering_window(self.id, area, std::process::id()),
+                shift: t.shift_held.load(Ordering::Acquire),
+                pointer_on_display: super::cursor_position()
+                    .is_some_and(|(x, y)| crate::screens::contains(display, [x, y])),
+            };
+            let repair = watch.look(&look);
+            for line in &repair.logs {
+                scrawl_log(line);
+            }
+            if repair.redraw {
+                let _ = self.handle.update(cx, |_, window, cx| {
+                    cx.notify();
+                    window.refresh();
+                });
+            }
+            if repair.reassert {
+                // Off the UI thread, like `move_to`: the moves reach GPUI's handlers at once.
+                let id = self.id;
+                std::thread::spawn(move || {
+                    place(id, display);
+                    crate::ui::raise_floating_windows();
+                });
+            }
+        }
+    }
+}
+
 impl Drop for InkOverlay {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
         let _ =
             unsafe { PostMessageW(Some(super::hwnd(self.hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
     }
@@ -348,6 +739,8 @@ struct OverlayView {
     telemetry: Arc<SharedCaptureTelemetry>,
     /// The display it covers (moved by `InkOverlay::move_to`).
     placement: Arc<Mutex<Placement>>,
+    /// When it last drew (`clock_ms`), for the watchdog.
+    drawn: Arc<AtomicU64>,
 }
 
 /// One frame's geometry, in the window's points.
@@ -761,6 +1154,7 @@ fn paint_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window) {
 
 impl Render for OverlayView {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.drawn.store(clock_ms(), Ordering::Release);
         let size = window.viewport_size();
         let scene = self.scene([f32::from(size.width), f32::from(size.height)]);
         // Telemetry changes on other threads; follow it every frame while the overlay is up.
@@ -806,5 +1200,343 @@ mod tests {
             rect(0, 0, 400, 100),
         );
         assert_eq!(none, [-1920, 0, 400, 100]);
+    }
+
+    /// Collin's desk: a 1080p primary and a 1440p display to its right, both at 100 %.
+    fn desk() -> Vec<Monitor> {
+        let monitor = |handle, rect: [f64; 4], primary| Monitor {
+            handle,
+            rect,
+            work: [rect[0], rect[1], rect[2], rect[3] - 40.0],
+            scale: 1.0,
+            primary,
+        };
+        vec![
+            monitor(1, [0.0, 0.0, 1920.0, 1080.0], true),
+            monitor(2, [1920.0, 0.0, 2560.0, 1440.0], false),
+        ]
+    }
+
+    const LEFT: [f64; 4] = [0.0, 0.0, 1920.0, 1080.0];
+    const RIGHT: [f64; 4] = [1920.0, 0.0, 2560.0, 1440.0];
+
+    #[test]
+    fn the_overlay_covers_the_display_holding_the_targets_centre() {
+        let desk = desk();
+        let on = |rect| display_for(&desk, rect).map(|m| m.rect);
+        assert_eq!(on(RIGHT), Some(RIGHT));
+        // The window Collin recorded.
+        assert_eq!(on([2713.0, 151.0, 892.0, 739.0]), Some(RIGHT));
+        assert_eq!(on([100.0, 100.0, 400.0, 300.0]), Some(LEFT));
+        // Straddling both: its centre decides.
+        assert_eq!(on([1500.0, 100.0, 1000.0, 300.0]), Some(RIGHT));
+        assert_eq!(on([1000.0, 100.0, 1000.0, 300.0]), Some(LEFT));
+        // Below the shorter display: the nearest one.
+        assert_eq!(on([100.0, 1200.0, 200.0, 100.0]), Some(LEFT));
+        assert_eq!(on([-900.0, 100.0, 200.0, 100.0]), Some(LEFT));
+        assert_eq!(display_for(&[], RIGHT).map(|m| m.rect), None);
+    }
+
+    #[test]
+    fn a_retarget_on_the_same_display_keeps_the_overlay_where_it_is() {
+        let desk = desk();
+        // Collin's run: a Display recording of the right display, Window opens the picker there,
+        // then a Region of a window on it. The overlay never moves.
+        let mut covers = display_for(&desk, RIGHT).unwrap().rect;
+        assert_eq!(covers, RIGHT);
+        for rect in [RIGHT, [2713.0, 151.0, 892.0, 739.0]] {
+            assert!(next_display(&desk, covers, rect).is_none());
+        }
+        // The picker followed the pointer to the left display, and the window picked is on the
+        // right one: it moves there and back.
+        let to_left = next_display(&desk, covers, LEFT).unwrap();
+        assert_eq!(to_left.rect, LEFT);
+        covers = to_left.rect;
+        let back = next_display(&desk, covers, [2713.0, 151.0, 892.0, 739.0]).unwrap();
+        assert_eq!(back.rect, RIGHT);
+    }
+
+    fn healthy() -> WindowState {
+        WindowState {
+            visible: true,
+            minimized: false,
+            topmost: true,
+            client: [1920, 0, 2560, 1440],
+        }
+    }
+
+    #[test]
+    fn faults_name_whatever_keeps_the_overlay_off_its_display() {
+        assert!(faults(&healthy(), RIGHT).is_empty());
+        // A pixel of rounding is fine.
+        let nudged = WindowState {
+            client: [1921, 0, 2559, 1440],
+            ..healthy()
+        };
+        assert!(faults(&nudged, RIGHT).is_empty());
+        let lost = WindowState {
+            visible: false,
+            minimized: true,
+            topmost: false,
+            client: [0, 0, 1920, 1080],
+        };
+        assert_eq!(
+            faults(&lost, RIGHT),
+            vec![
+                Fault::Hidden,
+                Fault::Minimized,
+                Fault::NotTopmost,
+                Fault::Misplaced
+            ]
+        );
+        assert_eq!(faults(&healthy(), LEFT), vec![Fault::Misplaced]);
+    }
+
+    fn look(now: u64, drawn: u64) -> Look {
+        Look {
+            now,
+            drawn,
+            state: Some(healthy()),
+            display: RIGHT,
+            covered_by: None,
+            shift: false,
+            pointer_on_display: true,
+        }
+    }
+
+    #[test]
+    fn the_watchdog_logs_the_window_once_per_change() {
+        let mut watch = Watch::default();
+        let first = watch.look(&look(1_000, 990));
+        assert_eq!(first.logs.len(), 1, "{:?}", first.logs);
+        assert!(first.logs[0].contains("visible=true topmost=true"));
+        assert!(watch.look(&look(1_100, 1_090)).logs.is_empty());
+        let moved = Look {
+            state: Some(WindowState {
+                client: [1920, 0, 2560, 1400],
+                ..healthy()
+            }),
+            ..look(1_200, 1_190)
+        };
+        let repair = watch.look(&moved);
+        assert_eq!(repair.logs.len(), 2, "{:?}", repair.logs);
+        assert!(repair.logs[1].contains("Misplaced"));
+        assert!(repair.reassert);
+    }
+
+    #[test]
+    fn a_stalled_overlay_is_redrawn_and_its_recovery_logged() {
+        let mut watch = Watch::default();
+        watch.look(&look(1_000, 990));
+        // 600 ms without a frame: logged once, redrawn and put back.
+        let stalled = watch.look(&look(1_700, 1_000));
+        assert!(stalled.redraw && stalled.reassert);
+        assert_eq!(stalled.logs.len(), 1);
+        assert!(stalled.logs[0].contains("stopped drawing 700 ms ago"));
+        // Still stalled: quiet, and retried once a second.
+        let quiet = watch.look(&look(1_800, 1_000));
+        assert_eq!(quiet, Repair::default());
+        let retry = watch.look(&look(2_700, 1_000));
+        assert!(retry.redraw && retry.reassert && retry.logs.is_empty());
+        let back = watch.look(&look(2_800, 2_790));
+        assert_eq!(back.logs, vec!["ink overlay draws again after 1790 ms".to_owned()]);
+        assert!(!back.redraw);
+    }
+
+    #[test]
+    fn the_overlay_is_put_back_when_it_loses_its_place() {
+        let mut watch = Watch::default();
+        watch.look(&look(1_000, 990));
+        let demoted = Look {
+            state: Some(WindowState {
+                topmost: false,
+                ..healthy()
+            }),
+            ..look(1_100, 1_090)
+        };
+        let repair = watch.look(&demoted);
+        assert!(repair.reassert);
+        assert!(repair.logs.iter().any(|l| l.contains("NotTopmost")));
+        // Same fault a moment later: no new log, no new repair until the retry is due.
+        let again = Look {
+            now: 1_200,
+            drawn: 1_190,
+            ..demoted
+        };
+        assert_eq!(watch.look(&again), Repair::default());
+        let due = Look {
+            now: 2_100,
+            drawn: 2_090,
+            ..again
+        };
+        let retry = watch.look(&due);
+        assert!(retry.reassert && retry.logs.is_empty());
+    }
+
+    #[test]
+    fn a_covering_window_is_named_once_and_the_overlay_raised_each_time() {
+        let mut watch = Watch::default();
+        watch.look(&look(1_000, 990));
+        let covered = |now| Look {
+            covered_by: Some("Chrome_WidgetWin_1 (pid 42)".into()),
+            ..look(now, now - 10)
+        };
+        let first = watch.look(&covered(1_100));
+        assert!(first.reassert);
+        assert_eq!(first.logs.len(), 1);
+        assert!(first.logs[0].contains("covered by Chrome_WidgetWin_1 (pid 42)"));
+        assert!(!watch.look(&look(1_200, 1_190)).reassert);
+        let second = watch.look(&covered(1_300));
+        assert!(second.reassert && second.logs.is_empty());
+    }
+
+    #[test]
+    fn shift_ink_and_the_pointer_coming_back_put_the_overlay_on_top() {
+        let mut watch = Watch::default();
+        watch.look(&look(1_000, 990));
+        assert!(!watch.look(&look(1_100, 1_090)).reassert);
+        let shift = |now| Look {
+            shift: true,
+            ..look(now, now - 10)
+        };
+        assert!(watch.look(&shift(1_200)).reassert);
+        assert!(!watch.look(&shift(1_300)).reassert);
+        let away = Look {
+            pointer_on_display: false,
+            ..look(1_400, 1_390)
+        };
+        assert!(!watch.look(&away).reassert);
+        let back = watch.look(&look(1_500, 1_490));
+        assert!(back.reassert && back.logs.is_empty());
+    }
+
+    /// A popup with the overlay's styles, fully transparent (alpha 0), so nothing shows on
+    /// screen and every click falls through.
+    fn ghost_window(name: &str) -> HWND {
+        use windows::Win32::Foundation::LRESULT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW, WS_POPUP,
+        };
+        unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        let class = w!("ScrawlOverlayTest");
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(proc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        unsafe { RegisterClassW(&wc) };
+        let title: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let ex = WS_EX_TRANSPARENT
+            | WS_EX_LAYERED
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE
+            | WS_EX_TOPMOST;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                ex,
+                class,
+                windows::core::PCWSTR(title.as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+        }
+        .unwrap();
+        unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA) }.unwrap();
+        hwnd
+    }
+
+    /// Opens two invisible, click-through, never-activating windows for about a second: the
+    /// overlay goes to the second display and back, is hidden, minimized, demoted from the top
+    /// band and covered, and `place` puts it back each time. Needs two displays.
+    /// `cargo test overlay_window -- --ignored --nocapture`
+    #[test]
+    #[ignore = "opens windows on the desktop"]
+    fn overlay_window_is_put_back_on_its_display() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DestroyWindow, HWND_NOTOPMOST, SW_HIDE, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_SHOWWINDOW,
+        };
+        let monitors = super::super::monitors();
+        let Some(primary) = monitors.iter().find(|m| m.primary).cloned() else {
+            panic!("no primary display");
+        };
+        let Some(other) = monitors.iter().find(|m| !m.primary).cloned() else {
+            eprintln!("one display only: nothing to move across");
+            return;
+        };
+        let overlay = ghost_window("overlay");
+        let id = overlay.0 as isize;
+        let check = |step: &str, display: [f64; 4]| {
+            let state = window_state(id).expect("the window is gone");
+            println!("{step}: {state}");
+            assert_eq!(faults(&state, display), vec![], "{step}");
+        };
+        place(id, other.rect);
+        check("placed on the other display", other.rect);
+        place(id, primary.rect);
+        check("moved to the primary", primary.rect);
+        place(id, other.rect);
+        check("moved back", other.rect);
+
+        let _ = unsafe { ShowWindow(overlay, SW_HIDE) };
+        let hidden = window_state(id).unwrap();
+        assert!(faults(&hidden, other.rect).contains(&Fault::Hidden));
+        place(id, other.rect);
+        check("shown again", other.rect);
+
+        let _ = unsafe { ShowWindow(overlay, SW_SHOWMINNOACTIVE) };
+        let minimized = window_state(id).unwrap();
+        println!("minimized: {minimized}");
+        assert!(faults(&minimized, other.rect).contains(&Fault::Minimized));
+        place(id, other.rect);
+        check("restored", other.rect);
+
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        unsafe { SetWindowPos(overlay, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags) }.unwrap();
+        let demoted = window_state(id).unwrap();
+        assert!(faults(&demoted, other.rect).contains(&Fault::NotTopmost));
+        place(id, other.rect);
+        check("back on top", other.rect);
+
+        // Another topmost window over the middle of the display, raised above the overlay.
+        let [x, y, w, h] = other.rect;
+        let area = [x + w / 4.0, y + h / 4.0, w / 2.0, h / 2.0];
+        let cover = ghost_window("cover");
+        let [cx, cy, cw, ch] = area.map(|v| v as i32);
+        unsafe {
+            SetWindowPos(
+                cover,
+                Some(HWND_TOPMOST),
+                cx,
+                cy,
+                cw,
+                ch,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        }
+        .unwrap();
+        let by = covering_window(id, area, 0);
+        println!("covered by: {by:?}");
+        assert!(by.is_some_and(|by| by.starts_with("ScrawlOverlayTest")));
+        assert_eq!(covering_window(id, area, std::process::id()), None);
+        place(id, other.rect);
+        assert_eq!(covering_window(id, area, 0), None, "raised above the cover");
+        check("raised above the cover", other.rect);
+
+        unsafe {
+            let _ = DestroyWindow(cover);
+            let _ = DestroyWindow(overlay);
+        }
     }
 }
