@@ -668,6 +668,9 @@ pub fn watch() {
         .name("scrawl-claude-watch".into())
         .spawn(|| {
             loop {
+                // Keeps the PATH lookup warm whatever the engine, so switching to Claude never
+                // makes a recording's start search PATH on the UI thread.
+                let _ = claude_path();
                 if wanted() {
                     if !failed_recently() {
                         warm();
