@@ -57,8 +57,13 @@ pub struct State {
 }
 
 impl State {
+    /// Status and errors come only from the footer below the prompt box, and the prompt only
+    /// from the box's first row, so dictated words ("listening", "No speech detected") and
+    /// Claude Code's own selection dialogs (one rule, numbered `❯ 1.` rows) never count.
     pub fn of(rows: &[String]) -> Self {
-        let has = |needle: &str| rows.iter().any(|row| row.contains(needle));
+        let layout = Layout::of(rows);
+        let footer = layout.footer(rows);
+        let has = |needle: &str| footer.iter().any(|row| row.contains(needle));
         Self {
             warming: has(STATUS_WARMUP),
             listening: has(STATUS_LISTENING),
@@ -73,8 +78,12 @@ impl State {
                         Trust::NotSelected
                     }
                 }),
-            prompt: rows.iter().any(|row| starts_with_mark(row)),
-            error: voice_error(rows),
+            prompt: layout
+                .prompt_box(rows)
+                .iter()
+                .find(|row| !row.trim().is_empty())
+                .is_some_and(|row| starts_with_mark(row) && !is_option(row)),
+            error: voice_error(footer),
         }
     }
 
@@ -113,7 +122,51 @@ fn starts_with_mark(row: &str) -> bool {
     PROMPT_MARKS.iter().any(|mark| row.starts_with(mark))
 }
 
-/// The first dictation error on screen. It shares its row with unrelated footer text to its left.
+/// A dialog's numbered choice, e.g. `❯ 1. Dark mode`.
+fn is_option(row: &str) -> bool {
+    let rest = PROMPT_MARKS
+        .iter()
+        .find_map(|mark| row.trim().strip_prefix(mark))
+        .unwrap_or(row)
+        .trim_start();
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with('.')
+}
+
+/// Where the horizontal rules are: the prompt box sits between the last two, and Claude Code's
+/// footer (mode, dictation status, errors) below the last.
+struct Layout {
+    rules: Vec<usize>,
+}
+
+impl Layout {
+    fn of(rows: &[String]) -> Self {
+        Self {
+            rules: rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.chars().count() > 20 && row.trim().chars().all(|c| c == '─'))
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+
+    /// The rows below the last rule (none without a rule).
+    fn footer<'a>(&self, rows: &'a [String]) -> &'a [String] {
+        self.rules.last().map_or(&[], |&last| &rows[last + 1..])
+    }
+
+    /// The rows between the last two rules (none without two rules).
+    fn prompt_box<'a>(&self, rows: &'a [String]) -> &'a [String] {
+        match self.rules[..] {
+            [.., above, below] => &rows[above + 1..below],
+            _ => &[],
+        }
+    }
+}
+
+/// The first dictation error in `rows` (the footer). It shares its row with unrelated footer
+/// text to its left.
 pub fn voice_error(rows: &[String]) -> Option<String> {
     rows.iter().find_map(|row| {
         VOICE_ERRORS
@@ -125,16 +178,8 @@ pub fn voice_error(rows: &[String]) -> Option<String> {
 /// The interim text in the prompt box (between the last two horizontal rules), wrapped rows
 /// rejoined and the level meter trimmed.
 pub fn preview(rows: &[String]) -> String {
-    let rules: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.chars().count() > 20 && row.trim().chars().all(|c| c == '─'))
-        .map(|(i, _)| i)
-        .collect();
-    let [.., above, below] = rules[..] else {
-        return String::new();
-    };
-    let text = rows[above + 1..below]
+    let text = Layout::of(rows)
+        .prompt_box(rows)
         .iter()
         .map(|row| row.trim())
         .filter(|row| !row.is_empty())
@@ -249,17 +294,56 @@ mod tests {
     }
 
     #[test]
+    fn spoken_status_words_in_the_prompt_are_not_the_status() {
+        let spoken = "Ich sage listening… und keep holding, dann Voice: processing und No speech detected";
+        let bytes = super::super::fixtures::with_prompt(
+            &super::super::fixtures::get("processing"),
+            spoken,
+        );
+        let rows = screen(&bytes);
+        let state = State::of(&rows);
+        assert!(!state.busy(), "{state:?}");
+        assert_eq!(state.error, None, "{state:?}");
+        assert!(state.prompt, "{state:?}");
+        assert_eq!(preview(&rows), spoken);
+        // The real footer still counts when it says so.
+        let bytes = [bytes, b"\x1b[12;140Hlistening\xe2\x80\xa6".to_vec()].concat();
+        assert!(State::of(&screen(&bytes)).listening);
+    }
+
+    #[test]
+    fn selection_dialogs_are_not_the_prompt() {
+        let rule = "─".repeat(60);
+        let one_rule = lines(&format!(
+            "{rule}\n Select model\n\n ❯ 1. Default (recommended)\n   2. Opus\n\n Enter to confirm · Esc to exit"
+        ));
+        assert!(!State::of(&one_rule).prompt);
+        let boxed = lines(&format!(
+            "{rule}\n❯ 1. Dark mode\n  2. Light mode\n{rule}\n  Enter to confirm"
+        ));
+        assert!(!State::of(&boxed).prompt);
+        let trust = State::of(&screen(&super::super::fixtures::get("trust-selected")));
+        assert!(!trust.prompt, "{trust:?}");
+        let ready = lines(&format!("{rule}\n❯ 1. ist eine Zahl\n{rule}\n  ? for shortcuts"));
+        assert!(!State::of(&ready).prompt, "a numbered prompt reads as a dialog: fail safe");
+        let ready = lines(&format!("{rule}\n❯ Hallo\n{rule}\n  ? for shortcuts"));
+        assert!(State::of(&ready).prompt);
+    }
+
+    #[test]
     fn settling_needs_a_quiet_screen_for_the_whole_window() {
         let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         let mut settle = Settle::new(start);
-        let busy = lines("❯ text\n  Voice: processing");
-        let done = lines("❯ Hallo Welt");
+        let rule = "─".repeat(60);
+        let busy = lines(&format!("{rule}\n❯ text\n{rule}\n  Voice: processing"));
+        let done = lines(&format!("{rule}\n❯ Hallo Welt\n{rule}\n  ? for shortcuts"));
         assert!(!settle.observe(&busy, at(0)));
         assert!(!settle.observe(&busy, at(900)), "busy never settles");
         assert!(!settle.observe(&done, at(1_000)));
         assert!(!settle.observe(&done, at(1_500)));
         assert!(settle.observe(&done, at(1_600)));
-        assert!(!settle.observe(&lines("❯ Hallo Welt!"), at(1_650)), "a change restarts it");
+        let changed = lines(&format!("{rule}\n❯ Hallo Welt!\n{rule}\n  ? for shortcuts"));
+        assert!(!settle.observe(&changed, at(1_650)), "a change restarts it");
     }
 }
