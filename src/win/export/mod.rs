@@ -87,12 +87,52 @@ pub fn run(plan_path: &Path, background: bool, progress: &mut dyn FnMut(f32)) ->
     let _priority = Priority::enter(background);
     crate::win::media::media_startup();
     let _ = std::fs::remove_file(&plan.out);
-    let result = render(&plan, progress);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&plan.out);
-    }
-    result
+    // A retry starts over; progress holds still until it catches up rather than going back.
+    let mut shown = 0.0_f32;
+    let mut progress = |done: f32| {
+        if done > shown {
+            shown = done;
+            progress(done);
+        }
+    };
+    // A failed try leaves no partial movie, before the retry or after the last one.
+    with_software_retry(|hardware| {
+        let result = render(&plan, hardware, &mut progress);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&plan.out);
+        }
+        result
+    })
 }
+
+/// Marks an error from the encoder (`Writer`), as opposed to the recording or the plan.
+#[derive(Debug)]
+struct EncoderFailed;
+
+impl std::fmt::Display for EncoderFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The video encoder failed")
+    }
+}
+
+/// Renders with the GPU's encoder, and when that encoder fails at any point (creating it, a
+/// sample, finishing: a driver's session limit, a lost device) renders everything again once
+/// with Media Foundation's software encoder. Any other failure is returned as it is.
+fn with_software_retry<T>(mut render: impl FnMut(bool) -> Result<T>) -> Result<T> {
+    match render(true) {
+        Err(error) if error.downcast_ref::<EncoderFailed>().is_some() => {
+            crate::capture::scrawl_log(format!(
+                "export: the hardware encoder failed ({error:#}); trying the software encoder"
+            ));
+            render(false)
+        }
+        result => result,
+    }
+}
+
+/// Tests set this to make the hardware encoder fail at this frame.
+#[cfg(test)]
+static FAIL_HARDWARE_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// The plan's audio as 48 kHz mono PCM, or `None` without any.
 fn audio_track(plan: &Plan) -> Result<Option<Vec<i16>>> {
@@ -131,13 +171,14 @@ fn resample(mono: &[f32], rate: u32, start_ms: u64, length_ms: u64) -> Vec<i16> 
         .collect()
 }
 
-fn render(plan: &Plan, progress: &mut dyn FnMut(f32)) -> Result<Done> {
+/// One render of the plan. `hardware` lets Media Foundation pick the GPU's encoder; every
+/// encoder error carries `EncoderFailed`, so `with_software_retry` can tell it apart.
+fn render(plan: &Plan, hardware: bool, progress: &mut dyn FnMut(f32)) -> Result<Done> {
     let video = VideoReader::open(&plan.video)?;
     let (sw, sh) = (video.aperture.2 as usize, video.aperture.3 as usize);
     ensure!(sw > 0 && sh > 0, "The recording has no video");
     let audio = audio_track(plan)?;
     let (w, h) = (plan.width as usize, plan.height as usize);
-    // The GPU's encoder when Media Foundation has one, else its software encoder.
     let with_audio = audio.is_some();
     let mut writer = Writer::new(
         &plan.out,
@@ -145,18 +186,9 @@ fn render(plan: &Plan, progress: &mut dyn FnMut(f32)) -> Result<Done> {
         plan.height,
         plan.fps,
         with_audio,
-        true,
+        hardware,
     )
-    .or_else(|_| {
-        Writer::new(
-            &plan.out,
-            plan.width,
-            plan.height,
-            plan.fps,
-            with_audio,
-            false,
-        )
-    })?;
+    .context(EncoderFailed)?;
     let threads = threads();
     let total = plan.frames();
     let mut pending = video.next().context("Reading the recording failed")?;
@@ -201,11 +233,17 @@ fn render(plan: &Plan, progress: &mut dyn FnMut(f32)) -> Result<Done> {
             let until =
                 (((ms + AUDIO_LEAD_MS) * f64::from(AUDIO_RATE) / 1000.0) as usize).min(pcm.len());
             if until > audio_at {
-                writer.audio(&pcm[audio_at..until])?;
+                writer.audio(&pcm[audio_at..until]).context(EncoderFailed)?;
                 audio_at = until;
             }
         }
-        writer.video(&nv12, tick)?;
+        #[cfg(test)]
+        if hardware && tick == FAIL_HARDWARE_AT.load(Ordering::Relaxed) {
+            return Err(
+                anyhow::anyhow!("injected: the GPU lost its session").context(EncoderFailed)
+            );
+        }
+        writer.video(&nv12, tick).context(EncoderFailed)?;
         if (tick + 1) % PROGRESS_EVERY == 0 {
             progress((tick + 1) as f32 / total as f32);
         }
@@ -213,9 +251,9 @@ fn render(plan: &Plan, progress: &mut dyn FnMut(f32)) -> Result<Done> {
     if let Some(pcm) = &audio
         && audio_at < pcm.len()
     {
-        writer.audio(&pcm[audio_at..])?;
+        writer.audio(&pcm[audio_at..]).context(EncoderFailed)?;
     }
-    writer.finish()?;
+    writer.finish().context(EncoderFailed)?;
 
     let written = crate::win::media::probe(&plan.out)?.duration_ms;
     if written.abs_diff(plan.duration_ms) >= 250 {
@@ -293,6 +331,75 @@ mod tests {
         let tail = resample(&mono, 16_000, 900, 200);
         assert_eq!(tail.len(), 9_600);
         assert!(tail[4_800..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn a_failing_hardware_encoder_is_retried_once_in_software() {
+        fn encoder<T>() -> Result<T> {
+            Err(anyhow::anyhow!("MF_E_HW_MFT_FAILED_START_STREAMING").context(EncoderFailed))
+        }
+        let mut tries = Vec::new();
+        let done = with_software_retry(|hardware| {
+            tries.push(hardware);
+            if hardware { encoder() } else { Ok("movie") }
+        });
+        assert_eq!(done.unwrap(), "movie");
+        assert_eq!(tries, [true, false]);
+
+        // The software encoder failing too returns its error; nothing runs a third time.
+        let mut tries = 0;
+        let error = with_software_retry(|_| -> Result<()> {
+            tries += 1;
+            encoder()
+        })
+        .unwrap_err();
+        assert_eq!(tries, 2);
+        assert!(format!("{error:#}").starts_with("The video encoder failed"));
+
+        // A bad recording isn't the encoder's fault: no second render.
+        let mut tries = 0;
+        let error = with_software_retry(|_| -> Result<()> {
+            tries += 1;
+            bail!("The recording has no frames")
+        })
+        .unwrap_err();
+        assert_eq!(tries, 1);
+        assert_eq!(error.to_string(), "The recording has no frames");
+    }
+
+    /// The real pipeline on a copy of a real capture (`SCRAWL_EXPORT_BUNDLE`, default
+    /// `C:\t\rec036.scrawl`) with the hardware encoder failing at its fifth frame: the export
+    /// still comes back whole, from the software encoder.
+    #[test]
+    #[ignore = "encodes and decodes through Media Foundation"]
+    fn an_export_survives_the_hardware_encoder_failing_mid_movie() {
+        let source = std::env::var_os("SCRAWL_EXPORT_BUNDLE")
+            .map_or_else(|| std::path::PathBuf::from(r"C:\t\rec036.scrawl"), Into::into);
+        let dir = std::env::temp_dir().join(format!("scrawl-export-retry-{}.scrawl", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::copy(&path, dir.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+        let (dir, bundle) = crate::handoff::load_bundle(&dir).unwrap();
+        let out = dir.join("out.mp4");
+        let options = crate::export::Options {
+            out: Some(out.clone()),
+            ..Default::default()
+        };
+        FAIL_HARDWARE_AT.store(5, Ordering::Relaxed);
+        let mut reported = Vec::new();
+        let exported = crate::export::export(&dir, &bundle, &options, &mut |f| reported.push(f));
+        FAIL_HARDWARE_AT.store(u64::MAX, Ordering::Relaxed);
+        let exported = exported.unwrap();
+        eprintln!("{}", crate::export::describe(&exported));
+        let probe = crate::win::media::probe(&out).unwrap();
+        assert!(probe.duration_ms.abs_diff(bundle.duration_ms) < 400, "{probe:?}");
+        assert!(reported.windows(2).all(|p| p[0] <= p[1]), "{reported:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `scrawl export` end to end on a synthetic bundle: a grey 3 s recording, a tone in

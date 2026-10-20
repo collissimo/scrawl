@@ -7,6 +7,7 @@ pub mod claude_dictation;
 pub mod clipboard;
 pub mod conpty;
 pub mod export;
+pub mod languages;
 pub mod login;
 pub mod media;
 pub mod overlay;

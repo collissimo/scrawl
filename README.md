@@ -731,7 +731,10 @@ without `claude` the choice is greyed out with the reason.
   key; Claude Code records the default microphone and transcribes through Anthropic with your
   login. When the recording stops, the text comes out through Claude Code's external editor hook
   (`scrawl.exe claude-editor`) and is never submitted as a prompt.
-- The language is `"language"` in the config (a code such as `"de"`), else Windows' language.
+- The language is Settings › Recording › **Language** (or the tray's Transcription › Language,
+  or `"language"` in the config, a code such as `"de"`), else English. Claude Code dictates
+  [these 20 languages](https://code.claude.com/docs/en/voice-dictation#change-the-dictation-language);
+  for any other the choice is greyed out with the reason.
 - Scrawl keeps one session warm while Claude Code is the engine and ends it with Scrawl.
 - Claude Code returns text without times, so its words are spread over the recording's stretches
   of speech (`"source": "claude-code"`, `"estimated": true`).
@@ -815,7 +818,11 @@ system owns differ:
   model (`%APPDATA%\voice-control\models`), Scrawl uses it. Otherwise the first launch downloads
   Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
   `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
-  captures made before it finishes get their transcript once it lands.
+  captures made before it finishes get their transcript once it lands. Recordings are English
+  unless Settings › Recording › **Language** says otherwise (never the Windows locale); another
+  language downloads Parakeet TDT 0.6b v3 (740 MB; bg cs da de el en es et fi fr hr hu it lt lv mt
+  nl pl pt ro ru sk sl sv uk) as soon as you pick it, and one v3 doesn't speak stays on the
+  English model.
   `"transcriber": "claude"` dictates through Claude Code instead (any language Claude Code
   supports; see [Claude Code dictation](#claude-code-dictation-windows)).
 - **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
