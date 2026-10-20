@@ -86,20 +86,21 @@ fn verified_in(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Hex's installed models (verified downloads), Hex's chosen one first, then Parakeet ones;
-/// then the ones Scrawl downloaded.
-pub fn installed_models() -> Vec<PathBuf> {
-    let mut models = hex_models();
-    models.extend(verified_in(&own_models_dir()));
-    models
+/// The installed models (verified downloads) that can transcribe `language`, best first.
+pub fn installed_models(language: &str) -> Vec<PathBuf> {
+    models_for(&hex_models(), &verified_in(&own_models_dir()), language)
 }
 
-/// The installed models that can transcribe `language`, in `installed`'s order. Every model
-/// speaks English; another language needs one whose name says it's multilingual (Parakeet v3,
-/// Whisper), so Parakeet Unified English and Parakeet v2 never get German speech.
-pub fn models_for(installed: &[PathBuf], language: &str) -> Vec<PathBuf> {
-    installed
-        .iter()
+/// Hex's models (its chosen one first, then Parakeet ones), then Scrawl's own, the language's
+/// `artifact_for` first, so English keeps Parakeet Unified English when v3 is there too. Every
+/// model speaks English; another language needs one whose name says it's multilingual
+/// (Parakeet v3, Whisper), so Parakeet Unified English and Parakeet v2 never get German speech.
+pub fn models_for(hex: &[PathBuf], own: &[PathBuf], language: &str) -> Vec<PathBuf> {
+    let wanted = artifact_for(language).filename;
+    let mut own = own.to_vec();
+    own.sort_by_key(|path| path.file_name().is_none_or(|name| name != wanted));
+    hex.iter()
+        .chain(&own)
         .filter(|path| language == "en" || multilingual(path))
         .cloned()
         .collect()
@@ -142,7 +143,7 @@ fn model_name(path: &Path) -> String {
 
 pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     let language = crate::handoff::transcription_language();
-    let candidates = models_for(&installed_models(), &language);
+    let candidates = installed_models(&language);
     if candidates.is_empty() {
         // The background download hasn't finished (or failed): the bundle is transcribed again
         // once it has.
@@ -286,7 +287,7 @@ pub fn install(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
         progress,
         error,
     };
-    if models_for(&installed_models(), &language).is_empty() {
+    if installed_models(&language).is_empty() {
         let artifact = artifact_for(&language);
         let mut progress = |done: f64| line(report("downloading", Some(done), None));
         if let Err(error) = download(artifact, &own_models_dir(), &mut progress) {
@@ -432,40 +433,59 @@ mod tests {
         names.iter().map(PathBuf::from).collect()
     }
 
-    #[test]
-    fn english_takes_any_model_in_order() {
-        let installed = paths(&[
-            r"hex\parakeet-unified-en-0.6b-Q8_0.gguf",
+    /// Scrawl's own folder lists both downloads alphabetically: v3 before Unified English.
+    fn own_both() -> Vec<PathBuf> {
+        paths(&[
             r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
-        ]);
-        assert_eq!(models_for(&installed, "en"), installed);
+            r"own\parakeet-unified-en-0.6b-Q8_0.gguf",
+        ])
+    }
+
+    #[test]
+    fn english_takes_hexs_models_then_scrawls_english_one() {
+        let hex = paths(&[r"hex\parakeet-tdt-0.6b-v3-Q8_0.gguf"]);
+        assert_eq!(
+            models_for(&hex, &own_both(), "en"),
+            paths(&[
+                r"hex\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+                r"own\parakeet-unified-en-0.6b-Q8_0.gguf",
+                r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
+            ])
+        );
+        assert_eq!(
+            models_for(&[], &own_both(), "en")[0],
+            PathBuf::from(r"own\parakeet-unified-en-0.6b-Q8_0.gguf")
+        );
         assert_eq!(artifact_for("en").filename, PARAKEET.filename);
     }
 
     #[test]
     fn german_never_gets_an_english_only_model() {
-        let english = paths(&[
+        let hex = paths(&[
             r"hex\parakeet-unified-en-0.6b-Q8_0.gguf",
             r"hex\parakeet-tdt-0.6b-v2-Q8_0.gguf",
             r"hex\whisper-small.en-Q8_0.gguf",
         ]);
-        assert!(models_for(&english, "de").is_empty());
+        let own = paths(&[r"own\parakeet-unified-en-0.6b-Q8_0.gguf"]);
+        assert!(models_for(&hex, &own, "de").is_empty());
         assert_eq!(artifact_for("de").filename, PARAKEET_V3.filename);
         assert_eq!(artifact_for("fr").filename, PARAKEET_V3.filename);
     }
 
     #[test]
     fn german_prefers_hexs_multilingual_model_then_scrawls_own() {
-        let installed = paths(&[
+        let hex = paths(&[
             r"hex\parakeet-unified-en-0.6b-Q8_0.gguf",
+            r"hex\parakeet-v3-Q8_0.gguf",
+        ]);
+        let picked = paths(&[
             r"hex\parakeet-v3-Q8_0.gguf",
             r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf",
         ]);
-        let picked = paths(&[r"hex\parakeet-v3-Q8_0.gguf", r"own\parakeet-tdt-0.6b-v3-Q8_0.gguf"]);
-        assert_eq!(models_for(&installed, "de"), picked);
-        assert_eq!(models_for(&installed, "fr"), picked);
+        assert_eq!(models_for(&hex, &own_both(), "de"), picked);
+        assert_eq!(models_for(&hex, &own_both(), "fr"), picked);
         let whisper = paths(&[r"hex\whisper-large-v3-turbo-Q8_0.gguf"]);
-        assert_eq!(models_for(&whisper, "de"), whisper);
+        assert_eq!(models_for(&whisper, &[], "de"), whisper);
     }
 
     /// `SCRAWL_MODELS_DIR` keeps the downloads there; else a temporary folder that's removed.
@@ -483,7 +503,8 @@ mod tests {
         let (dir, remove) = download_dir("parakeet");
         let mut last = 0.0;
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
-        assert_eq!(last, 1.0);
+        // A kept download that was already there reports no progress.
+        assert!(last == 1.0 || !remove);
         transcribe_cpp::init_backends_default().unwrap();
         Model::load(&model).unwrap();
         if remove {
@@ -499,8 +520,9 @@ mod tests {
         let (dir, remove) = download_dir("parakeet-v3");
         let mut last = 0.0;
         let path = download(&PARAKEET_V3, &dir, &mut |done| last = done).unwrap();
-        assert_eq!(last, 1.0);
-        assert_eq!(models_for(&[path.clone()], "de"), vec![path.clone()]);
+        // A kept download that was already there reports no progress.
+        assert!(last == 1.0 || !remove);
+        assert_eq!(models_for(&[], &[path.clone()], "de"), vec![path.clone()]);
         transcribe_cpp::init_backends_default().unwrap();
         let (_, model, hint) = load_for(&[path], "de").unwrap();
         let caps = model.capabilities();
@@ -514,7 +536,11 @@ mod tests {
             language: hint,
             ..Default::default()
         };
-        model.session().unwrap().run(&[0.0; 16_000], &options).unwrap();
+        model
+            .session()
+            .unwrap()
+            .run(&[0.0; 16_000], &options)
+            .unwrap();
         drop(model);
         if remove {
             let _ = std::fs::remove_dir_all(&dir);
