@@ -25,9 +25,13 @@ Shortcuts are `RegisterHotKey` plus low-level hooks and a key-state poller (inje
 - `agentContext` looks up what clicks and marks land on through UI Automation (`win/uia.rs`, behind `ax::hit_test`; the rest of `ax.rs`, its prober and `apply`, is shared). It reads names, localized control types and automation ids, never a control's value, so nothing typed into a field (passwords included) is read. `cargo test win::uia -- --ignored --nocapture` names whatever is under the pointer. `ax_other.rs` stays the stub for systems with neither lookup.
 - Settings › Agents puts `scrawl` on PATH with a `scrawl.cmd` shim in `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH (`win/command_line.rs`, the same API as `command_line.rs`): a symbolic link needs Developer Mode and a hard link can't cross drives. The shim runs this `scrawl.exe` with every argument; another program called `scrawl` there is left alone.
 
+## Video export
+
+`scrawl export` (and the menu's **Export Last Capture as Video…**) renders in process: `src/export` writes the same JSON plan as on macOS and `run_helper` hands it to `win/export/` instead of `scrawl-helper`. The Media Foundation source reader decodes BGRA, `pixels.rs` scales each tick's camera rectangle on the CPU, `draw.rs` ports `ExportInk` from `helper/Export.swift` to tiny-skia (pin numbers in Segoe UI Bold), and `encode.rs` writes H.264 (the GPU's encoder when Media Foundation has one, BT.709 limited NV12) plus 48 kHz AAC through a sink writer. The default output is `Videos\Scrawl\<bundle>.mp4`; a background (menu) export runs its threads in background mode. HEVC is macOS-only, and the index sits at the end of the file (`MF_MPEG4SINK_MOOV_BEFORE_MDAT` writes a movie Media Foundation can't read back on Windows 10). Decoded frames keep the decoder's 16 px padding, so `win::export::bgra` infers the pitch. `cargo test export` covers the math and the plan; `cargo test win::export -- --ignored --nocapture` encodes, exports and decodes synthetic movies, and `SCRAWL_EXPORT_PROBE=<movie> SCRAWL_EXPORT_FRAMES=<ms,…> cargo test probe_an_export -- --ignored --nocapture` prints a movie's probe and audio level and saves frames beside it as PNGs.
+
 ## Not on Windows
 
-The cabled iPhone, video export, Sparkle (**Check for Updates…** opens the releases page) and reading the browser tab URL (the `sdk.js` page bridge still works).
+The cabled iPhone, Sparkle (**Check for Updates…** opens the releases page) and reading the browser tab URL (the `sdk.js` page bridge still works).
 
 ## Building and testing
 
