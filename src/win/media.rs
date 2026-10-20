@@ -72,7 +72,7 @@ use crate::model::{CaptureMode, RgbaFrame, TargetInfo};
 const MAX_FPS: u32 = 30;
 const FRAME_100NS: i64 = 10_000_000 / MAX_FPS as i64;
 
-fn media_startup() {
+pub(crate) fn media_startup() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
@@ -715,7 +715,7 @@ pub fn run_sampler(sampler: Sampler) -> Option<PathBuf> {
 
 // MARK: Reading movies
 
-fn reader(movie: &Path, video_processing: bool) -> Result<IMFSourceReader> {
+pub(crate) fn reader(movie: &Path, video_processing: bool) -> Result<IMFSourceReader> {
     media_startup();
     let mut attributes: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut attributes, 1) }?;
@@ -776,17 +776,17 @@ struct Decoded {
     rgba: Vec<u8>,
 }
 
-struct VideoReader {
+pub(crate) struct VideoReader {
     reader: IMFSourceReader,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// The visible area inside each (possibly padded) decoded frame.
-    aperture: (u32, u32, u32, u32),
-    duration_ms: u64,
+    pub(crate) aperture: (u32, u32, u32, u32),
+    pub(crate) duration_ms: u64,
 }
 
 impl VideoReader {
-    fn open(movie: &Path) -> Result<Self> {
+    pub(crate) fn open(movie: &Path) -> Result<Self> {
         let reader = reader(movie, true)?;
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         unsafe {
@@ -837,7 +837,7 @@ impl VideoReader {
     }
 
     /// The next decoded frame, or `None` at the end.
-    fn next(&self) -> Result<Option<(u64, IMFSample)>> {
+    pub(crate) fn next(&self) -> Result<Option<(u64, IMFSample)>> {
         let mut flags = 0_u32;
         let mut time = 0_i64;
         let mut sample = None;
@@ -1138,6 +1138,69 @@ pub fn export_audio(movie: &Path, wav: &Path) -> Result<()> {
         .collect();
     std::fs::write(wav, crate::audio::encode_wav_16k(&resampled)?)
         .with_context(|| format!("Could not write {}", wav.display()))
+}
+
+/// The first audio track of a movie or sound file, mixed to mono at its own sample rate, from
+/// the file's start (silence fills any gap before or between its samples). Returns
+/// `(rate, samples)`.
+pub(crate) fn audio_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
+    let reader = reader(path, false)?;
+    let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+    unsafe {
+        reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+        reader.SetStreamSelection(stream, true)?;
+    }
+    let wanted = unsafe { MFCreateMediaType() }?;
+    unsafe {
+        wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        wanted.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
+        reader.SetCurrentMediaType(stream, None, &wanted)?;
+    }
+    let current = unsafe { reader.GetCurrentMediaType(stream) }?;
+    let rate = unsafe { current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND) }?.max(1);
+    let channels = unsafe { current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS) }?.max(1) as usize;
+    ensure!(
+        unsafe { current.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE) }.unwrap_or(32) == 32,
+        "Unexpected audio format"
+    );
+    let mut mono: Vec<f32> = Vec::new();
+    loop {
+        let mut flags = 0_u32;
+        let mut time = 0_i64;
+        let mut sample = None;
+        unsafe {
+            reader.ReadSample(
+                stream,
+                0,
+                None,
+                Some(&mut flags),
+                Some(&mut time),
+                Some(&mut sample),
+            )
+        }?;
+        if let Some(sample) = sample {
+            let at = (time.max(0) as u64 * u64::from(rate) / 10_000_000) as usize;
+            if mono.len() < at {
+                mono.resize(at, 0.0);
+            }
+            let buffer = unsafe { sample.ConvertToContiguousBuffer() }?;
+            let mut data = std::ptr::null_mut();
+            let mut len = 0_u32;
+            unsafe { buffer.Lock(&mut data, None, Some(&mut len)) }?;
+            let floats =
+                unsafe { std::slice::from_raw_parts(data.cast::<f32>(), len as usize / 4) };
+            mono.extend(
+                floats
+                    .chunks_exact(channels)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32),
+            );
+            unsafe { buffer.Unlock() }?;
+        }
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            break;
+        }
+    }
+    Ok((rate, mono))
 }
 
 #[cfg(test)]
