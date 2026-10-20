@@ -73,7 +73,9 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] The fork's `main` is synced with upstream (6449367), with Collin's OK.
 - [x] Alt+Shift+V works (Collin). [ ] It's still unclear whether the Settings Language menu scrolls.
 - [x] F3 merged: Claude's words get Parakeet's measured times (`align.rs`). 373 tests pass. Finish takes about 1.7 s when Claude succeeds (was 1.1 s) and 1.7 s when it fails (was 2.8 s). "Follow-Knopf" now starts at 18.56 s.
-- [ ] F6 (running; `C:/t/briefs/F6-full.md`, target scrawl-b, clientRequestId `scrawl-win-F6-keyframe-clauses-1`): `keyframes::said_per_keyframe` still gives the clause to the scene-change keyframe #4. The fix ships behind an experiment; once it's merged, ask Collin whether to switch it on in his config.
+- [x] F6 merged: experiment `speechFollowsMarks` (off by default). On his capture, #3 (the circle) now gets "hier ist der Follow-Knopf" and #5 "und hier ist eine Glühbirne." 378 tests pass. Open items:
+  - Ask Collin whether to switch it on in his config (`"experiments": {"speechFollowsMarks": true}`).
+  - A mark keyframe with speech loses its "marked region" text in `summary.md` (upstream behaviour; clicks keep `[clicked]`).
 - [ ] F4 (running; `C:/t/briefs/F4-full.md`, target scrawl-c, clientRequestId `scrawl-win-F4-overlay-1`): BUG from Collin. Ink stops showing on screen after a click on the other monitor, though it is still recorded. Evidence: bundle `scrawl-1792514420118-44d4-3`, log `[1792514413614]`.
 - [ ] F5 (running; `C:/t/briefs/F5-full.md`, target scrawl-a, clientRequestId `scrawl-win-F5-video-storage-1`): Collin wants recordings to use less disk.
   - VBR at full resolution. 720p is ruled out because frames are decoded from the video.
