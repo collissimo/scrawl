@@ -451,8 +451,14 @@ fn window_state(id: isize) -> Option<WindowState> {
     }
 }
 
-/// Windows that sit above everything on purpose and never cover the middle of a display.
-const SHELL_BARS: [&str; 2] = ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+/// Windows that sit above everything on purpose, at a display's edge or only briefly: the
+/// taskbars, menus and tooltips.
+const SHELL_BARS: [&str; 4] = [
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "#32768",
+    "tooltips_class32",
+];
 
 /// The first window above the overlay (in z-order) that overlaps `area` (global pixels) and
 /// isn't process `own`'s, as "class (pid N)".
