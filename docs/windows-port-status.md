@@ -35,7 +35,7 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
 
 - A: German file transcription (Parakeet TDT v3). **Done and merged** (b614a2c). 316 tests pass. Follow-up: Settings must call `speech_model::ensure()` after the language changes (B owns settings.rs, or do it at integration).
 - B: Claude Code dictation engine, clientRequestId `scrawl-win-B-claude-1`
-- C: Windows video export, clientRequestId `scrawl-win-C-export-1`
+- C: Windows video export. **Done and merged** (ec4b14f), plus my fix for sheared decoded frames (513473d). 327 tests pass. Follow-ups: the AMD encoder runs near-constant bitrate, so static screens produce big files (switch to VBR via CODECAPI_AVEncCommonRateControlMode); no fast-start; `media::audio_mono` duplicates `export_audio`.
 
 Stopped agents from the old plan are obsolete and must not be resumed: T3 "Scrawl Windows: foundation commit" and the workflow "foundation".
 
@@ -48,7 +48,7 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] `language` config + `handoff::transcription_language()` (commit 5162612).
 - [x] transcribe.cpp supports Parakeet/Whisper; HF has `handy-computer/parakeet-tdt-0.6b-v3-gguf` (multilingual) → task A
 - [ ] Engine: Claude dictation (live) + German file fallback. Tests. A real check needs Collin's voice.
-- [ ] Video export via Media Foundation.
+- [x] Video export via Media Foundation (task C).
 - [ ] Real-use checks: app, tray, Alt+Shift+S, ink, paste, review window; fix what breaks.
 - [ ] Push to `fork`, open a PR against collissimo/scrawl main, link it in T3, report in German.
 
