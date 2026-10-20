@@ -316,6 +316,22 @@ fn spoken_cue(word: &str) -> Option<(&'static str, f32, bool)> {
         ("these", 44.0, false),
         ("that", 42.0, false),
         ("those", 42.0, false),
+        // German, ranked like their English twins. "das" stays out: it is the article far more
+        // often than a pointer.
+        ("jetzt", 58.0, true),
+        ("hier", 56.0, true),
+        ("schau", 58.0, true),
+        ("schaut", 58.0, true),
+        ("guck", 58.0, true),
+        ("guckt", 58.0, true),
+        ("sieh", 58.0, true),
+        ("siehst", 44.0, false),
+        ("da", 44.0, false),
+        ("dort", 44.0, false),
+        ("dies", 44.0, false),
+        ("diese", 44.0, false),
+        ("dieser", 44.0, false),
+        ("dieses", 44.0, false),
     ]
     .into_iter()
     .find(|(cue, _, _)| *cue == word)
@@ -1302,6 +1318,39 @@ mod tests {
         assert_eq!(selected[1].0.reason, KeyframeReason::Speech);
         assert_eq!(selected[0].0.said.as_deref(), Some("Here's the list."));
         assert_eq!(selected[1].0.said.as_deref(), Some("Watch it now."));
+    }
+
+    #[test]
+    fn a_german_spoken_cue_finds_the_change_it_points_at() {
+        let mut frames: Vec<_> = (0..=24).map(|i| frame(i * 250, 40)).collect();
+        for f in frames.iter_mut().filter(|f| f.t_ms >= 3_250) {
+            *f = frame(f.t_ms, 220);
+        }
+        let transcript = TranscriptData {
+            words: words(&[
+                (200, "Das"),
+                (400, "ist"),
+                (600, "die"),
+                (800, "Liste."),
+                (2_400, "Schau"),
+                (2_600, "mal"),
+                (2_800, "jetzt."),
+            ]),
+            ..Default::default()
+        };
+        let selected = select_keyframes(
+            &frames,
+            &[],
+            &mut [],
+            &[click(500)],
+            &transcript,
+            MAX_KEYFRAMES,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[1].0.t, 3_250);
+        assert_eq!(selected[1].0.reason, KeyframeReason::Speech);
+        assert_eq!(selected[0].0.said.as_deref(), Some("Das ist die Liste."));
+        assert_eq!(selected[1].0.said.as_deref(), Some("Schau mal jetzt."));
     }
 
     #[test]
