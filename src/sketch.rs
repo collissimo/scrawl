@@ -552,6 +552,9 @@ pub fn summary_markdown_with(
     {
         out.push_str(&format!("No transcript: {}\n", missing.reason));
     }
+    if bundle.transcript.estimated && !bundle.transcript.text.trim().is_empty() {
+        out.push_str("Word times are estimated: a word may sit under a neighbouring keyframe.\n");
+    }
     // App events and context changes nest under the keyframe on screen when they happened.
     let mut app_events: Vec<(u64, String)> = bundle
         .events

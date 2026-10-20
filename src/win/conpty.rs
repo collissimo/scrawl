@@ -2,7 +2,8 @@
 //! as VT sequences and keystrokes go in through another, with no console window. Every child
 //! joins a kill-on-close job object, so it (and anything it starts) ends with Scrawl.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
+use std::os::windows::ffi::OsStrExt as _;
 use std::fs::File;
 use std::io::Write;
 use std::os::windows::io::FromRawHandle;
@@ -47,7 +48,7 @@ impl Pty {
         program: &Path,
         args: &[String],
         cwd: &Path,
-        env: &[(String, String)],
+        env: &[(OsString, OsString)],
         rows: u16,
         cols: u16,
     ) -> Result<(Self, File)> {
@@ -229,13 +230,16 @@ pub fn command_line(program: &Path, args: &[String]) -> String {
         .join(" ")
 }
 
-/// `KEY=value\0…\0\0` in UTF-16, sorted case-insensitively as Windows expects.
-fn environment_block(env: &[(String, String)]) -> Vec<u16> {
-    let mut pairs: Vec<&(String, String)> = env.iter().collect();
-    pairs.sort_by_key(|(key, _)| key.to_uppercase());
+/// `KEY=value\0…\0\0` in UTF-16, sorted case-insensitively as Windows expects. Values that
+/// aren't Unicode pass through unchanged.
+fn environment_block(env: &[(OsString, OsString)]) -> Vec<u16> {
+    let mut pairs: Vec<&(OsString, OsString)> = env.iter().collect();
+    pairs.sort_by_key(|(key, _)| key.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (key, value) in pairs {
-        block.extend(format!("{key}={value}").encode_utf16());
+        block.extend(key.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
         block.push(0);
     }
     if block.is_empty() {
@@ -248,6 +252,7 @@ fn environment_block(env: &[(String, String)]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStringExt as _;
 
     #[test]
     fn arguments_are_quoted_as_the_c_runtime_reads_them() {
@@ -267,5 +272,9 @@ mod tests {
         let block = environment_block(&[("b".into(), "2".into()), ("A".into(), "1".into())]);
         assert_eq!(String::from_utf16_lossy(&block), "A=1\0b=2\0\0");
         assert_eq!(environment_block(&[]), vec![0, 0]);
+        // An unpaired surrogate (not Unicode) survives as is.
+        let odd = OsString::from_wide(&[0xD800, u16::from(b'x')]);
+        let block = environment_block(&[("K".into(), odd)]);
+        assert_eq!(block, [u16::from(b'K'), u16::from(b'='), 0xD800, u16::from(b'x'), 0, 0]);
     }
 }

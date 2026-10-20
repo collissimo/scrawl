@@ -77,3 +77,12 @@ fn cut_fixtures() {
     }
     println!("--- final screen ---\n{}", rows(&parser).join("\n"));
 }
+
+/// `template` (a captured screen with the prompt box on rows 9-11) after Claude Code redrew the
+/// prompt row with `text` and blanked the footer's dictation status, as when dictation is done.
+pub fn with_prompt(template: &[u8], text: &str) -> Vec<u8> {
+    let mut bytes = template.to_vec();
+    bytes.extend_from_slice(format!("\x1b[10;3H\x1b[K{text}\x1b[12;100H\x1b[K").as_bytes());
+    bytes
+}
+
