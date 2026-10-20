@@ -483,8 +483,10 @@ fn split_said(
             };
             if follow
                 && deliberate
+                && let Some(clause) = clause
                 && let Some(&(lead, _, _)) = units.iter().find(|unit| {
-                    floor.is_none_or(|floor| unit.0 > floor)
+                    unit.0 >= clause
+                        && floor.is_none_or(|floor| unit.0 > floor)
                         && unit.0 < anchor
                         && unit.0 + SPEECH_LEAD_MS >= anchor
                 })
@@ -1796,6 +1798,30 @@ mod tests {
             split_said(&[1_250, 2_400], &moments, &transcript, true),
             said(&[Some("Open the settings panel"), Some("and pick dark mode.")])
         );
+    }
+
+    /// The words leading into an act come only from its own clause, never the one before.
+    #[test]
+    fn the_lead_into_an_act_stays_inside_its_clause() {
+        let transcript = TranscriptData {
+            words: tdt_words(
+                &[
+                    (950, "Done."),
+                    (1_300, "And"),
+                    (1_500, "this"),
+                    (1_700, "one"),
+                ],
+                1_900,
+            ),
+            ..Default::default()
+        };
+        let moments = [act(900, 1_000), act(1_800, 1_900)];
+        for follow in [false, true] {
+            assert_eq!(
+                split_said(&[1_000, 1_900], &moments, &transcript, follow),
+                said(&[Some("Done."), Some("And this one")])
+            );
+        }
     }
 
     /// Speech that starts well after the act (more than `ACT_SPEECH_MS`) is about what came
