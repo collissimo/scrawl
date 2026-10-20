@@ -150,12 +150,10 @@ impl Live {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn finish_within(&mut self, wav_bytes: &[u8], timeout: Duration) -> Result<Finished> {
         match &mut self.0 {
             Inner::Stream(stream) => stream.finish_within(wav_bytes, timeout),
-            #[cfg(target_os = "windows")]
-            Inner::Claude(take) => take.finish(wav_bytes),
         }
     }
 }

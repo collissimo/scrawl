@@ -775,11 +775,16 @@ fn microphone_view(
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriberView {
-    /// What recordings use now: "apple" or "hex".
+    /// What recordings use now: "apple", "hex" or (Windows) "claude".
     pub engine: &'static str,
     pub hex_title: &'static str,
     pub hex_enabled: bool,
     pub models: Vec<ModelView>,
+    /// Claude Code dictation: shown only on Windows, greyed out with the reason when `claude`
+    /// can't be found.
+    pub claude_offered: bool,
+    pub claude_title: String,
+    pub claude_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1160,6 +1165,7 @@ impl Panel {
             .and_then(crate::transcribe::Engine::parse)
             .unwrap_or_default();
         let menu = crate::transcribe::menu_state(engine, hex.as_ref(), config.hex_model.as_deref());
+        let claude = crate::transcribe::claude_choice();
         let policy = crate::retention::Policy::load_from(&host.config_path());
         let login = login_item();
         // Windows asks for no screen or accessibility grant, and has no cabled iPhone.
@@ -1203,7 +1209,13 @@ impl Panel {
                 self.status(Permission::Microphone) == Status::Granted,
             ),
             transcriber: TranscriberView {
-                engine: if menu.hex_checked { "hex" } else { "apple" },
+                engine: if menu.hex_checked {
+                    "hex"
+                } else if claude.enabled && engine == crate::transcribe::Engine::Claude {
+                    "claude"
+                } else {
+                    "apple"
+                },
                 hex_title: menu.hex_title,
                 hex_enabled: menu.hex_enabled,
                 models: menu
@@ -1211,6 +1223,9 @@ impl Panel {
                     .into_iter()
                     .map(|(id, title, chosen)| ModelView { id, title, chosen })
                     .collect(),
+                claude_offered: claude.offered,
+                claude_title: claude.title,
+                claude_enabled: claude.enabled,
             },
             video_export: config.video_export.unwrap_or(false),
             retention: RetentionView {
@@ -1520,7 +1535,8 @@ impl Session {
         view["type"] = "state".into();
         // Switched from Hex to Apple Speech: get its model now, not at the first capture.
         let speech = crate::speech_model::current();
-        if view["transcriber"]["engine"] == "apple"
+        // Claude Code dictation falls back to the local model.
+        if (view["transcriber"]["engine"] == "apple" || view["transcriber"]["engine"] == "claude")
             && speech.state == crate::speech_model::State::Unknown
         {
             crate::speech_model::ensure();
@@ -2056,6 +2072,33 @@ mod tests {
         set(&mut panel, &mut host, "retention", "forever".into());
         // "Forever" says it all; no caption.
         assert_eq!(panel.view(&host).retention.note, "");
+    }
+
+    #[test]
+    fn claude_code_dictation_is_a_windows_choice() {
+        let dir = TempDir::new("claude");
+        let mut host = fake(&dir);
+        let mut panel = Panel::default();
+        panel.on(
+            Action::Set {
+                key: "transcriber".into(),
+                value: "claude".into(),
+            },
+            &mut host,
+        );
+        let view = panel.view(&host).transcriber;
+        assert_eq!(view.claude_offered, WIN);
+        let saved = read_json(&host.path);
+        if WIN {
+            assert_eq!(saved["transcriber"], "claude");
+            // Chosen only when claude.exe can be found; otherwise recordings use the local model.
+            assert_eq!(view.engine == "claude", view.claude_enabled);
+            assert!(view.claude_title.starts_with("Claude Code (dictation)"));
+        } else {
+            assert!(saved.get("transcriber").is_none());
+            assert_eq!(view.engine, "apple");
+            assert!(!view.claude_enabled);
+        }
     }
 
     #[test]

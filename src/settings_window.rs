@@ -114,6 +114,9 @@ struct Transcriber {
     hex_enabled: bool,
     models: Vec<ModelOption>,
     speech: Speech,
+    claude_offered: bool,
+    claude_title: String,
+    claude_enabled: bool,
 }
 
 /// `speech_model::Status`: the local model's download.
@@ -1027,17 +1030,28 @@ impl SettingsWindow {
     fn recording_pane(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
         let t = &state.transcriber;
         let hex = t.engine == "hex";
+        let claude = t.engine == "claude";
         let local = crate::transcribe::LOCAL_ENGINE_TITLE;
-        let engines = vec![
+        let mut engines = vec![
             ("apple".to_owned(), local.to_owned(), true),
             ("hex".to_owned(), t.hex_title.clone(), t.hex_enabled),
         ];
+        if t.claude_offered {
+            engines.push(("claude".to_owned(), t.claude_title.clone(), t.claude_enabled));
+        }
+        let chosen_title = if hex {
+            "Hex"
+        } else if claude {
+            crate::transcribe::CLAUDE_ENGINE_TITLE
+        } else {
+            local
+        };
         let chosen = t.models.iter().find(|m| m.chosen);
         let mut rows = vec![row(
             theme,
             "Transcription",
             true,
-            popup(theme, "settings-transcriber", if hex { "Hex" } else { local }).on_click(
+            popup(theme, "settings-transcriber", chosen_title).on_click(
                 cx.listener({
                     let selected = t.engine.clone();
                     move |view, event: &ClickEvent, _, cx| {
@@ -1076,6 +1090,9 @@ impl SettingsWindow {
             );
         }
         let note = match (WINDOWS, t.hex_enabled || hex) {
+            _ if claude => {
+                "Claude Code dictates while you record, through your claude.ai login, in the language set in Scrawl's config (else Windows'). Word times are estimates. When it hears nothing or fails, Parakeet transcribes the recording."
+            }
             (true, true) => {
                 "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
             }

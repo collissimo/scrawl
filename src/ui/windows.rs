@@ -14,7 +14,7 @@ use gpui::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{
-    IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem,
+    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::HWND;
@@ -544,6 +544,8 @@ const ID_SETTINGS: &str = "settings";
 const ID_UPDATES: &str = "check-updates";
 const ID_QUIT: &str = "quit";
 const INBOX_PREFIX: &str = "inbox:";
+const ID_TRANSCRIBE_LOCAL: &str = "transcriber:apple";
+const ID_TRANSCRIBE_CLAUDE: &str = "transcriber:claude";
 
 struct Tray {
     icon: TrayIcon,
@@ -554,6 +556,9 @@ struct Tray {
     export_shown: bool,
     /// Inbox rows, replaced each time the menu opens.
     dynamic: Vec<Box<dyn IsMenuItem>>,
+    /// The Transcription submenu's engines.
+    transcribe_local: CheckMenuItem,
+    transcribe_claude: CheckMenuItem,
     status: Option<String>,
     inbox: usize,
 }
@@ -639,7 +644,25 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     if export_shown {
         let _ = menu.append(&export);
     }
+    let transcription = Submenu::new("Transcription", true);
+    let transcribe_local = CheckMenuItem::with_id(
+        ID_TRANSCRIBE_LOCAL,
+        crate::transcribe::LOCAL_ENGINE_TITLE,
+        true,
+        false,
+        None,
+    );
+    let transcribe_claude = CheckMenuItem::with_id(
+        ID_TRANSCRIBE_CLAUDE,
+        crate::transcribe::CLAUDE_ENGINE_TITLE,
+        false,
+        false,
+        None,
+    );
+    let _ = transcription.append(&transcribe_local);
+    let _ = transcription.append(&transcribe_claude);
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&transcription);
     let _ = menu.append(&MenuItem::with_id(ID_SETTINGS, "Settings…", true, None));
     let _ = menu.append(&MenuItem::with_id(
         ID_UPDATES,
@@ -650,6 +673,9 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     let _ = menu.append(&MenuItem::with_id(ID_QUIT, "Quit Scrawl", true, None));
 
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if choose_transcriber(event.id()) {
+            return;
+        }
         if let Some(action) = menu_action(event.id()) {
             let _ = sender.try_send(action);
         }
@@ -683,12 +709,49 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
             export,
             export_shown,
             dynamic: Vec::new(),
+            transcribe_local,
+            transcribe_claude,
             status: None,
             inbox: 0,
         });
     });
     SHOW_MENU.with(|slot| *slot.borrow_mut() = Some(show_rx));
     Some(receiver)
+}
+
+/// A Transcription row: saves the engine as Settings would. True when `id` was one.
+fn choose_transcriber(id: &MenuId) -> bool {
+    let engine = match id.as_ref() {
+        ID_TRANSCRIBE_LOCAL => crate::transcribe::Engine::Apple,
+        ID_TRANSCRIBE_CLAUDE => crate::transcribe::Engine::Claude,
+        _ => return false,
+    };
+    let path = crate::handoff::default_config_path();
+    if let Err(error) = crate::handoff::set_config_value_in(&path, "transcriber", engine.name().into())
+    {
+        crate::capture::scrawl_log(format!("Saving transcriber failed: {error:#}"));
+    }
+    if engine == crate::transcribe::Engine::Claude {
+        crate::win::claude_dictation::warm();
+    }
+    true
+}
+
+/// Ticks the engine recordings would use, and greys out Claude Code without `claude`.
+fn refresh_transcription(tray: &Tray) {
+    let preferred = crate::transcribe::Engine::preferred();
+    let claude = crate::transcribe::claude_choice();
+    let hex = crate::transcribe::menu_state(
+        preferred,
+        crate::hex::cached_status().as_ref(),
+        crate::handoff::hex_model().as_deref(),
+    )
+    .hex_checked;
+    let claude_checked = claude.enabled && preferred == crate::transcribe::Engine::Claude;
+    tray.transcribe_claude.set_text(&claude.title);
+    tray.transcribe_claude.set_enabled(claude.enabled);
+    tray.transcribe_claude.set_checked(claude_checked);
+    tray.transcribe_local.set_checked(!claude_checked && !hex);
 }
 
 fn menu_action(id: &MenuId) -> Option<MenuAction> {
@@ -708,6 +771,7 @@ fn menu_action(id: &MenuId) -> Option<MenuAction> {
 /// Brings the menu's rows up to date, as macOS's `menuNeedsUpdate:` does.
 fn refresh(tray: &mut Tray) {
     tray.toggle.set_text(record_title());
+    refresh_transcription(tray);
     for item in tray.dynamic.drain(..) {
         let _ = tray.menu.remove(item.as_ref());
     }
