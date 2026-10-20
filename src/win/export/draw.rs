@@ -409,7 +409,7 @@ fn label(pixmap: &mut PixmapMut, text: &str, c: (f32, f32), size: f64, max_width
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::win::export::plan::{Pin, Ripple, Snap};
+    use crate::win::export::plan::{Laser, LaserFrame, Pin, Ripple, Snap, Trail};
 
     #[test]
     fn fades_hold_then_smoothstep_out() {
@@ -488,6 +488,21 @@ mod tests {
                 y: 0.8,
                 t: 0.0,
             }],
+            // Output (20, 85) to (80, 85), at full life throughout.
+            lasers: vec![Laser {
+                frames: [0.0, 200.0]
+                    .map(|t| LaserFrame {
+                        t,
+                        pts: vec![0.55, 0.85, 1.0, 0.7, 0.85, 1.0],
+                    })
+                    .into(),
+            }],
+            // Output (20, 65) to (80, 65) over 200 ms: half drawn at 100 ms.
+            trails: vec![Trail {
+                pts: vec![0.55, 0.65, 0.7, 0.65],
+                t: 0.0,
+                t1: 200.0,
+            }],
             ..Ink::default()
         };
         let mut pixmap = PixmapMut::from_bytes(&mut data, w as u32, h as u32).unwrap();
@@ -510,5 +525,16 @@ mod tests {
         // The ripple at output (100, 80): blue tint inside, white ring around.
         let inside = pixel(&data, w, 100, 80);
         assert!(inside[2] > inside[0] + 40, "{inside:?}");
+        // The laser: a near-white core with a red glow around it.
+        let core = pixel(&data, w, 50, 85);
+        assert!(core[0] > 230 && core[1] > 180, "{core:?}");
+        let glow = pixel(&data, w, 50, 88);
+        assert!(glow[0] > glow[1] + 40 && glow[0] > glow[2] + 40, "{glow:?}");
+        // The trail: blue up to its head at (50, 65), nothing past it yet.
+        let line = pixel(&data, w, 35, 65);
+        assert!(line[2] > line[0] + 60, "{line:?}");
+        let head = pixel(&data, w, 50, 65);
+        assert!(head[2] > 200 && head[0] < 80, "{head:?}");
+        assert_eq!(pixel(&data, w, 72, 65), [40, 40, 40]);
     }
 }
