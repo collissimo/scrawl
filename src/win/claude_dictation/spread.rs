@@ -61,7 +61,7 @@ pub fn transcript(
 
 /// Deals the words out to `spans` in order: each word goes to the span its middle character
 /// falls in, with the text's length laid over the spans' combined length.
-fn share<'a>(text: &'a str, spans: &[(u64, u64)]) -> Vec<Vec<&'a str>> {
+pub(super) fn share<'a>(text: &'a str, spans: &[(u64, u64)]) -> Vec<Vec<&'a str>> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let weight = |word: &str| word.chars().count().max(1) as u128;
     let total: u128 = words.iter().map(|w| weight(w)).sum();
