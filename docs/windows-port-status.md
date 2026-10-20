@@ -39,7 +39,7 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
 
 Stopped agents from the old plan are obsolete and must not be resumed: T3 "Scrawl Windows: foundation commit" and the workflow "foundation".
 
-Build: `cmd //c 'C:	\cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and Ninja, because the VS 18 generator isn't found. If cmake complains "generator does not match", delete `<target>/debug/build/transcribe-cpp-sys-*/out/build`.
+Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and Ninja, because the VS 18 generator isn't found. If cmake complains "generator does not match", delete `<target>/debug/build/transcribe-cpp-sys-*/out/build`.
 
 ## To-do
 
