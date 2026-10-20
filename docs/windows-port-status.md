@@ -80,11 +80,13 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
   - What it does: every 100 ms it checks the overlay. After 600 ms without drawing, or when the overlay is hidden, minimized, misplaced, not topmost or covered, it redraws and re-raises it.
   - Diagnostics: log lines `ink overlay …`.
   - The bug was NOT reproduced. Likely cause: a GPUI `request_animation_frame` lost on a failed `try_borrow_mut`.
-  - [ ] Collin re-tests with `C:/t/scrawl-test2/scrawl.exe`. Look in the log for "stopped drawing" / "draws again" / "is covered by". If it shows "stopped drawing" without "draws again", the next step is reopening the overlay window.
-- [ ] F5 (running; `C:/t/briefs/F5-full.md`, target scrawl-a, clientRequestId `scrawl-win-F5-video-storage-1`): Collin wants recordings to use less disk.
-  - VBR at full resolution. 720p is ruled out because frames are decoded from the video.
-  - An opt-in "delete the video after each capture".
-  - A note that the Recycle Bin only frees space once it's emptied.
+  - [ ] Collin re-tests with `C:/t/scrawl-test2/scrawl.exe` (built from 04c42bd, includes F5). Look in the log for "stopped drawing" / "draws again" / "is covered by". If it shows "stopped drawing" without "draws again", the next step is reopening the overlay window.
+- [x] F5 merged (04c42bd): the recording encoder runs in quality mode 85, about 3.5× smaller on still screens and 1.7–2.5× with video on screen.
+  - Opt-in `retention.keepVideo:false` deletes `recording.mp4` after each capture (zoom/export/reprocess then explain why they can't run).
+  - The Storage note now mentions the Recycle Bin.
+  - 391 tests pass.
+  - Next lever (not shipped): a key frame every 120 frames would give about 3× less again, but needs cheaper decoding first.
+  - [ ] Collin has not seen the Storage pane yet.
 - [x] Tests no longer write to the real `scrawl.log` (`cfg!(test)` in `scrawl_log`).
 - Collin's decision (2026-10-20): Parakeet (`apple`) is the default transcriber, and Claude Code dictation is only a low-priority extra.
 - [x] German spoken cues (jetzt, hier, schau, guck, …) in `keyframes::spoken_cue` (a127e09). On his capture, "Ich scroll jetzt hier …" now gets its own keyframe.
