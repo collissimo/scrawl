@@ -172,6 +172,8 @@ impl Live {
         match &mut self.0 {
             Inner::Stream(stream) => stream.finish_within(wav_bytes, TAIL_TIMEOUT),
             #[cfg(target_os = "windows")]
+            // `transcribe` takes Claude Code's take out first (`into_claude`) to finish it with
+            // Parakeet's times; this way has none.
             Inner::Claude(take) => take.finish(wav_bytes, || None),
         }
     }

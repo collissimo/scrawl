@@ -1405,23 +1405,35 @@ mod tests {
         let (take, _released, _cancelled, answer) = test_take();
         let audio = audio_of(&recording(3_000, &[(500, 2_000)]));
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(300));
             let _ = answer.send(said("Hallo Welt."));
         });
         let started = Instant::now();
         let transcript = crate::transcribe::claude(take, &audio, || {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(300));
             Ok(parakeet(&[(600, "Hallo"), (1_200, "Welt.")]))
         });
         let took = started.elapsed();
-        assert!(took < Duration::from_millis(750), "{took:?}");
+        assert!(took < Duration::from_millis(550), "one after the other takes 600 ms: {took:?}");
         assert!(!transcript.estimated);
         assert_eq!(transcript.words[1].t0, 1_200);
     }
 
     /// `summary.md` for an 8 s recording with scene changes at `times`.
     fn summary_with_keyframes(transcript: TranscriptData, times: &[u64]) -> String {
-        let said = crate::keyframes::said_per_keyframe(times, &[], &transcript);
+        summary_with(transcript, times, &[], 8_000)
+    }
+
+    /// `summary.md` for a `duration_ms` recording with keyframes at `times`, each anchored where
+    /// its span starts (`anchors`, as `said_per_keyframe` takes them; a mark's starts with its
+    /// stroke).
+    fn summary_with(
+        transcript: TranscriptData,
+        times: &[u64],
+        anchors: &[u64],
+        duration_ms: u64,
+    ) -> String {
+        let said = crate::keyframes::said_per_keyframe(times, anchors, &transcript);
         let keyframes = times
             .iter()
             .zip(said)
@@ -1441,7 +1453,7 @@ mod tests {
             version: 1,
             id: "t".into(),
             created_at_ms: 0,
-            duration_ms: 8_000,
+            duration_ms,
             target: TargetInfo {
                 mode: CaptureMode::Display,
                 app: None,
@@ -1483,7 +1495,8 @@ mod tests {
     /// Claude Code's text (`SCRAWL_ALIGN_TEXT`) for a real recording (`SCRAWL_ALIGN_WAV`) with
     /// the real Parakeet alongside: prints each word's aligned start next to Parakeet's words,
     /// and `summary.md` with scene changes at `SCRAWL_ALIGN_KEYFRAMES` (ms, comma separated;
-    /// without it, 300 ms before each of Parakeet's sentences). Needs `SCRAWL_CONFIG` naming
+    /// without it, 300 ms before each of Parakeet's sentences), anchored at
+    /// `SCRAWL_ALIGN_ANCHORS` (one per keyframe). Needs `SCRAWL_CONFIG` naming
     /// the language and `SCRAWL_MODELS_DIR`; `-- --ignored --nocapture real_parakeet_times`.
     #[test]
     #[ignore]
@@ -1493,6 +1506,9 @@ mod tests {
         let audio = audio_of(&samples);
         let measured = crate::helper::transcribe(&wav).unwrap();
         println!("Parakeet ({:?}): {}", measured.model, measured.text);
+        for segment in &measured.segments {
+            println!("Parakeet segment {}-{}: {}", segment.t0, segment.t1, segment.text);
+        }
         let text = std::env::var("SCRAWL_ALIGN_TEXT").unwrap_or_else(|_| measured.text.clone());
         let (take, _released, _cancelled, answer) = test_take();
         answer.send(said(&text)).unwrap();
@@ -1502,7 +1518,7 @@ mod tests {
             "model {:?}, estimated {}",
             transcript.model, transcript.estimated
         );
-        println!("{:<24} {:>8}   Parakeet", "Claude Code", "aligned");
+        println!("{:<24} {:>13}   Parakeet", "Claude Code", "aligned");
         for word in &transcript.words {
             let near: Vec<String> = measured
                 .words
@@ -1510,7 +1526,13 @@ mod tests {
                 .filter(|w| w.t1 > word.t0.saturating_sub(150) && w.t0 < word.t1 + 150)
                 .map(|w| format!("{}@{}", w.text, w.t0))
                 .collect();
-            println!("{:<24} {:>8}   {}", word.text, word.t0, near.join(" "));
+            println!(
+                "{:<24} {:>6}-{:<6}   {}",
+                word.text,
+                word.t0,
+                word.t1,
+                near.join(" ")
+            );
         }
         let times: Vec<u64> = match std::env::var("SCRAWL_ALIGN_KEYFRAMES") {
             Ok(list) => list.split(',').map(|t| t.trim().parse().unwrap()).collect(),
@@ -1520,8 +1542,14 @@ mod tests {
                 .map(|s| s.t0.saturating_sub(300))
                 .collect(),
         };
-        println!("keyframes at {times:?}");
-        println!("{}", summary_with_keyframes(transcript.clone(), &times));
+        let anchors: Vec<u64> = std::env::var("SCRAWL_ALIGN_ANCHORS")
+            .map(|list| list.split(',').map(|t| t.trim().parse().unwrap()).collect())
+            .unwrap_or_default();
+        println!("keyframes at {times:?}, anchors {anchors:?}");
+        println!(
+            "{}",
+            summary_with(transcript.clone(), &times, &anchors, audio.duration_ms)
+        );
         assert!(!transcript.estimated);
         assert_eq!(transcript.text, text.split_whitespace().collect::<Vec<_>>().join(" "));
     }
