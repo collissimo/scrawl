@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncMPVGOPSize, IMFAttributes, IMFMediaType, IMFSinkWriter, MF_MT_AAC_PAYLOAD_TYPE,
+    IMFAttributes, IMFMediaType, IMFSinkWriter, MF_MT_AAC_PAYLOAD_TYPE,
     MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
     MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
     MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
@@ -21,6 +21,8 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::core::{GUID, HSTRING};
 
+use crate::win::media::{RateControl, describe_encoder, set_input_type};
+
 /// AAC in the export is 48 kHz mono at 96 kbit/s, like the macOS helper's.
 pub const AUDIO_RATE: u32 = 48_000;
 const AAC_BYTES_PER_SECOND: u32 = 12_000;
@@ -29,7 +31,11 @@ fn pack(hi: u32, lo: u32) -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
-/// The helper's bit rate: 0.065 bit per pixel and frame, between 1.5 and 18 Mbit/s.
+/// The export's `CODECAPI_AVEncCommonQuality`: the recording's.
+const EXPORT_QUALITY: u32 = 85;
+
+/// The helper's bit rate: 0.065 bit per pixel and frame, between 1.5 and 18 Mbit/s (the
+/// average every encoder is given; the quality setting decides the rest).
 pub fn bit_rate(width: u32, height: u32, fps: u32) -> u32 {
     let pixels = f64::from(width) * f64::from(height) * f64::from(fps);
     (pixels * 0.065).clamp(1_500_000.0, 18_000_000.0) as u32
@@ -113,18 +119,19 @@ impl Writer {
         }
         let video = unsafe { writer.AddStream(&output) }.context("No H.264 encoder")?;
         let input = video_type(&MFVideoFormat_NV12, width, height, fps)?;
-        let mut params: Option<IMFAttributes> = None;
-        unsafe { MFCreateAttributes(&mut params, 1) }?;
-        let params = params.context("attributes")?;
         unsafe {
             input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
             input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-            // A key frame every 2 s.
-            params.SetUINT32(&CODECAPI_AVEncMPVGOPSize, fps * 2)?;
-            writer
-                .SetInputMediaType(video, &input, &params)
-                .context("The H.264 encoder refused the frames")?;
         }
+        // Quality-based like the recording (hardware encoders otherwise run near-constant
+        // bitrate), with a key frame every 2 s.
+        let params = RateControl::Quality(EXPORT_QUALITY).params(Some(fps * 2))?;
+        set_input_type(&writer, video, &input, params.as_ref())
+            .context("The H.264 encoder refused the frames")?;
+        crate::capture::scrawl_log(format!(
+            "Export encoder: {}",
+            describe_encoder(&writer, video)
+        ));
 
         let audio = if audio {
             let output = audio_type(&MFAudioFormat_AAC, AAC_BYTES_PER_SECOND)?;
