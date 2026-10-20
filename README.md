@@ -165,7 +165,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
   (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
 - **Recording**: the microphone, with its input level, the transcriber (Apple Speech, or Hex while
   it runs, with its model) and, under Experimental, Video export.
-- **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
+- **Storage**: how long recordings are kept, whether each capture's video is deleted once it's
+  processed, how much space the captures take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
   install command with Copy. A `scrawl` that belongs to another program is left alone.
@@ -663,7 +664,12 @@ daily, at low priority, and logs what it did:
 - **Keep recordings** in Settings › Storage picks Video for 7 Days (bundles 30), Video for 30 Days
   (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
   `~/.config/scrawl/config.json`; `null` keeps forever. The same pane shows how much the captures
-  take and opens the folder in Finder.
+  take and opens the folder in Finder. On Windows the Recycle Bin gives the space back only once
+  it's emptied.
+- **Delete the video after each capture** (Settings › Storage, off by default, `"keepVideo":
+  false` under `"retention"`) deletes `recording.mp4` for good a minute after each new capture is
+  processed, once it's delivered and no copy is running; frames, contact sheet, text and
+  `audio.wav` stay, and `scrawl zoom`, `export` and `reprocess` say the video was deleted.
 - Never touched: a bundle under a day old or changed in the last day (a copy just arrived from
   another Mac, a zoom), one whose media is still copying (`.media-pending` there, `.media-sending`
   here; a marker over a day old is ignored), one being recorded or re-encoded, and one with a
