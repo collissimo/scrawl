@@ -84,10 +84,7 @@ pub fn claude_choice_for(choice: ClaudeChoice, language: &str) -> ClaudeChoice {
     }
     ClaudeChoice {
         offered: choice.offered,
-        title: format!(
-            "{CLAUDE_ENGINE_TITLE}: no {} dictation",
-            name(language)
-        ),
+        title: format!("{CLAUDE_ENGINE_TITLE}: no {} dictation", name(language)),
         enabled: false,
     }
 }
@@ -125,7 +122,10 @@ mod tests {
     #[test]
     fn each_engine_knows_its_own_languages() {
         for both in ["en", "de", "fr", "uk"] {
-            assert!(claude_supports(both) && parakeet_v3_supports(both), "{both}");
+            assert!(
+                claude_supports(both) && parakeet_v3_supports(both),
+                "{both}"
+            );
         }
         for claude_only in ["ja", "ko", "hi", "id", "no", "tr"] {
             assert!(claude_supports(claude_only) && !parakeet_v3_supports(claude_only));
@@ -137,7 +137,9 @@ mod tests {
         assert_eq!(parakeet_note("de"), None);
         assert_eq!(
             parakeet_note("ja").as_deref(),
-            Some("Parakeet doesn't speak 日本語, so recordings it transcribes come out as English.")
+            Some(
+                "Parakeet doesn't speak 日本語, so recordings it transcribes come out as English."
+            )
         );
     }
 
@@ -158,7 +160,10 @@ mod tests {
             title: "Claude Code (dictation): claude.exe not found on PATH".into(),
             enabled: false,
         };
-        assert_eq!(claude_choice_for(missing, "fi").title, "Claude Code (dictation): claude.exe not found on PATH");
+        assert_eq!(
+            claude_choice_for(missing, "fi").title,
+            "Claude Code (dictation): claude.exe not found on PATH"
+        );
     }
 
     /// `PARAKEET_V3` matches the languages the downloaded model lists. Reads it from
@@ -166,7 +171,8 @@ mod tests {
     #[test]
     #[ignore = "loads the 740 MB Parakeet v3 model"]
     fn the_v3_list_matches_the_model() {
-        let path = crate::win::speech::own_models_dir().join(crate::win::speech::PARAKEET_V3.filename);
+        let path =
+            crate::win::speech::own_models_dir().join(crate::win::speech::PARAKEET_V3.filename);
         transcribe_cpp::init_backends_default().unwrap();
         let model = transcribe_cpp::Model::load(&path).unwrap();
         let mut listed = model.capabilities().languages;

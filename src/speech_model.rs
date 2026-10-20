@@ -361,13 +361,33 @@ mod tests {
         let failed = status(State::Failed, &language);
         let mut last = Some((language.clone(), Engine::Apple));
         // Nothing changed: no check, not even to retry a failed download.
-        assert!(!should_ensure(&mut last, (language.clone(), Engine::Apple), &ready));
-        assert!(!should_ensure(&mut last, (language.clone(), Engine::Apple), &failed));
+        assert!(!should_ensure(
+            &mut last,
+            (language.clone(), Engine::Apple),
+            &ready
+        ));
+        assert!(!should_ensure(
+            &mut last,
+            (language.clone(), Engine::Apple),
+            &failed
+        ));
         // The language changed (Settings, the tray or config.json): check once.
-        assert!(should_ensure(&mut last, ("xx".into(), Engine::Apple), &failed));
-        assert!(!should_ensure(&mut last, ("xx".into(), Engine::Apple), &failed));
+        assert!(should_ensure(
+            &mut last,
+            ("xx".into(), Engine::Apple),
+            &failed
+        ));
+        assert!(!should_ensure(
+            &mut last,
+            ("xx".into(), Engine::Apple),
+            &failed
+        ));
         // Hex to Claude Code, which falls back to the local model.
-        assert!(should_ensure(&mut last, ("xx".into(), Engine::Claude), &failed));
+        assert!(should_ensure(
+            &mut last,
+            ("xx".into(), Engine::Claude),
+            &failed
+        ));
         // A download for the old language finished after the change: check again.
         assert!(should_ensure(
             &mut last,
