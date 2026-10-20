@@ -39,7 +39,14 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
 
 - A: German file transcription (Parakeet TDT v3). **Done and merged** (b614a2c). 316 tests pass. Follow-up: Settings must call `speech_model::ensure()` after the language changes (B owns settings.rs, or do it at integration).
 - B: Claude Code dictation engine. **Done and merged** (cfc45d8); A+B+C together: 341 tests pass. Not yet tested with real speech (needs Collin). Risks: it hears only the Windows default mic; a cold start begins listening 2-3 s late; npm `claude.cmd` isn't found.
-- Reviews running (read-only, fastMode): R2 Windows robustness, R3 product/docs. (R1 macOS cancelled.) Brief: `C:/t/briefs/review-common.md`. clientRequestIds `scrawl-win-review-R{1,2,3}-*-1`
+- Reviews done: R2 robustness and R3 product (R1 macOS was cancelled; macOS is out of scope). Verbatim findings: `C:/t/briefs/review-findings.md`.
+- Fix tasks (started 2026-10-20 ~17:45, fastMode, worktree):
+  - F1 Claude-dictation robustness (`C:/t/briefs/F1-dictation-fixes.md`, target `C:/t/scrawl-b`, clientRequestId `scrawl-win-F1-dictation-1`).
+  - F2 language picker + model watcher + export retry (`C:/t/briefs/F2-language-settings-export-fixes.md`, target `C:/t/scrawl-c`, clientRequestId `scrawl-win-F2-language-1`).
+  - Decision: the default language is `en` unless config `language` is set (no locale following; experiments rule). Collin picks Deutsch in Settings.
+  - Merge order: F1 first, then F2, then a full `cargo test`.
+  - After merging: add a runtime gate in `claude_dictation` for languages Claude doesn't support (use F2's `win::languages::claude_supports`; log it and fall back). Write F1's doc notes into `docs/windows.md`.
+  - Then Collin's spoken test.
 - C: Windows video export. **Done and merged** (ec4b14f), plus my fix for sheared decoded frames (513473d). 327 tests pass. Follow-ups: the AMD encoder runs near-constant bitrate, so static screens produce big files (switch to VBR via CODECAPI_AVEncCommonRateControlMode); no fast-start; `media::audio_mono` duplicates `export_audio`.
 
 Stopped agents from the old plan are obsolete and must not be resumed: T3 "Scrawl Windows: foundation commit" and the workflow "foundation".
