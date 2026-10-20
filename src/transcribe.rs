@@ -198,6 +198,7 @@ fn finish_live(
     live: crate::live_transcribe::Live,
     audio: &RecordedAudio,
 ) -> Option<TranscriptData> {
+    let finishing = std::time::Instant::now();
     match live.finish(&audio.wav_bytes) {
         Ok(done) => {
             crate::capture::scrawl_log(format!(
@@ -214,7 +215,8 @@ fn finish_live(
         Err(error) if error.is::<crate::win::claude_dictation::Skipped>() => None,
         Err(error) => {
             crate::capture::scrawl_log(format!(
-                "Live transcription failed, transcribing the recording: {error:#}"
+                "Live transcription failed after {} ms, transcribing the recording: {error:#}",
+                finishing.elapsed().as_millis()
             ));
             None
         }
