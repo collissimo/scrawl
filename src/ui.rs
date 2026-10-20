@@ -5327,6 +5327,9 @@ pub fn run_app(
         platform::start_updates();
         crate::retention::start();
         crate::hex::watch();
+        // Claude Code dictation keeps a session warm while it is the engine.
+        #[cfg(target_os = "windows")]
+        crate::win::claude_dictation::watch();
         crate::speech_model::ensure();
         let menu_rx = install_status_bar();
 

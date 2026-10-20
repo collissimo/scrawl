@@ -703,7 +703,7 @@ Or in
 { "transcriber": "hex", "hexModel": "parakeet_v3" }
 ```
 
-`"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
+`"transcriber"` is `"apple"` (default), `"hex"` or, on Windows, `"claude"`; `hexModel` defaults to the first ready one of
 `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
 downloads or prepares a model: install it in Hex first.
 
@@ -717,6 +717,29 @@ downloads or prepares a model: install it in Hex first.
 - `scrawl hex status` shows whether Hex is connected, its ready models and what the next recording
   will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
   an engine for one run.
+
+### Claude Code dictation (Windows)
+
+On Windows, Scrawl can transcribe through Claude Code's voice dictation instead, which handles
+German and the other languages Claude Code lists: Settings › Recording › **Transcription** →
+**Claude Code (dictation)**, the tray's **Transcription** submenu, or `"transcriber": "claude"`
+in the config. It needs `claude.exe` on PATH and a claude.ai login (`claude auth status`);
+without `claude` the choice is greyed out with the reason.
+
+- A hidden, unmodified `claude` session runs in a pseudo console (no window) with dictation on in
+  hold mode, no tools, no MCP servers and plan mode. While you record, Scrawl holds its dictation
+  key; Claude Code records the default microphone and transcribes through Anthropic with your
+  login. When the recording stops, the text comes out through Claude Code's external editor hook
+  (`scrawl.exe claude-editor`) and is never submitted as a prompt.
+- The language is `"language"` in the config (a code such as `"de"`), else Windows' language.
+- Scrawl keeps one session warm while Claude Code is the engine and ends it with Scrawl.
+- Claude Code returns text without times, so its words are spread over the recording's stretches
+  of speech (`"source": "claude-code"`, `"estimated": true`).
+- When Claude Code hears nothing, fails, or started listening too late to hear the start, the
+  recording is transcribed on this PC instead (see `%LOCALAPPDATA%\Scrawl\Logs`). Import,
+  reprocess and retranscribe always use the on-device engine.
+- `scrawl dictation-selftest` starts a session, takes typed text back out through the editor hook,
+  holds dictation for 2 s (this records the microphone) and cancels one.
 
 ### Transcribing while recording (experiment)
 
@@ -793,6 +816,8 @@ system owns differ:
   Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
   `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
   captures made before it finishes get their transcript once it lands.
+  `"transcriber": "claude"` dictates through Claude Code instead (any language Claude Code
+  supports; see [Claude Code dictation](#claude-code-dictation-windows)).
 - **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
   `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH, so agents and terminals
   can run `scrawl`.

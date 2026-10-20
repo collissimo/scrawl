@@ -1,0 +1,42 @@
+[2J[m[H]0;C:\Users\user\.local\bin\claude.exe[?25h]0;claudeClaude Code's fullscreen renderer didn't finish starting last time on this machine, so this launch is using the classic renderer. It will try fullscreen again n
+ext launch; /tui default keeps the classic renderer.[K
+[?25l[?2004h[?2031h[?1004h[?9001l[>0q[?u]7501;?[38;2;255;193;7m
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+ [1m[38;2;255;193;7mAccessing[m [1m[38;2;255;193;7mworkspace:[m[K
+[K
+ [1m[97mC:\t\b-work\rt\claude-cwd[m[K
+[K
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not,    
+ take a moment to review what's in this folder first.[K
+[K
+ Claude Code'll be able to read, edit, and execute files here.[K
+[K
+ [38;2;153;153;153mSecurity[m [38;2;153;153;153mguide[m[K
+[K
+ [38;2;177;185;249m❯[m [38;2;177;185;249mNo,[m [38;2;177;185;249mexit[m[K
+   Yes, I trust this folder[K
+[K
+ [38;2;153;153;153mEnter[m [38;2;153;153;153mto[m [38;2;153;153;153mconfirm[m [38;2;153;153;153m·[m [38;2;153;153;153mEsc[m [38;2;153;153;153mto[m [38;2;153;153;153mcancel[m[K[127C[16;2H  No, exit[16X[38;2;177;185;249m[17;2H❯[m [38;2;177;185;249mYes, I trust this folder[m[>4m[?1004l[?2031l[?2004l[3;1H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[160C[?2004h[?2031h[?1004h[?9001l[>0q[>4m[?1004l[?2031l[?2004l[?2004h[?2031h[?1004h[?9001l]0;✳ Claude Code[38;2;215;119;87m[3;1H ▐[48;2;0;0;0m▛███▛█[m   [1m[97mClaude[m [1m[97mCode[m [38;2;153;153;153mv2.1.304[m[K[38;2;215;119;87m
+▝▜[48;2;0;0;0m█████[49m█▀[m  [38;2;153;153;153mOpus[m [38;2;153;153;153m5.5[m [38;2;153;153;153m·[m [38;2;153;153;153mClaude[m [38;2;153;153;153mMax[m[K[38;2;215;119;87m
+ ▝▝[m   [38;2;215;119;87m▝▝[m   [38;2;153;153;153mC:\t\b-work\rt\claude-cwd[m[K
+[K
+[K[38;2;136;136;136m
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[m
+❯ Try "how doe
