@@ -6,9 +6,6 @@
 //! that tail is left to transcribe, so the words and times are the WAV's own. Anything wrong (the
 //! helper fails, the model isn't installed, it lost samples or took too long) returns an error and
 //! the caller transcribes the WAV as before.
-//!
-//! On Windows the same seam drives Claude Code dictation (`"transcriber": "claude"`,
-//! `crate::win::claude_dictation`): starting holds its dictation key, finishing releases it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -30,27 +27,14 @@ const FEED_EVERY: Duration = Duration::from_millis(160);
 const TAIL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Whether recordings should start a live transcription now. It streams to `scrawl-helper`'s
-/// SpeechAnalyzer, so only on macOS; on Windows only Claude Code dictation runs live.
+/// SpeechAnalyzer, so only on macOS (Windows transcribes after the recording).
 pub fn wanted() -> bool {
-    #[cfg(target_os = "windows")]
-    if crate::transcribe::Engine::preferred() == crate::transcribe::Engine::Claude {
-        return crate::win::claude_dictation::available();
-    }
     cfg!(target_os = "macos")
         && crate::handoff::experiment(crate::handoff::LIVE_TRANSCRIBE)
         && crate::transcribe::Engine::preferred() == crate::transcribe::Engine::Apple
 }
 
-pub struct Live(Inner);
-
-enum Inner {
-    Stream(Stream),
-    #[cfg(target_os = "windows")]
-    Claude(crate::win::claude_dictation::Take),
-}
-
-/// Samples streamed to `scrawl-helper transcribe-stream`.
-struct Stream {
+pub struct Live {
     stop: Arc<AtomicBool>,
     feeder: Option<JoinHandle<Result<Feeding>>>,
 }
@@ -106,18 +90,8 @@ pub struct Finished {
 impl Live {
     /// Starts streaming `samples` (the recorder's 16 kHz buffer, which only grows until the
     /// recording stops) to a new helper. Nothing here blocks: the helper starts on the feeder
-    /// thread. On Windows with Claude Code as the engine, starts its dictation instead.
+    /// thread.
     pub fn start(samples: Arc<Mutex<Vec<f32>>>) -> Result<Self> {
-        #[cfg(target_os = "windows")]
-        if crate::transcribe::Engine::preferred() == crate::transcribe::Engine::Claude {
-            return Ok(Self(Inner::Claude(
-                crate::win::claude_dictation::Take::start(samples)?,
-            )));
-        }
-        Self::stream(samples)
-    }
-
-    fn stream(samples: Arc<Mutex<Vec<f32>>>) -> Result<Self> {
         let mut command = Command::new(crate::helper::path()?);
         command.arg("transcribe-stream");
         Self::start_with(command, samples)
@@ -134,59 +108,18 @@ impl Live {
             .name("scrawl-live-transcribe".into())
             .spawn(move || feed(command, &samples, &feeder_stop))
             .context("Could not spawn the live transcription thread")?;
-        Ok(Self(Inner::Stream(Stream {
+        Ok(Self {
             stop,
             feeder: Some(feeder),
-        })))
-    }
-
-    /// The recording has stopped (`AudioRecorder::stop`, first thing): Claude Code dictation
-    /// releases its key so nothing said afterwards lands in the transcript. The stream needs
-    /// nothing; it gets the rest from the WAV.
-    pub fn release(&self) {
-        match &self.0 {
-            Inner::Stream(_) => {}
-            #[cfg(target_os = "windows")]
-            Inner::Claude(take) => take.release(),
-        }
-    }
-
-    #[cfg(all(test, target_os = "windows"))]
-    pub fn claude(take: crate::win::claude_dictation::Take) -> Self {
-        Self(Inner::Claude(take))
-    }
-
-    /// Claude Code dictation's take, which `transcribe` finishes with Parakeet alongside, or
-    /// this stream back.
-    #[cfg(target_os = "windows")]
-    pub fn into_claude(self) -> std::result::Result<crate::win::claude_dictation::Take, Self> {
-        match self.0 {
-            Inner::Claude(take) => Ok(take),
-            stream => Err(Self(stream)),
-        }
+        })
     }
 
     /// Sends what the helper hasn't had of `wav_bytes` (the recording's `audio.wav`), ends its
     /// input and collects the transcript.
     pub fn finish(mut self, wav_bytes: &[u8]) -> Result<Finished> {
-        match &mut self.0 {
-            Inner::Stream(stream) => stream.finish_within(wav_bytes, TAIL_TIMEOUT),
-            #[cfg(target_os = "windows")]
-            // `transcribe` takes Claude Code's take out first (`into_claude`) to finish it with
-            // Parakeet's times; this way has none.
-            Inner::Claude(take) => take.finish(wav_bytes, || None),
-        }
+        self.finish_within(wav_bytes, TAIL_TIMEOUT)
     }
 
-    #[cfg(all(test, unix))]
-    fn finish_within(&mut self, wav_bytes: &[u8], timeout: Duration) -> Result<Finished> {
-        match &mut self.0 {
-            Inner::Stream(stream) => stream.finish_within(wav_bytes, timeout),
-        }
-    }
-}
-
-impl Stream {
     fn finish_within(&mut self, wav_bytes: &[u8], timeout: Duration) -> Result<Finished> {
         let finishing = Instant::now();
         let mut feeding = self.join_feeder()?;
@@ -258,7 +191,7 @@ impl Stream {
     }
 }
 
-impl Drop for Stream {
+impl Drop for Live {
     fn drop(&mut self) {
         if self.feeder.is_some() {
             let _ = self.join_feeder();
@@ -372,8 +305,7 @@ fn le_bytes(samples: &[i16]) -> Vec<u8> {
 pub fn simulate(wav_bytes: &[u8], speed: f64) -> Result<Live> {
     let samples = crate::audio::decode_wav_16k(wav_bytes)?;
     let buffer = Arc::new(Mutex::new(Vec::with_capacity(samples.len())));
-    // Always the helper: Claude Code would listen to the room, not to this file.
-    let live = Live::stream(Arc::clone(&buffer))?;
+    let live = Live::start(Arc::clone(&buffer))?;
     let started = Instant::now();
     for (i, chunk) in samples.chunks(160).enumerate() {
         buffer

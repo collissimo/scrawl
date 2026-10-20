@@ -76,14 +76,17 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          $name = "Scrawl-$version-windows-x64.zip"
+          $name = "Scrawl-$version-windows-x64-nur-lokal.zip"
           $dir = "dist\Scrawl"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item $env:EXE "$dir\scrawl.exe"
           Copy-Item runtime\*.dll $dir
           Copy-Item LICENSE "$dir\LICENSE.txt"
           @"
-          Scrawl $version for Windows (preview)
+          Scrawl $version for Windows (preview), local-only build
+
+          Transcription runs only on this PC (Parakeet). There is no Claude Code dictation:
+          no recording, screenshot or word leaves this PC until you paste a capture somewhere.
 
           Run scrawl.exe. Scrawl lives in the notification area; press Alt+Shift+S to record.
 

@@ -1,10 +1,7 @@
 //! Transcription: Apple's SpeechAnalyzer through `scrawl-helper` (measured word and segment
 //! timings), or Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
-//! times estimated). Any Hex trouble falls back to Apple for that recording. On Windows,
-//! `"transcriber": "claude"` dictates through a hidden Claude Code session while recording
-//! (`crate::win::claude_dictation`) while Parakeet transcribes the finished recording alongside:
-//! Claude Code's words take Parakeet's measured times (estimated when too few line up), and
-//! without Claude Code's text Parakeet's transcript is used.
+//! times estimated). Any Hex trouble falls back to Apple for that recording. On Windows the
+//! on-device engine is Parakeet; nothing leaves this PC.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,8 +16,6 @@ pub enum Engine {
     #[default]
     Apple,
     Hex,
-    /// Claude Code's voice dictation, live while recording (Windows only).
-    Claude,
 }
 
 impl Engine {
@@ -28,7 +23,6 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "apple" => Some(Self::Apple),
             "hex" => Some(Self::Hex),
-            "claude" if cfg!(target_os = "windows") => Some(Self::Claude),
             _ => None,
         }
     }
@@ -37,7 +31,6 @@ impl Engine {
         match self {
             Self::Apple => "apple",
             Self::Hex => "hex",
-            Self::Claude => "claude",
         }
     }
 
@@ -54,7 +47,6 @@ impl Engine {
         match OVERRIDE.load(Ordering::Relaxed) {
             1 => Self::Apple,
             2 => Self::Hex,
-            3 => Self::Claude,
             _ => Self::configured(),
         }
     }
@@ -122,47 +114,12 @@ pub fn menu_state(
     }
 }
 
-/// The Claude Code dictation choice in menus: offered only on Windows, and greyed out with the
-/// reason when `claude` can't be found.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ClaudeChoice {
-    pub offered: bool,
-    pub title: String,
-    pub enabled: bool,
-}
-
-pub const CLAUDE_ENGINE_TITLE: &str = "Claude Code (dictation)";
-
-pub fn claude_choice() -> ClaudeChoice {
-    #[cfg(target_os = "windows")]
-    let missing = crate::win::claude_dictation::unavailable_reason();
-    #[cfg(not(target_os = "windows"))]
-    let missing: Option<String> = None;
-    claude_choice_for(cfg!(target_os = "windows"), missing)
-}
-
-fn claude_choice_for(offered: bool, missing: Option<String>) -> ClaudeChoice {
-    match missing {
-        Some(reason) => ClaudeChoice {
-            offered,
-            title: format!("{CLAUDE_ENGINE_TITLE}: {reason}"),
-            enabled: false,
-        },
-        None => ClaudeChoice {
-            offered,
-            title: CLAUDE_ENGINE_TITLE.to_owned(),
-            enabled: offered,
-        },
-    }
-}
-
 /// Pins the engine for this process (`scrawl reprocess --transcriber`).
 pub fn set_override(engine: Engine) {
     OVERRIDE.store(
         match engine {
             Engine::Apple => 1,
             Engine::Hex => 2,
-            Engine::Claude => 3,
         },
         Ordering::Relaxed,
     );
@@ -181,97 +138,10 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
         Engine::preferred(),
         || try_hex(audio),
         || {
-            #[cfg(target_os = "windows")]
-            let live = match live.map(crate::live_transcribe::Live::into_claude) {
-                Some(Ok(take)) => {
-                    return claude(take, audio, || crate::helper::transcribe(wav));
-                }
-                Some(Err(live)) => Some(live),
-                None => None,
-            };
             live.and_then(|live| finish_live(|| live.finish(&audio.wav_bytes), audio))
-                .unwrap_or_else(|| {
-                    if Engine::preferred() == Engine::Claude {
-                        crate::capture::scrawl_log(format!(
-                            "No Claude Code dictation for this recording, using {LOCAL_ENGINE_TITLE}"
-                        ));
-                    }
-                    local(crate::helper::transcribe(wav))
-                })
+                .unwrap_or_else(|| local(crate::helper::transcribe(wav)))
         },
     )
-}
-
-/// Claude Code's dictation of `audio` with Parakeet (`parakeet`, which transcribes the recording's
-/// file) running alongside, so finishing takes as long as the slower of the two. Claude Code's
-/// words take Parakeet's times; when Claude Code has no text, Parakeet's transcript is the
-/// answer. Parakeet runs once either way.
-#[cfg(target_os = "windows")]
-pub(crate) fn claude(
-    mut take: crate::win::claude_dictation::Take,
-    audio: &RecordedAudio,
-    parakeet: impl FnOnce() -> Result<TranscriptData> + Send,
-) -> TranscriptData {
-    std::thread::scope(|scope| {
-        let started = std::time::Instant::now();
-        let running = scope.spawn(move || {
-            let transcript = parakeet();
-            crate::capture::scrawl_log(format!(
-                "{LOCAL_ENGINE_TITLE} alongside Claude Code: done in {} ms",
-                started.elapsed().as_millis()
-            ));
-            transcript
-        });
-        let mut alongside = Alongside {
-            running: Some(running),
-            done: None,
-        };
-        let claude = finish_live(
-            || {
-                take.finish(&audio.wav_bytes, || match alongside.wait() {
-                    Ok(transcript) => Some(transcript.clone()),
-                    Err(error) => {
-                        crate::capture::scrawl_log(format!(
-                            "Claude Code dictation: word times estimated, {LOCAL_ENGINE_TITLE} failed: {error:#}"
-                        ));
-                        None
-                    }
-                })
-            },
-            audio,
-        );
-        crate::capture::scrawl_log(format!(
-            "Claude Code dictation and {LOCAL_ENGINE_TITLE} finished in {} ms",
-            started.elapsed().as_millis()
-        ));
-        claude.unwrap_or_else(|| local(alongside.into_result()))
-    })
-}
-
-/// Parakeet's transcript while it runs alongside Claude Code, joined once.
-#[cfg(target_os = "windows")]
-struct Alongside<'scope> {
-    running: Option<std::thread::ScopedJoinHandle<'scope, Result<TranscriptData>>>,
-    done: Option<Result<TranscriptData>>,
-}
-
-#[cfg(target_os = "windows")]
-impl Alongside<'_> {
-    fn wait(&mut self) -> &Result<TranscriptData> {
-        let running = &mut self.running;
-        self.done.get_or_insert_with(|| match running.take() {
-            Some(running) => running
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} panicked"))),
-            None => Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} never ran")),
-        })
-    }
-
-    fn into_result(mut self) -> Result<TranscriptData> {
-        self.wait();
-        self.done
-            .unwrap_or_else(|| Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} never ran")))
-    }
 }
 
 /// The transcript made while recording, or `None` (logged) to use the file's instead.
@@ -293,8 +163,6 @@ fn finish_live(
             ));
             Some(done.transcript)
         }
-        #[cfg(target_os = "windows")]
-        Err(error) if error.is::<crate::win::claude_dictation::Skipped>() => None,
         Err(error) => {
             crate::capture::scrawl_log(format!(
                 "Live transcription failed after {} ms, using the recording's file: {error:#}",
@@ -306,9 +174,7 @@ fn finish_live(
 }
 
 /// Hex first when preferred, with Apple as the answer to anything it can't do. `hex` returns
-/// `Ok(None)` when Hex isn't available at all (not connected, model not ready). Claude Code
-/// dictation only runs live, so `apple` (which finishes the live transcription first) is its
-/// path too.
+/// `Ok(None)` when Hex isn't available at all (not connected, model not ready).
 fn run(
     engine: Engine,
     hex: impl FnOnce() -> Result<Option<TranscriptData>>,
@@ -384,11 +250,8 @@ mod tests {
     #[test]
     fn engine_names_parse_and_unknown_is_not_an_engine() {
         assert_eq!(Engine::parse("hex"), Some(Engine::Hex));
-        // Claude Code dictation is a Windows engine; elsewhere it reads as unknown (Apple).
-        assert_eq!(
-            Engine::parse(" Claude").is_some(),
-            cfg!(target_os = "windows")
-        );
+        // This build has no Claude Code dictation: "claude" reads as unknown (Parakeet).
+        assert_eq!(Engine::parse(" Claude"), None);
         assert_eq!(Engine::parse(" Apple "), Some(Engine::Apple));
         assert_eq!(Engine::parse("whisper"), None);
         assert_eq!(Engine::default(), Engine::Apple);
@@ -402,31 +265,6 @@ mod tests {
             || named("speech-analyzer"),
         );
         assert_eq!(result.source, "speech-analyzer");
-    }
-
-    #[test]
-    fn claude_preference_never_touches_hex_and_ends_in_the_live_or_file_path() {
-        let result = run(
-            Engine::Claude,
-            || panic!("Hex must not be asked"),
-            || named("claude-code"),
-        );
-        assert_eq!(result.source, "claude-code");
-        assert_eq!(Engine::Claude.name(), "claude");
-    }
-
-    #[test]
-    fn claude_choice_says_why_it_is_greyed_out() {
-        let ready = claude_choice_for(true, None);
-        assert!(ready.offered && ready.enabled);
-        assert_eq!(ready.title, "Claude Code (dictation)");
-        let missing = claude_choice_for(true, Some("claude not found on PATH".into()));
-        assert!(missing.offered && !missing.enabled);
-        assert_eq!(
-            missing.title,
-            "Claude Code (dictation): claude not found on PATH"
-        );
-        assert!(!claude_choice_for(false, None).enabled);
     }
 
     #[test]
