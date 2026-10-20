@@ -1480,6 +1480,52 @@ mod tests {
         crate::sketch::summary_markdown(&bundle, Path::new("/recordings/t"))
     }
 
+    /// Claude Code's text (`SCRAWL_ALIGN_TEXT`) for a real recording (`SCRAWL_ALIGN_WAV`) with
+    /// the real Parakeet alongside: prints each word's aligned start next to Parakeet's words,
+    /// and `summary.md` with scene changes at `SCRAWL_ALIGN_KEYFRAMES` (ms, comma separated;
+    /// without it, 300 ms before each of Parakeet's sentences). Needs `SCRAWL_CONFIG` naming
+    /// the language and `SCRAWL_MODELS_DIR`; `-- --ignored --nocapture real_parakeet_times`.
+    #[test]
+    #[ignore]
+    fn real_parakeet_times() {
+        let wav = PathBuf::from(std::env::var_os("SCRAWL_ALIGN_WAV").expect("SCRAWL_ALIGN_WAV"));
+        let samples = crate::audio::decode_wav_16k(&std::fs::read(&wav).unwrap()).unwrap();
+        let audio = audio_of(&samples);
+        let measured = crate::helper::transcribe(&wav).unwrap();
+        println!("Parakeet ({:?}): {}", measured.model, measured.text);
+        let text = std::env::var("SCRAWL_ALIGN_TEXT").unwrap_or_else(|_| measured.text.clone());
+        let (take, _released, _cancelled, answer) = test_take();
+        answer.send(said(&text)).unwrap();
+        let alongside = measured.clone();
+        let transcript = crate::transcribe::claude(take, &audio, || Ok(alongside));
+        println!(
+            "model {:?}, estimated {}",
+            transcript.model, transcript.estimated
+        );
+        println!("{:<24} {:>8}   Parakeet", "Claude Code", "aligned");
+        for word in &transcript.words {
+            let near: Vec<String> = measured
+                .words
+                .iter()
+                .filter(|w| w.t1 > word.t0.saturating_sub(150) && w.t0 < word.t1 + 150)
+                .map(|w| format!("{}@{}", w.text, w.t0))
+                .collect();
+            println!("{:<24} {:>8}   {}", word.text, word.t0, near.join(" "));
+        }
+        let times: Vec<u64> = match std::env::var("SCRAWL_ALIGN_KEYFRAMES") {
+            Ok(list) => list.split(',').map(|t| t.trim().parse().unwrap()).collect(),
+            Err(_) => measured
+                .segments
+                .iter()
+                .map(|s| s.t0.saturating_sub(300))
+                .collect(),
+        };
+        println!("keyframes at {times:?}");
+        println!("{}", summary_with_keyframes(transcript.clone(), &times));
+        assert!(!transcript.estimated);
+        assert_eq!(transcript.text, text.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+
     /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`,
     /// when Parakeet has nothing.
     #[test]

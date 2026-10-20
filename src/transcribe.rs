@@ -241,7 +241,7 @@ pub(crate) fn claude(
             audio,
         );
         crate::capture::scrawl_log(format!(
-            "Claude Code dictation finished in {} ms",
+            "Claude Code dictation and {LOCAL_ENGINE_TITLE} finished in {} ms",
             started.elapsed().as_millis()
         ));
         claude.unwrap_or_else(|| local(alongside.into_result()))
@@ -297,7 +297,7 @@ fn finish_live(
         Err(error) if error.is::<crate::win::claude_dictation::Skipped>() => None,
         Err(error) => {
             crate::capture::scrawl_log(format!(
-                "Live transcription failed after {} ms, transcribing the recording: {error:#}",
+                "Live transcription failed after {} ms, using the recording's file: {error:#}",
                 finishing.elapsed().as_millis()
             ));
             None
