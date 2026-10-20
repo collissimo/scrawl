@@ -119,6 +119,21 @@ struct Transcriber {
     claude_enabled: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct LanguageOption {
+    id: String,
+    title: String,
+}
+
+/// `settings::LanguageView`: the Language popup.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct Language {
+    chosen: String,
+    options: Vec<LanguageOption>,
+    note: Option<String>,
+}
+
 /// `speech_model::Status`: the local model's download.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -160,6 +175,7 @@ struct ViewState {
     auto_send: bool,
     shortcuts: Vec<Shortcut>,
     transcriber: Transcriber,
+    language: Option<Language>,
     video_export: bool,
     retention: Retention,
     captures_size: Option<String>,
@@ -1062,6 +1078,33 @@ impl SettingsWindow {
             ),
         )
         .into_any_element()];
+        if let Some(language) = &state.language {
+            let options: Vec<(String, String, bool)> = language
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.title.clone(), true))
+                .collect();
+            let title = language
+                .options
+                .iter()
+                .find(|o| o.id == language.chosen)
+                .map_or(language.chosen.clone(), |o| o.title.clone());
+            let selected = language.chosen.clone();
+            rows.push(
+                row(
+                    theme,
+                    "Language",
+                    true,
+                    popup(theme, "settings-language", &title).on_click(cx.listener(
+                        move |view, event: &ClickEvent, _, cx| {
+                            view.open_menu("language", options.clone(), Some(selected.clone()), event);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element(),
+            );
+        }
         if hex && !t.models.is_empty() {
             let options: Vec<(String, String, bool)> = t
                 .models
@@ -1091,7 +1134,7 @@ impl SettingsWindow {
         }
         let note = match (WINDOWS, t.hex_enabled || hex) {
             _ if claude => {
-                "Claude Code dictates while you record, through your claude.ai login, in the language set in Scrawl's config (else Windows'). Word times are estimates. When it hears nothing or fails, Parakeet transcribes the recording."
+                "Claude Code dictates while you record, through your claude.ai login, in the language chosen above. Word times are estimates. When it hears nothing or fails, Parakeet transcribes the recording."
             }
             (true, true) => {
                 "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
@@ -1129,11 +1172,18 @@ impl SettingsWindow {
             _ => None,
         };
         let video = state.video_export;
+        // Hex brings its own model; Parakeet's limits don't apply to it.
+        let language_note = state
+            .language
+            .as_ref()
+            .and_then(|l| l.note.clone())
+            .filter(|_| !hex);
         div()
             .flex()
             .flex_col()
             .child(group(theme, rows))
             .child(caption(theme, note, false))
+            .when_some(language_note, |pane, text| pane.child(caption(theme, &text, false)))
             .when_some(speech, |pane, (text, error)| {
                 pane.child(caption(theme, &text, error))
             })
@@ -1556,7 +1606,8 @@ impl SettingsWindow {
         let menu = self.menu.as_ref()?;
         let item_h = 26.0;
         let w = 220.0;
-        let h = menu.options.len() as f32 * item_h + 10.0;
+        // A long list (Language) scrolls inside the window.
+        let h = (menu.options.len() as f32 * item_h + 10.0).min(f32::from(viewport.height) - 16.0);
         let x = f32::from(menu.at.x).min(f32::from(viewport.width) - w - 8.0).max(8.0);
         let y = (f32::from(menu.at.y) - item_h * 0.5)
             .min(f32::from(viewport.height) - h - 8.0)
@@ -1569,6 +1620,8 @@ impl SettingsWindow {
             .left(px(x))
             .top(px(y))
             .w(px(w))
+            .max_h(px(h))
+            .overflow_y_scroll()
             .py(px(5.0))
             .rounded(px(8.0))
             .bg(theme.menu())
@@ -1590,6 +1643,7 @@ impl SettingsWindow {
                 div()
                     .id(("settings-menu-item", index))
                     .h(px(item_h))
+                    .flex_none()
                     .mx(px(5.0))
                     .px(px(8.0))
                     .rounded(px(5.0))
@@ -1754,3 +1808,27 @@ impl Render for SettingsWindow {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_language_row_reads_from_the_settings_view() {
+        let state: ViewState = serde_json::from_value(serde_json::json!({
+            "type": "state",
+            "language": {
+                "chosen": "de",
+                "options": [{"id": "en", "title": "English"}, {"id": "de", "title": "Deutsch"}],
+            },
+        }))
+        .unwrap();
+        let language = state.language.unwrap();
+        assert_eq!(language.chosen, "de");
+        assert_eq!(language.options[1].title, "Deutsch");
+        assert_eq!(language.note, None);
+        // Off Windows the view has no language row.
+        let state: ViewState = serde_json::from_value(serde_json::json!({"type": "state"})).unwrap();
+        assert!(state.language.is_none());
+    }
+}

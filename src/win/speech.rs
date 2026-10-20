@@ -2,9 +2,10 @@
 //! `transcribe.cpp`, the engine Hex uses. It loads a model Hex has already installed
 //! (`%APPDATA%\voice-control\models`), else Scrawl's own copy (`%LOCALAPPDATA%\Scrawl\models`),
 //! which `install` downloads once in the background and checks against its SHA-256. English
-//! (`handoff::transcription_language`) uses Hex's Parakeet Unified English; any other language
-//! needs a multilingual model, Parakeet TDT 0.6b v3 (25 European languages). Like the Hex client, it transcribes each speech island on its own; unlike
-//! it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
+//! (`handoff::transcription_language`) uses Hex's Parakeet Unified English; another language
+//! that Parakeet TDT 0.6b v3 speaks (25 European languages, `languages::PARAKEET_V3`) needs that
+//! multilingual model, and one it doesn't stays on the English model (`model_language`). Like
+//! the Hex client, it transcribes each speech island on its own; unlike it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
 //! here") can cut keyframes.
 
 use std::path::{Path, PathBuf};
@@ -45,9 +46,21 @@ pub const PARAKEET_V3: Artifact = Artifact {
     sha256: "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7",
 };
 
+/// The language the model has to speak for recordings in `language`: the language itself when
+/// Parakeet v3 covers it, else English. v3 can't transcribe Japanese either, so a Japanese
+/// setting keeps the English model (English speech still comes out right) instead of
+/// downloading 740 MB that would guess the language.
+pub fn model_language(language: &str) -> &str {
+    if crate::win::languages::parakeet_v3_supports(language) {
+        language
+    } else {
+        "en"
+    }
+}
+
 /// The model Scrawl downloads for `language`.
 pub fn artifact_for(language: &str) -> &'static Artifact {
-    if language == "en" {
+    if model_language(language) == "en" {
         &PARAKEET
     } else {
         &PARAKEET_V3
@@ -96,6 +109,7 @@ pub fn installed_models(language: &str) -> Vec<PathBuf> {
 /// model speaks English; another language needs one whose name says it's multilingual
 /// (Parakeet v3, Whisper), so Parakeet Unified English and Parakeet v2 never get German speech.
 pub fn models_for(hex: &[PathBuf], own: &[PathBuf], language: &str) -> Vec<PathBuf> {
+    let language = model_language(language);
     let wanted = artifact_for(language).filename;
     let mut own = own.to_vec();
     own.sort_by_key(|path| path.file_name().is_none_or(|name| name != wanted));
@@ -185,7 +199,12 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
 
     transcribe_cpp::disable_logging();
     transcribe_cpp::init_backends_default().context("transcribe.cpp backends")?;
-    let (path, model, hint) = load_for(&candidates, &language)?;
+    let (path, model, hint) = load_for(&candidates, model_language(&language))?;
+    crate::capture::scrawl_log(format!(
+        "transcribing ({language}) with {} (hint {})",
+        path.display(),
+        hint.as_deref().unwrap_or("none")
+    ));
     let mut transcript = named(&path);
     let mut session = model.session()?;
     let options = RunOptions {
@@ -486,6 +505,23 @@ mod tests {
         assert_eq!(models_for(&hex, &own_both(), "fr"), picked);
         let whisper = paths(&[r"hex\whisper-large-v3-turbo-Q8_0.gguf"]);
         assert_eq!(models_for(&whisper, &[], "de"), whisper);
+    }
+
+    #[test]
+    fn a_language_v3_cannot_speak_keeps_the_english_model() {
+        for language in ["ja", "ko", "hi", "tr", "zh"] {
+            assert_eq!(model_language(language), "en");
+            assert_eq!(artifact_for(language).filename, PARAKEET.filename);
+            assert_eq!(
+                models_for(&[], &own_both(), language)[0],
+                PathBuf::from(r"own\parakeet-unified-en-0.6b-Q8_0.gguf")
+            );
+            let english_only = paths(&[r"own\parakeet-unified-en-0.6b-Q8_0.gguf"]);
+            assert_eq!(models_for(&[], &english_only, language), english_only);
+        }
+        assert_eq!(model_language("de"), "de");
+        assert_eq!(model_language("fi"), "fi");
+        assert_eq!(artifact_for("fi").filename, PARAKEET_V3.filename);
     }
 
     /// `SCRAWL_MODELS_DIR` keeps the downloads there; else a temporary folder that's removed.
