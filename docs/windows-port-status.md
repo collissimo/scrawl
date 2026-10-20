@@ -70,9 +70,12 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] Video export via Media Foundation (task C).
 - [ ] Real-use checks: app, tray, Alt+Shift+S, ink, paste, review window; fix what breaks.
 - [x] PR https://github.com/collissimo/scrawl/pull/1, linked in T3. Merge only after Collin approves.
-- [ ] Bring the fork's `main` up to upstream main (a7d44aa → 6449367, fast-forward), so the PR shows only our 42 commits. This needs Collin's OK: it is a push to the default branch.
-- [ ] Collin tests Alt+Shift+V (pastes the image and the text), and whether the Settings Language menu scrolls.
-- [ ] Possible improvement, if Collin wants it: run Parakeet alongside Claude and align Claude's text to Parakeet's measured word times (fixes the keyframe drift).
+- [x] The fork's `main` is synced with upstream (6449367), with Collin's OK.
+- [x] Alt+Shift+V works (Collin). [ ] It's still unclear whether the Settings Language menu scrolls.
+- [ ] F3 (running; `C:/t/briefs/F3-full.md`, target scrawl-b, clientRequestId `scrawl-win-F3-align-1`): run Parakeet alongside Claude and align the word times. Collin approved it.
+- [ ] F4 (running; `C:/t/briefs/F4-full.md`, target scrawl-c, clientRequestId `scrawl-win-F4-overlay-1`): BUG from Collin. Ink stops showing on screen after a click on the other monitor, though it is still recorded. Evidence: bundle `scrawl-1792514420118-44d4-3`, log `[1792514413614]`.
+- [x] Tests no longer write to the real `scrawl.log` (`cfg!(test)` in `scrawl_log`).
+- Collin's config has `transcriber: apple` again (he switched back for a Parakeet test, or something else reset it; ask him).
 
 ## Lessons
 

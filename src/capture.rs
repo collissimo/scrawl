@@ -323,6 +323,10 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
         .as_millis();
     let line = format!("[{ts}] {}\n", msg.as_ref());
     eprint!("{line}");
+    // Tests log to stderr only: their made-up failures don't belong in the user's log.
+    if cfg!(test) {
+        return;
+    }
     let Some(dir) = log_dir() else {
         return;
     };
