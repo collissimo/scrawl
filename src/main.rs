@@ -3,18 +3,23 @@ mod audio;
 mod autocrop;
 mod ax;
 mod autocrop_lab;
+#[cfg_attr(windows, path = "win/capture.rs")]
 mod capture;
+#[cfg_attr(windows, path = "win/command_line.rs")]
 mod command_line;
 mod delivery;
 mod export;
 mod handoff;
+#[cfg_attr(windows, path = "win/helper.rs")]
 mod helper;
 mod hex;
 mod hold;
 mod icons;
 mod inbox;
 mod keyframes;
+#[cfg_attr(windows, path = "win/laser_overlay.rs")]
 mod laser_overlay;
+#[cfg_attr(windows, path = "win/live_transcribe.rs")]
 mod live_transcribe;
 mod mic;
 mod model;
@@ -28,10 +33,14 @@ mod routing;
 mod screens;
 mod settings;
 mod sketch;
+#[cfg_attr(windows, path = "win/sparkle.rs")]
 mod sparkle;
+#[cfg_attr(windows, path = "win/transcribe.rs")]
 mod transcribe;
 mod ui;
 mod web;
+#[cfg(windows)]
+mod win;
 mod windows;
 mod zoom;
 
@@ -63,8 +72,25 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(target_os = "macos")]
 fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
     crate::transcribe::Engine::parse(name).ok_or_else(|| "expected `apple` or `hex`".to_owned())
+}
+
+#[cfg(windows)]
+fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
+    crate::transcribe::Engine::parse(name)
+        .ok_or_else(|| "expected `claude`, `whisper` or `hex`".to_owned())
+}
+
+/// What a Windows recording falls back to when Hex has no model: Claude Code dictation
+/// (whisper.cpp when it fails), or whisper.cpp alone.
+#[cfg(windows)]
+fn fallback_engine_label(preferred: transcribe::Engine) -> String {
+    match preferred {
+        transcribe::Engine::Whisper => "whisper.cpp".to_owned(),
+        _ => "Claude Code dictation (whisper.cpp fallback)".to_owned(),
+    }
 }
 
 /// `scrawl hex status`: connection, models and what the next recording would use.
@@ -81,7 +107,10 @@ fn hex_status() {
         Ok(status) => status,
         Err(error) => {
             println!("Hex: not connected ({error:#})");
+            #[cfg(target_os = "macos")]
             println!("Next recording uses: Apple Speech");
+            #[cfg(windows)]
+            println!("Next recording uses: {}", fallback_engine_label(preferred));
             return;
         }
     };
@@ -103,7 +132,10 @@ fn hex_status() {
         "Next recording uses: {}",
         match (preferred, chosen) {
             (transcribe::Engine::Hex, Some(model)) => format!("Hex ({model})"),
+            #[cfg(target_os = "macos")]
             _ => "Apple Speech".to_owned(),
+            #[cfg(windows)]
+            _ => fallback_engine_label(preferred),
         }
     );
 }
@@ -537,6 +569,37 @@ enum Command {
     },
     /// Print the agent skill that teaches coding agents to read captures and use this CLI (`bunx skills add kitlangton/scrawl` installs it).
     Skill,
+    /// The Settings window (Windows UI host, spoken to over stdin/stdout JSON like the Swift helper).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    Settings {
+        #[arg(long)]
+        pane: Option<String>,
+        #[arg(long)]
+        icon: Option<PathBuf>,
+    },
+    /// The onboarding window (Windows UI host).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    Onboarding {
+        #[arg(long)]
+        shortcut: String,
+        #[arg(long)]
+        paste: String,
+        #[arg(long)]
+        icon: Option<PathBuf>,
+    },
+    /// The `EDITOR` Claude Code opens under Ctrl+G during dictation: copies the prompt out.
+    #[cfg(windows)]
+    #[command(name = "claude-editor", hide = true)]
+    ClaudeEditor {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// Start the hidden Claude Code dictation session and check it end to end.
+    #[cfg(windows)]
+    #[command(name = "dictation-selftest", hide = true)]
+    DictationSelftest,
 }
 
 /// `skills/scrawl/SKILL.md`, the same text `bunx skills add kitlangton/scrawl` installs.
@@ -1403,6 +1466,8 @@ pub fn generate_demo_bundle(out: Option<PathBuf>) -> Result<(PathBuf, ScrawlBund
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    crate::win::init_process();
     if std::env::var_os("SCRAWL_BENCH_START").is_some() {
         ui::run_start_benchmark();
         return Ok(());
@@ -1410,6 +1475,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let command = match cli.command {
         Some(command) => command,
+        // A double-clicked console exe gets a fresh console (stdin is a terminal), so Explorer
+        // launches are recognised by the parent process before the terminal check.
+        #[cfg(windows)]
+        None if crate::win::launched_from_explorer() => {
+            // SAFETY: detaching from the console has no preconditions.
+            let _ = unsafe { win32::Win32::System::Console::FreeConsole() };
+            Command::App {
+                record: false,
+                iphone: false,
+            }
+        }
         // `scrawl` typed in a terminal (on PATH through Settings › Agents or Homebrew) would
         // start a second menu-bar app. macOS opens the app with stdin on /dev/null.
         None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
@@ -1434,6 +1510,7 @@ fn main() -> Result<()> {
             print!("{summary}");
             Ok(())
         }
+        #[cfg_attr(windows, allow(unreachable_code, unused_variables))]
         Command::Record {
             window,
             iphone: true,
@@ -1441,6 +1518,8 @@ fn main() -> Result<()> {
             note,
             out,
         } => {
+            #[cfg(windows)]
+            anyhow::bail!("iPhone capture isn't available on Windows");
             let bundle_dir = out.unwrap_or_else(|| {
                 handoff::default_captures_dir().join(format!("{}.scrawl", make_bundle_id()))
             });
@@ -1871,6 +1950,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Devices => {
+            #[cfg(windows)]
+            eprintln!("Cabled iPhone capture isn't available on Windows.");
             for device in helper::devices()? {
                 println!("{}\t{}", device.name, device.id);
             }
@@ -2060,7 +2141,10 @@ fn main() -> Result<()> {
             let page = autocrop_lab::export(&dir, &loaded)?;
             println!("{}", page.display());
             if open {
+                #[cfg(target_os = "macos")]
                 std::process::Command::new("open").arg(&page).status()?;
+                #[cfg(windows)]
+                win::spawn::shell_open(&page.to_string_lossy())?;
             }
             Ok(())
         }
@@ -2256,6 +2340,18 @@ fn main() -> Result<()> {
             print!("{SKILL}");
             Ok(())
         }
+        #[cfg(windows)]
+        Command::Settings { pane, icon } => win::ui_host::run_settings(pane, icon),
+        #[cfg(windows)]
+        Command::Onboarding {
+            shortcut,
+            paste,
+            icon,
+        } => win::ui_host::run_onboarding(shortcut, paste, icon),
+        #[cfg(windows)]
+        Command::ClaudeEditor { args } => win::claude_dictation::run_editor(&args),
+        #[cfg(windows)]
+        Command::DictationSelftest => win::claude_dictation::selftest(),
     }
 }
 
