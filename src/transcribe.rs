@@ -1,6 +1,9 @@
 //! Transcription: Apple's SpeechAnalyzer through `scrawl-helper` (measured word and segment
 //! timings), or Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
-//! times estimated). Any Hex trouble falls back to Apple for that recording.
+//! times estimated). Any Hex trouble falls back to Apple for that recording. On Windows,
+//! `"transcriber": "claude"` dictates through a hidden Claude Code session while recording
+//! (`crate::win::claude_dictation`, word times estimated); without that live result the
+//! recording is transcribed on this PC as usual.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -15,6 +18,8 @@ pub enum Engine {
     #[default]
     Apple,
     Hex,
+    /// Claude Code's voice dictation, live while recording (Windows only).
+    Claude,
 }
 
 impl Engine {
@@ -22,6 +27,7 @@ impl Engine {
         match name.trim().to_ascii_lowercase().as_str() {
             "apple" => Some(Self::Apple),
             "hex" => Some(Self::Hex),
+            "claude" if cfg!(target_os = "windows") => Some(Self::Claude),
             _ => None,
         }
     }
@@ -30,6 +36,7 @@ impl Engine {
         match self {
             Self::Apple => "apple",
             Self::Hex => "hex",
+            Self::Claude => "claude",
         }
     }
 
@@ -46,6 +53,7 @@ impl Engine {
         match OVERRIDE.load(Ordering::Relaxed) {
             1 => Self::Apple,
             2 => Self::Hex,
+            3 => Self::Claude,
             _ => Self::configured(),
         }
     }
@@ -113,12 +121,47 @@ pub fn menu_state(
     }
 }
 
+/// The Claude Code dictation choice in menus: offered only on Windows, and greyed out with the
+/// reason when `claude` can't be found.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ClaudeChoice {
+    pub offered: bool,
+    pub title: String,
+    pub enabled: bool,
+}
+
+pub const CLAUDE_ENGINE_TITLE: &str = "Claude Code (dictation)";
+
+pub fn claude_choice() -> ClaudeChoice {
+    #[cfg(target_os = "windows")]
+    let missing = crate::win::claude_dictation::unavailable_reason();
+    #[cfg(not(target_os = "windows"))]
+    let missing: Option<String> = None;
+    claude_choice_for(cfg!(target_os = "windows"), missing)
+}
+
+fn claude_choice_for(offered: bool, missing: Option<String>) -> ClaudeChoice {
+    match missing {
+        Some(reason) => ClaudeChoice {
+            offered,
+            title: format!("{CLAUDE_ENGINE_TITLE}: {reason}"),
+            enabled: false,
+        },
+        None => ClaudeChoice {
+            offered,
+            title: CLAUDE_ENGINE_TITLE.to_owned(),
+            enabled: offered,
+        },
+    }
+}
+
 /// Pins the engine for this process (`scrawl reprocess --transcriber`).
 pub fn set_override(engine: Engine) {
     OVERRIDE.store(
         match engine {
             Engine::Apple => 1,
             Engine::Hex => 2,
+            Engine::Claude => 3,
         },
         Ordering::Relaxed,
     );
@@ -138,7 +181,14 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
         || try_hex(audio),
         || {
             live.and_then(|live| finish_live(live, audio))
-                .unwrap_or_else(|| apple(wav))
+                .unwrap_or_else(|| {
+                    if Engine::preferred() == Engine::Claude {
+                        crate::capture::scrawl_log(format!(
+                            "No Claude Code dictation for this recording, using {LOCAL_ENGINE_TITLE}"
+                        ));
+                    }
+                    apple(wav)
+                })
         },
     )
 }
@@ -151,7 +201,8 @@ fn finish_live(
     match live.finish(&audio.wav_bytes) {
         Ok(done) => {
             crate::capture::scrawl_log(format!(
-                "Live transcription: {} words, {} of {} ms streamed, tail {} ms",
+                "Live transcription ({}): {} words, {} of {} ms streamed, tail {} ms",
+                done.transcript.source,
                 done.transcript.words.len(),
                 done.streamed_samples as u64 * 1_000 / 16_000,
                 audio.duration_ms,
@@ -169,7 +220,9 @@ fn finish_live(
 }
 
 /// Hex first when preferred, with Apple as the answer to anything it can't do. `hex` returns
-/// `Ok(None)` when Hex isn't available at all (not connected, model not ready).
+/// `Ok(None)` when Hex isn't available at all (not connected, model not ready). Claude Code
+/// dictation only runs live, so `apple` (which finishes the live transcription first) is its
+/// path too.
 fn run(
     engine: Engine,
     hex: impl FnOnce() -> Result<Option<TranscriptData>>,
@@ -243,6 +296,11 @@ mod tests {
     #[test]
     fn engine_names_parse_and_unknown_is_not_an_engine() {
         assert_eq!(Engine::parse("hex"), Some(Engine::Hex));
+        // Claude Code dictation is a Windows engine; elsewhere it reads as unknown (Apple).
+        assert_eq!(
+            Engine::parse(" Claude").is_some(),
+            cfg!(target_os = "windows")
+        );
         assert_eq!(Engine::parse(" Apple "), Some(Engine::Apple));
         assert_eq!(Engine::parse("whisper"), None);
         assert_eq!(Engine::default(), Engine::Apple);
@@ -256,6 +314,31 @@ mod tests {
             || named("speech-analyzer"),
         );
         assert_eq!(result.source, "speech-analyzer");
+    }
+
+    #[test]
+    fn claude_preference_never_touches_hex_and_ends_in_the_live_or_file_path() {
+        let result = run(
+            Engine::Claude,
+            || panic!("Hex must not be asked"),
+            || named("claude-code"),
+        );
+        assert_eq!(result.source, "claude-code");
+        assert_eq!(Engine::Claude.name(), "claude");
+    }
+
+    #[test]
+    fn claude_choice_says_why_it_is_greyed_out() {
+        let ready = claude_choice_for(true, None);
+        assert!(ready.offered && ready.enabled);
+        assert_eq!(ready.title, "Claude Code (dictation)");
+        let missing = claude_choice_for(true, Some("claude not found on PATH".into()));
+        assert!(missing.offered && !missing.enabled);
+        assert_eq!(
+            missing.title,
+            "Claude Code (dictation): claude not found on PATH"
+        );
+        assert!(!claude_choice_for(false, None).enabled);
     }
 
     #[test]
