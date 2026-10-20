@@ -89,9 +89,7 @@ pub fn ensure() {
     if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Hex {
         return;
     }
-    if matches!(current().state, State::Ready | State::Unavailable)
-        || RUNNING.swap(true, Ordering::AcqRel)
-    {
+    if settled(&current()) || RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
     let spawned = std::thread::Builder::new()
@@ -102,6 +100,20 @@ pub fn ensure() {
         });
     if spawned.is_err() {
         RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// Nothing left to install. On Windows the model follows the transcription language, so a model
+/// that's ready for another language (Settings changed it) doesn't count: `work` checks again,
+/// which costs nothing when the right model is already there.
+fn settled(status: &Status) -> bool {
+    match status.state {
+        State::Unavailable => true,
+        State::Ready if cfg!(target_os = "windows") => {
+            status.locale.as_deref() == Some(crate::handoff::transcription_language().as_str())
+        }
+        State::Ready => true,
+        _ => false,
     }
 }
 
@@ -269,6 +281,24 @@ pub fn transcribe_again(dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_ready_for_another_language_is_checked_again_on_windows() {
+        let status = |state: State, locale: &str| Status {
+            state,
+            locale: Some(locale.into()),
+            ..Default::default()
+        };
+        let language = crate::handoff::transcription_language();
+        assert!(settled(&status(State::Ready, &language)));
+        assert_eq!(
+            settled(&status(State::Ready, "xx")),
+            cfg!(not(target_os = "windows"))
+        );
+        assert!(settled(&status(State::Unavailable, "xx")));
+        assert!(!settled(&status(State::Downloading, &language)));
+        assert!(!settled(&status(State::Failed, &language)));
+    }
 
     #[test]
     fn a_download_in_progress_will_be_retried_but_a_missing_language_will_not() {
