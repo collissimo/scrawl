@@ -157,6 +157,15 @@ fn nearest_frame(frames: &[&RgbaFrame], t: u64) -> usize {
 
 /// Speech that starts a new thought: after clause punctuation, a pause, or a recognizer segment.
 const CLAUSE_GAP_MS: u64 = 1_500;
+/// Experiment: speech follows the mark, click or laser point the user started it at, rather
+/// than a scene change that cuts into the sentence (`said_per_keyframe`).
+pub const SPEECH_FOLLOWS_MARKS: &str = "speechFollowsMarks";
+/// With `SPEECH_FOLLOWS_MARKS`, a clause that starts during an act or this soon after it belongs
+/// to that act's keyframe.
+const ACT_SPEECH_MS: u64 = 500;
+/// With `SPEECH_FOLLOWS_MARKS`, an act that lands inside a clause another keyframe owns takes
+/// the words begun up to this long before it: people name a thing as they reach for it.
+const SPEECH_LEAD_MS: u64 = 1_000;
 /// A spoken cue only cuts a keyframe if its image differs from every keyframe already chosen.
 const CUE_NOVELTY: f32 = 0.03;
 /// Marks share a keyframe while the screen around their ink (`INK_CONTEXT` beyond it, as a
@@ -355,16 +364,27 @@ fn word_count(text: &str) -> usize {
 /// belongs to it.
 fn align_transcript(
     selected: &mut [(Keyframe, RgbaFrame)],
-    anchors: &[u64],
+    moments: &[Moment],
     transcript: &TranscriptData,
 ) {
     let times: Vec<u64> = selected.iter().map(|(frame, _)| frame.t).collect();
+    let follow = crate::handoff::experiment(SPEECH_FOLLOWS_MARKS);
     for ((frame, _), said) in selected
         .iter_mut()
-        .zip(said_per_keyframe(&times, anchors, transcript))
+        .zip(split_said(&times, moments, transcript, follow))
     {
         frame.said = said;
     }
+}
+
+/// When a keyframe's moment happened, for splitting the transcript: its anchor (when its action
+/// began, or the cue word), when the action ended, and whether the user did it on purpose (a
+/// mark, click, drag or laser point) rather than the screen changing.
+#[derive(Clone, Copy, Debug)]
+struct Moment {
+    anchor: u64,
+    until: u64,
+    deliberate: bool,
 }
 
 /// `align_transcript` for keyframes at `times` (anchored at `anchors`, or their own time where
@@ -373,6 +393,27 @@ pub fn said_per_keyframe(
     times: &[u64],
     anchors: &[u64],
     transcript: &TranscriptData,
+) -> Vec<Option<String>> {
+    let moments: Vec<Moment> = anchors
+        .iter()
+        .map(|&anchor| Moment {
+            anchor,
+            until: anchor,
+            deliberate: false,
+        })
+        .collect();
+    split_said(times, &moments, transcript, false)
+}
+
+/// `said_per_keyframe` with each keyframe's `Moment`. With `follow` (`SPEECH_FOLLOWS_MARKS`), a
+/// clause the user began during a deliberate act, or within `ACT_SPEECH_MS` after it, stays with
+/// that act's keyframe when a later keyframe's anchor falls inside it: the later one starts at
+/// its own anchor, and a deliberate one there also takes the words begun `SPEECH_LEAD_MS` before.
+fn split_said(
+    times: &[u64],
+    moments: &[Moment],
+    transcript: &TranscriptData,
+    follow: bool,
 ) -> Vec<Option<String>> {
     if times.is_empty() {
         return Vec::new();
@@ -415,21 +456,62 @@ pub fn said_per_keyframe(
         }
         previous = Some((t1, text));
     }
-    let clause_start = |anchor: u64| {
+    let clause_at = |anchor: u64| {
         clauses
             .iter()
             .find(|(t0, t1)| *t0 <= anchor && anchor <= *t1)
-            .map_or(anchor, |clause| clause.0)
+            .map(|clause| clause.0)
+    };
+    let moment = |i: usize| {
+        moments.get(i).copied().unwrap_or(Moment {
+            anchor: times[i],
+            until: times[i],
+            deliberate: false,
+        })
     };
     let mut starts: Vec<u64> = Vec::with_capacity(times.len());
-    for (i, &t) in times.iter().enumerate() {
-        let anchor = anchors.get(i).copied().unwrap_or(t);
-        let mut start = clause_start(anchor);
+    for i in 0..times.len() {
+        let Moment {
+            anchor, deliberate, ..
+        } = moment(i);
+        let clause = clause_at(anchor);
+        let mut start = clause.unwrap_or(anchor);
+        if follow
+            && let (Some(clause), Some(&prev_start)) = (clause, starts.last())
+            && moment(i - 1).deliberate
+            && moment(i - 1).anchor <= clause
+            && clause <= moment(i - 1).until.saturating_add(ACT_SPEECH_MS)
+        {
+            // The user began this clause at the act before: it stays there.
+            start = start.min(prev_start);
+        }
         if let Some(&prev) = starts.last()
             && start <= prev
         {
             // Two keyframes in one clause: the later one takes the words from its own moment.
             start = anchor.max(prev + 1);
+            // A scene change just before yields the words that lead into the act; another act
+            // keeps its own.
+            let floor = if moment(i - 1).deliberate {
+                Some(prev)
+            } else {
+                i.checked_sub(2).map(|j| starts[j])
+            };
+            if follow
+                && deliberate
+                && let Some(clause) = clause
+                && let Some(&(lead, _, _)) = units.iter().find(|unit| {
+                    unit.0 >= clause
+                        && floor.is_none_or(|floor| unit.0 > floor)
+                        && unit.0 < anchor
+                        && unit.0 + SPEECH_LEAD_MS >= anchor
+                })
+            {
+                start = lead;
+                // Equal starts give the words to the later keyframe.
+                let last = starts.len() - 1;
+                starts[last] = starts[last].min(lead);
+            }
         }
         starts.push(start);
     }
@@ -751,9 +833,16 @@ pub fn select_keyframes(
         }
     }
     selected.sort_by_key(|candidate| frames[candidate.frame].t_ms);
-    let anchors: Vec<u64> = selected
+    let moments: Vec<Moment> = selected
         .iter()
-        .map(|c| c.span.0.min(frames[c.frame].t_ms))
+        .map(|c| Moment {
+            anchor: c.span.0.min(frames[c.frame].t_ms),
+            until: c.span.1,
+            deliberate: matches!(
+                c.reason,
+                KeyframeReason::Mark | KeyframeReason::Click | KeyframeReason::Laser
+            ),
+        })
         .collect();
     let mut out: Vec<_> = selected
         .into_iter()
@@ -781,7 +870,7 @@ pub fn select_keyframes(
             )
         })
         .collect();
-    align_transcript(&mut out, &anchors, transcript);
+    align_transcript(&mut out, &moments, transcript);
     out
 }
 
@@ -1616,5 +1705,198 @@ mod tests {
             said_per_keyframe(&[1_000, 5_000], &[], &transcript),
             [Some("Lots of glitches.".into()), Some("Yeah".into())]
         );
+    }
+
+    /// Words that each end where the next begins, as Parakeet TDT times them.
+    fn tdt_words(words: &[(u64, &str)], end: u64) -> Vec<WordTiming> {
+        words
+            .iter()
+            .enumerate()
+            .map(|(i, &(t0, text))| WordTiming {
+                t0,
+                t1: words.get(i + 1).map_or(end, |next| next.0),
+                text: text.into(),
+            })
+            .collect()
+    }
+
+    fn act(anchor: u64, until: u64) -> Moment {
+        Moment {
+            anchor,
+            until,
+            deliberate: true,
+        }
+    }
+
+    fn scene(anchor: u64) -> Moment {
+        Moment {
+            anchor,
+            until: anchor,
+            deliberate: false,
+        }
+    }
+
+    fn said(texts: &[Option<&str>]) -> Vec<Option<String>> {
+        texts.iter().map(|t| t.map(str::to_owned)).collect()
+    }
+
+    /// Collin circled the Follow button (17468–18024) and said "Hier ist der Follow-Knopf";
+    /// the screen scrolled at 19845 and he circled the light bulb from 20499 (Parakeet's times
+    /// from his capture, `scrawl-1792514034537-44d4`).
+    #[test]
+    fn speech_follows_the_mark_it_was_started_at() {
+        let mut words = tdt_words(
+            &[
+                (11_520, "Hier"),
+                (11_840, "ist"),
+                (12_080, "Shiloh,"),
+                (13_360, "hier"),
+                (13_680, "steht"),
+                (14_080, "doch"),
+                (14_320, "nochmal"),
+                (14_720, "Germany,"),
+                (17_680, "hier"),
+                (18_000, "ist"),
+                (18_320, "der"),
+                (18_560, "Follow-Knopf"),
+                (20_000, "und"),
+                (20_320, "hier"),
+                (20_560, "ist"),
+                (20_800, "eine"),
+                (20_960, "Glühbirne."),
+            ],
+            22_800,
+        );
+        words[2].t1 = 13_120;
+        words[7].t1 = 16_400;
+        let transcript = TranscriptData {
+            segments: vec![TranscriptSegment {
+                t0: 1_040,
+                t1: 22_800,
+                text: words
+                    .iter()
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }],
+            words,
+            ..Default::default()
+        };
+        let times = [9_043, 18_065, 19_843, 21_149];
+        let moments = |scrolled: u64, circled: u64| {
+            [
+                act(8_850, 8_850),
+                act(17_468, 18_024),
+                scene(scrolled),
+                act(circled, circled + 614),
+            ]
+        };
+        let shiloh = Some("Hier ist Shiloh, hier steht doch nochmal Germany,");
+        assert_eq!(
+            split_said(&times, &moments(19_845, 20_499), &transcript, false),
+            said(&[
+                shiloh,
+                None,
+                Some("hier ist der Follow-Knopf und hier"),
+                Some("ist eine Glühbirne."),
+            ])
+        );
+        // Not tuned to these exact moments: the scroll and the second circle may move 200 ms.
+        for scrolled in [19_645, 19_845, 20_045] {
+            for circled in [20_299, 20_499, 20_699] {
+                assert_eq!(
+                    split_said(&times, &moments(scrolled, circled), &transcript, true),
+                    said(&[
+                        shiloh,
+                        Some("hier ist der Follow-Knopf"),
+                        None,
+                        Some("und hier ist eine Glühbirne."),
+                    ]),
+                    "scrolled at {scrolled}, circled at {circled}"
+                );
+            }
+        }
+    }
+
+    /// A click opens a panel while the user explains it: the sentence they began at the click
+    /// stays with the click up to the panel's scene change.
+    #[test]
+    fn a_sentence_begun_at_a_click_stays_with_it() {
+        let transcript = TranscriptData {
+            words: tdt_words(
+                &[
+                    (1_200, "Open"),
+                    (1_400, "the"),
+                    (1_600, "settings"),
+                    (1_900, "panel"),
+                    (2_300, "and"),
+                    (2_500, "pick"),
+                    (2_700, "dark"),
+                    (2_900, "mode."),
+                ],
+                3_300,
+            ),
+            ..Default::default()
+        };
+        let moments = [act(1_000, 1_000), scene(2_200)];
+        assert_eq!(
+            split_said(&[1_250, 2_400], &moments, &transcript, false),
+            said(&[None, Some("Open the settings panel and pick dark mode.")])
+        );
+        assert_eq!(
+            split_said(&[1_250, 2_400], &moments, &transcript, true),
+            said(&[Some("Open the settings panel"), Some("and pick dark mode.")])
+        );
+    }
+
+    /// The words leading into an act come only from its own clause, never the one before.
+    #[test]
+    fn the_lead_into_an_act_stays_inside_its_clause() {
+        let transcript = TranscriptData {
+            words: tdt_words(
+                &[
+                    (950, "Done."),
+                    (1_300, "And"),
+                    (1_500, "this"),
+                    (1_700, "one"),
+                ],
+                1_900,
+            ),
+            ..Default::default()
+        };
+        let moments = [act(900, 1_000), act(1_800, 1_900)];
+        for follow in [false, true] {
+            assert_eq!(
+                split_said(&[1_000, 1_900], &moments, &transcript, follow),
+                said(&[Some("Done."), Some("And this one")])
+            );
+        }
+    }
+
+    /// Speech that starts well after the act (more than `ACT_SPEECH_MS`) is about what came
+    /// next, so a scene change inside it still takes the whole clause.
+    #[test]
+    fn a_sentence_begun_after_the_act_is_not_the_acts() {
+        let transcript = TranscriptData {
+            words: tdt_words(
+                &[
+                    (1_600, "Now"),
+                    (1_800, "the"),
+                    (2_000, "panel"),
+                    (2_300, "is"),
+                    (2_500, "open."),
+                ],
+                2_900,
+            ),
+            ..Default::default()
+        };
+        // The click ended at 1 000 ms; the sentence began 600 ms later.
+        let moments = [act(900, 1_000), scene(2_200)];
+        for follow in [false, true] {
+            assert_eq!(
+                split_said(&[1_250, 2_400], &moments, &transcript, follow),
+                said(&[None, Some("Now the panel is open.")])
+            );
+        }
     }
 }
