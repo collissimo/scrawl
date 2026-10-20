@@ -120,6 +120,17 @@ pub(super) fn move_picker_window(frame: [f64; 4], cx: &mut App) {
     }
 }
 
+/// Puts the picker and then the pill back above the ink overlay once its watchdog has raised
+/// it. From any thread.
+pub(crate) fn raise_floating_windows() {
+    for slot in [&PICKER_HWND, &PILL_HWND] {
+        if let Some(id) = own_window(slot) {
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = unsafe { SetWindowPos(win::hwnd(id), Some(HWND_TOPMOST), 0, 0, 0, 0, flags) };
+        }
+    }
+}
+
 /// The picker takes the keys itself (`configure_picker_window`); the review window opens in front.
 pub(super) fn take_keys(_cx: &mut App) {}
 
