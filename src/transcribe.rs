@@ -210,6 +210,8 @@ fn finish_live(
             ));
             Some(done.transcript)
         }
+        #[cfg(target_os = "windows")]
+        Err(error) if error.is::<crate::win::claude_dictation::Skipped>() => None,
         Err(error) => {
             crate::capture::scrawl_log(format!(
                 "Live transcription failed, transcribing the recording: {error:#}"

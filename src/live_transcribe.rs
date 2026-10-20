@@ -140,6 +140,22 @@ impl Live {
         })))
     }
 
+    /// The recording has stopped (`AudioRecorder::stop`, first thing): Claude Code dictation
+    /// releases its key so nothing said afterwards lands in the transcript. The stream needs
+    /// nothing; it gets the rest from the WAV.
+    pub fn release(&self) {
+        match &self.0 {
+            Inner::Stream(_) => {}
+            #[cfg(target_os = "windows")]
+            Inner::Claude(take) => take.release(),
+        }
+    }
+
+    #[cfg(all(test, target_os = "windows"))]
+    pub fn claude(take: crate::win::claude_dictation::Take) -> Self {
+        Self(Inner::Claude(take))
+    }
+
     /// Sends what the helper hasn't had of `wav_bytes` (the recording's `audio.wav`), ends its
     /// input and collects the transcript.
     pub fn finish(mut self, wav_bytes: &[u8]) -> Result<Finished> {
