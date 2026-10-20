@@ -150,11 +150,13 @@ struct RetentionOption {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 struct Retention {
     preset: Option<String>,
     options: Vec<RetentionOption>,
     note: String,
+    delete_video: bool,
+    video_note: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -1224,6 +1226,7 @@ impl SettingsWindow {
             .map(|o| (o.id.clone(), o.label.clone(), true))
             .collect();
         let selected = r.preset.clone();
+        let delete_video = r.delete_video;
         let show = if WINDOWS {
             "Show in File Explorer"
         } else {
@@ -1250,6 +1253,23 @@ impl SettingsWindow {
                 ],
             ))
             .when(!r.note.is_empty(), |d| d.child(caption(theme, &r.note, false)))
+            .child(group(
+                theme,
+                vec![
+                    row(
+                        theme,
+                        "Delete the video after each capture",
+                        true,
+                        switch(theme, "settings-delete-video", delete_video, true).on_click(
+                            cx.listener(move |view, _, _, _| {
+                                view.set("deleteVideo", (!delete_video).into());
+                            }),
+                        ),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+            .child(caption(theme, &r.video_note, false))
             .child(header(theme, "Captures"))
             .child(group(
                 theme,
@@ -1830,5 +1850,37 @@ mod tests {
         // Off Windows the view has no language row.
         let state: ViewState = serde_json::from_value(serde_json::json!({"type": "state"})).unwrap();
         assert!(state.language.is_none());
+    }
+
+    #[test]
+    fn the_storage_pane_reads_the_delete_video_switch_from_the_settings_view() {
+        let dir = std::env::temp_dir().join(format!(
+            "scrawl-settings-window-{}-{}",
+            std::process::id(),
+            crate::make_bundle_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"retention":{"keepVideo":false}}"#).unwrap();
+        let policy = crate::retention::Policy::load_from(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        // What `settings::Panel::view` sends for that policy, as the window reads it.
+        let sent = serde_json::json!({
+            "retention": crate::settings::RetentionView {
+                preset: Some("week"),
+                options: Vec::new(),
+                note: String::new(),
+                delete_video: !policy.keep_video,
+                video_note: crate::settings::DELETE_VIDEO_NOTE,
+            },
+        });
+        let state: ViewState = serde_json::from_value(sent).unwrap();
+        assert!(state.retention.delete_video);
+        assert_eq!(state.retention.preset.as_deref(), Some("week"));
+        assert!(state.retention.video_note.contains("not to the Recycle Bin"));
+        // An older view without the switch reads as keeping videos.
+        let state: ViewState =
+            serde_json::from_value(serde_json::json!({"retention": {"note": ""}})).unwrap();
+        assert!(!state.retention.delete_video);
     }
 }
