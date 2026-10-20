@@ -74,8 +74,12 @@ Build: `cmd //c 'C:/t/cargo-msvc.cmd' <args>`. It runs vcvars64 with CMake and N
 - [x] Alt+Shift+V works (Collin). [ ] It's still unclear whether the Settings Language menu scrolls.
 - [ ] F3 (running; `C:/t/briefs/F3-full.md`, target scrawl-b, clientRequestId `scrawl-win-F3-align-1`): run Parakeet alongside Claude and align the word times. Collin approved it.
 - [ ] F4 (running; `C:/t/briefs/F4-full.md`, target scrawl-c, clientRequestId `scrawl-win-F4-overlay-1`): BUG from Collin. Ink stops showing on screen after a click on the other monitor, though it is still recorded. Evidence: bundle `scrawl-1792514420118-44d4-3`, log `[1792514413614]`.
+- [ ] F5 (running; `C:/t/briefs/F5-full.md`, target scrawl-a, clientRequestId `scrawl-win-F5-video-storage-1`): Collin wants recordings to use less disk.
+  - VBR at full resolution. 720p is ruled out because frames are decoded from the video.
+  - An opt-in "delete the video after each capture".
+  - A note that the Recycle Bin only frees space once it's emptied.
 - [x] Tests no longer write to the real `scrawl.log` (`cfg!(test)` in `scrawl_log`).
-- Collin's config has `transcriber: apple` again (he switched back for a Parakeet test, or something else reset it; ask him).
+- Collin switched back to `transcriber: apple` himself (2026-10-20). Open offer: log Parakeet's text next to Claude's for comparison (after F3).
 
 ## Lessons
 
