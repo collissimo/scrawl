@@ -27,6 +27,8 @@ pub const VOICE_ERRORS: [&str; 8] = [
 ];
 /// How long the screen must hold still after dictation before the text is final.
 pub const SETTLE: Duration = Duration::from_millis(600);
+/// The same once the footer shows a dictation error ("No speech detected"): no text follows.
+pub const SETTLE_ON_ERROR: Duration = Duration::from_millis(150);
 
 /// The screen's rows as text, trailing blanks trimmed.
 pub fn rows(parser: &vt100::Parser) -> Vec<String> {
@@ -192,7 +194,8 @@ pub fn preview(rows: &[String]) -> String {
     text.trim().trim_end_matches(LEVEL_BARS).trim().to_owned()
 }
 
-/// Waits for the screen to settle: not busy, and unchanged for `SETTLE`.
+/// Waits for the screen to settle: not busy, and unchanged for `SETTLE` (`SETTLE_ON_ERROR`
+/// with a dictation error showing).
 pub struct Settle {
     last: Option<String>,
     since: Instant,
@@ -213,7 +216,13 @@ impl Settle {
             self.last = Some(text);
             self.since = now;
         }
-        !State::of(rows).busy() && now.duration_since(self.since) >= SETTLE
+        let state = State::of(rows);
+        let quiet_for = if state.error.is_some() {
+            SETTLE_ON_ERROR
+        } else {
+            SETTLE
+        };
+        !state.busy() && now.duration_since(self.since) >= quiet_for
     }
 }
 
@@ -345,5 +354,11 @@ mod tests {
         assert!(settle.observe(&done, at(1_600)));
         let changed = lines(&format!("{rule}\n❯ Hallo Welt!\n{rule}\n  ? for shortcuts"));
         assert!(!settle.observe(&changed, at(1_650)), "a change restarts it");
+
+        let mut settle = Settle::new(start);
+        let failed = lines(&format!("{rule}\n❯\n{rule}\n  ? for shortcuts   No speech detected."));
+        assert!(!settle.observe(&busy, at(0)));
+        assert!(!settle.observe(&failed, at(100)));
+        assert!(settle.observe(&failed, at(250)), "an error has no text to wait for");
     }
 }
