@@ -393,6 +393,10 @@ pub struct Config {
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
     pub hex_model: Option<String>,
+    /// The language spoken in recordings (`"de"`, `"de-DE"`), for transcribers that need one
+    /// (`transcription_language`); absent follows the system's language.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -645,6 +649,36 @@ pub fn hex_model() -> Option<String> {
         .hex_model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())
+}
+
+/// The language recordings are transcribed in, as a lowercase two-letter code: `language` in
+/// `config.json`, else the system's language, else `en`.
+pub fn transcription_language() -> String {
+    config()
+        .language
+        .as_deref()
+        .and_then(language_code)
+        .or_else(|| system_language().as_deref().and_then(language_code))
+        .unwrap_or_else(|| "en".into())
+}
+
+/// `"de"`, `"de-DE"` and `"de_DE.UTF-8"` are all `de`; anything else is no language.
+fn language_code(raw: &str) -> Option<String> {
+    let code = raw.trim().split(['-', '_', '.']).next()?.to_ascii_lowercase();
+    (matches!(code.len(), 2 | 3) && code.bytes().all(|b| b.is_ascii_lowercase())).then_some(code)
+}
+
+#[cfg(windows)]
+fn system_language() -> Option<String> {
+    let mut buffer = [0_u16; 85];
+    // SAFETY: the buffer is LOCALE_NAME_MAX_LENGTH (85) UTF-16 units, as the call requires.
+    let len = unsafe { windows::Win32::Globalization::GetUserDefaultLocaleName(&mut buffer) };
+    (len > 1).then(|| String::from_utf16_lossy(&buffer[..len as usize - 1]))
+}
+
+#[cfg(not(windows))]
+fn system_language() -> Option<String> {
+    std::env::var("LANG").ok()
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -1337,6 +1371,17 @@ fn existing_keyframes(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn language_codes_take_the_language_part_only() {
+        assert_eq!(language_code("de").as_deref(), Some("de"));
+        assert_eq!(language_code(" de-DE ").as_deref(), Some("de"));
+        assert_eq!(language_code("de_DE.UTF-8").as_deref(), Some("de"));
+        assert_eq!(language_code("EN").as_deref(), Some("en"));
+        assert_eq!(language_code("German"), None);
+        assert_eq!(language_code(""), None);
+        assert_eq!(language_code("C.UTF-8"), None);
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {
