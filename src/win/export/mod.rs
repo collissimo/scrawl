@@ -232,19 +232,6 @@ fn render(plan: &Plan, progress: &mut dyn FnMut(f32)) -> Result<Done> {
     })
 }
 
-/// The row pitch of a packed RGB32 frame `len` bytes long. The H.264 decoder pads frames to
-/// 16 px macroblocks and the converted buffer keeps that padding (a 1000×562 frame arrives as
-/// 1008×576), so a size off the grid read at `width * 4` comes back sheared.
-fn packed_pitch(len: usize, width: u32, height: u32) -> usize {
-    let row = width as usize * 4;
-    let (h, padded) = (height as usize, (height as usize).div_ceil(16) * 16);
-    if len == row * h || padded == 0 || len % padded != 0 || len / padded < row {
-        row
-    } else {
-        len / padded
-    }
-}
-
 /// A decoded frame's visible area as tightly packed BGRA.
 fn bgra(video: &VideoReader, sample: &IMFSample, out: &mut Vec<u8>) -> Result<()> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer() }?;
@@ -268,7 +255,7 @@ fn bgra(video: &VideoReader, sample: &IMFSample, out: &mut Vec<u8>) -> Result<()
         let mut data = std::ptr::null_mut();
         let mut len = 0_u32;
         unsafe { buffer.Lock(&mut data, None, Some(&mut len)) }?;
-        let pitch = packed_pitch(len as usize, video.width, video.height);
+        let pitch = crate::win::media::packed_pitch(len as usize, video.width, video.height);
         let enough = len as usize >= pitch * video.height as usize;
         if enough {
             copy(data, pitch as isize);
@@ -286,10 +273,10 @@ mod tests {
 
     #[test]
     fn packed_frames_keep_the_decoders_macroblock_padding() {
-        assert_eq!(packed_pitch(1000 * 562 * 4, 1000, 562), 4000);
-        assert_eq!(packed_pitch(1008 * 576 * 4, 1000, 562), 4032);
-        assert_eq!(packed_pitch(1920 * 1088 * 4, 1920, 1080), 7680);
-        assert_eq!(packed_pitch(1920 * 1072 * 4, 1920, 1072), 7680);
+        assert_eq!(crate::win::media::packed_pitch(1000 * 562 * 4, 1000, 562), 4000);
+        assert_eq!(crate::win::media::packed_pitch(1008 * 576 * 4, 1000, 562), 4032);
+        assert_eq!(crate::win::media::packed_pitch(1920 * 1088 * 4, 1920, 1080), 7680);
+        assert_eq!(crate::win::media::packed_pitch(1920 * 1072 * 4, 1920, 1072), 7680);
     }
 
     #[test]

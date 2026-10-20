@@ -889,7 +889,7 @@ impl VideoReader {
                 len as usize >= self.width as usize * self.height as usize * 4,
                 "Short video frame"
             );
-            copy(data, self.width as isize * 4);
+            copy(data, packed_pitch(len as usize, self.width, self.height) as isize);
             unsafe { buffer.Unlock() }?;
         }
         Ok(shrink_to_edge(
@@ -967,6 +967,19 @@ fn on_screen_at<S>(
         }
     }
     Ok(())
+}
+
+/// The row pitch of a packed RGB32 frame `len` bytes long. The H.264 decoder pads frames to
+/// 16 px macroblocks and the converted buffer keeps that padding (a 1000×562 frame arrives as
+/// 1008×576), so a size off the grid read at `width * 4` comes back sheared.
+pub(crate) fn packed_pitch(len: usize, width: u32, height: u32) -> usize {
+    let row = width as usize * 4;
+    let (h, padded) = (height as usize, (height as usize).div_ceil(16) * 16);
+    if len == row * h || padded == 0 || len % padded != 0 || len / padded < row {
+        row
+    } else {
+        len / padded
+    }
 }
 
 /// Box-filters a frame down so its long edge is at most `max_edge` (0 keeps it).
