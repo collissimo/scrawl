@@ -41,13 +41,17 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
 - B: Claude Code dictation engine. **Done and merged** (cfc45d8); A+B+C together: 341 tests pass. Not yet tested with real speech (needs Collin). Risks: it hears only the Windows default mic; a cold start begins listening 2-3 s late; npm `claude.cmd` isn't found.
 - Reviews done: R2 robustness and R3 product (R1 macOS was cancelled; macOS is out of scope). Verbatim findings: `C:/t/briefs/review-findings.md`.
 - Fix tasks (started 2026-10-20 ~17:45, fastMode, worktree):
-  - F1 Claude-dictation robustness (`C:/t/briefs/F1-dictation-fixes.md`, target `C:/t/scrawl-b`, clientRequestId `scrawl-win-F1-dictation-1`).
+  - F1 Claude-dictation robustness: **done and merged** (43e707f).
+    - It produced the first real Claude-dictated bundle: `source: claude-code`, `estimated: true`, and the line in `summary.md`. The test bundles held screen and room audio and are deleted.
+    - Open item: a recording started within ~1 s of a no-speech finish falls back with "busy".
+    - Open item: a recording that ends before Claude listens restarts the session, so the next one starts cold.
   - F2 language picker + model watcher + export retry: **done and merged** (4c55926, plus d86a9d0); 351 tests pass. Open items:
     - The Settings Language menu (31 entries, scrolling) has never been seen on screen.
     - The 5 s watcher loop has only unit tests for its decision.
   - Decision: the default language is `en` unless config `language` is set (no locale following; experiments rule). Collin picks Deutsch in Settings.
   - Merge order: F1 first, then F2, then a full `cargo test`.
-  - After F1 merges: `live_transcribe::wanted()` must also require `crate::win::languages::claude_supports(&handoff::transcription_language())`. Log it and fall back. Write F1's doc notes into `docs/windows.md`.
+  - Language gate for Claude: done (afb45c5, in `claude_dictation::dictate`). F1's doc notes are in `docs/windows.md` (7843d4c). 363 tests pass.
+  - R4 review of the fix round is running (`C:/t/briefs/R4-fix-review.md`, clientRequestId `scrawl-win-review-R4-fixes-1`). A release build for Collin's test is at `C:/t/scrawl-up/release/scrawl.exe`. Write F1's doc notes into `docs/windows.md`.
   - Then Collin's spoken test.
 - C: Windows video export. **Done and merged** (ec4b14f), plus my fix for sheared decoded frames (513473d). 327 tests pass. Follow-ups: the AMD encoder runs near-constant bitrate, so static screens produce big files (switch to VBR via CODECAPI_AVEncCommonRateControlMode); no fast-start; `media::audio_mono` duplicates `export_audio`.
 
