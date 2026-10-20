@@ -38,7 +38,13 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFAttributes, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoEncodeQP,
+    ICodecAPI, IMF2DBuffer, IMFAttributes, IMFMediaType,
+    IMFSample, IMFSinkWriter, IMFSinkWriterEx, IMFSourceReader, IMFTransform,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncCommonRateControlMode_Quality, eAVEncCommonRateControlMode_UnconstrainedVBR,
     MF_E_INVALIDSTREAMNUMBER, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AUDIO_BITS_PER_SAMPLE,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE,
     MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
@@ -334,6 +340,155 @@ impl Scaler {
     }
 }
 
+/// How an H.264 encoder spends its bits. Screen recordings are mostly still: a constant rate
+/// spends as many bits on an unchanged screen as on a scroll, so they ask for quality instead.
+/// `rate_control_lab` (below) measures each on a screenshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateControl {
+    /// No mode, just `MF_MT_AVG_BITRATE` (hardware encoders then run near-constant bitrate).
+    #[cfg_attr(not(test), allow(dead_code))]
+    AverageOnly,
+    /// `eAVEncCommonRateControlMode_Quality` at this `CODECAPI_AVEncCommonQuality` (0–100).
+    Quality(u32),
+    /// Peak-constrained VBR with this mean and peak, in bit/s (the AMD encoder takes its mean
+    /// from `MF_MT_AVG_BITRATE` instead).
+    #[cfg_attr(not(test), allow(dead_code))]
+    PeakVbr { mean: u32, peak: u32 },
+    /// Quality mode at this fixed `CODECAPI_AVEncVideoEncodeQP` (0–51, lower is finer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Qp(u32),
+}
+
+/// The recording encoder's rate control, picked with `rate_control_lab` (see `docs/windows.md`):
+/// the AMD encoder runs it at QP 20.
+const RECORDING_RATE: RateControl = RateControl::Quality(85);
+
+impl RateControl {
+    /// The encoding parameters `IMFSinkWriter::SetInputMediaType` hands to the encoder's
+    /// `ICodecAPI`.
+    pub(crate) fn params(self, gop: Option<u32>) -> Result<Option<IMFAttributes>> {
+        let mode = match self {
+            Self::AverageOnly if gop.is_none() => return Ok(None),
+            Self::AverageOnly => None,
+            Self::Quality(_) | Self::Qp(_) => Some(eAVEncCommonRateControlMode_Quality),
+            Self::PeakVbr { .. } => Some(eAVEncCommonRateControlMode_PeakConstrainedVBR),
+        };
+        let mut params: Option<IMFAttributes> = None;
+        unsafe { MFCreateAttributes(&mut params, 4) }?;
+        let params = params.context("attributes")?;
+        unsafe {
+            if let Some(mode) = mode {
+                params.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode.0 as u32)?;
+            }
+            if let Some(gop) = gop {
+                params.SetUINT32(&CODECAPI_AVEncMPVGOPSize, gop)?;
+            }
+            match self {
+                Self::Quality(q) => params.SetUINT32(&CODECAPI_AVEncCommonQuality, q)?,
+                // The default, I, P and B frame QPs, 16 bits each.
+                Self::Qp(qp) => params.SetUINT64(
+                    &CODECAPI_AVEncVideoEncodeQP,
+                    u64::from(qp) * 0x0001_0001_0001_0001,
+                )?,
+                Self::PeakVbr { mean, peak } => {
+                    params.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, mean)?;
+                    params.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, peak)?;
+                }
+                Self::AverageOnly => {}
+            }
+        }
+        Ok(Some(params))
+    }
+}
+
+/// Sets `stream`'s input type with `params` for the encoder, and again without them if the
+/// encoder refuses them, so an encoder that doesn't take a setting still records.
+pub(crate) fn set_input_type(
+    writer: &IMFSinkWriter,
+    stream: u32,
+    input: &IMFMediaType,
+    params: Option<&IMFAttributes>,
+) -> Result<()> {
+    match unsafe { writer.SetInputMediaType(stream, input, params) } {
+        Err(error) if params.is_some() => {
+            scrawl_log(format!(
+                "The H.264 encoder refused its rate control ({error}); using its defaults"
+            ));
+            unsafe { writer.SetInputMediaType(stream, input, None) }?;
+            Ok(())
+        }
+        result => Ok(result?),
+    }
+}
+
+/// The video encoder the sink writer picked for `stream` and the rate control it reports, like
+/// `AMDh264Encoder (hardware), rate control Quality, quality 70`.
+pub(crate) fn describe_encoder(writer: &IMFSinkWriter, stream: u32) -> String {
+    let encoder = writer.cast::<IMFSinkWriterEx>().ok().and_then(|ex| {
+        (0..8).find_map(|index| {
+            let mut category = GUID::zeroed();
+            let mut transform: Option<IMFTransform> = None;
+            unsafe { ex.GetTransformForStream(stream, index, Some(&mut category), &mut transform) }
+                .ok()?;
+            (category == MFT_CATEGORY_VIDEO_ENCODER).then_some(transform).flatten()
+        })
+    });
+    let Some(encoder) = encoder else {
+        return "unknown encoder".to_owned();
+    };
+    let attributes = unsafe { encoder.GetAttributes() }.ok();
+    let name = attributes
+        .as_ref()
+        .and_then(|a| attribute_string(a, &MFT_FRIENDLY_NAME_Attribute))
+        .unwrap_or_else(|| "H.264 encoder".to_owned());
+    let hardware = attributes
+        .as_ref()
+        .is_some_and(|a| unsafe { a.GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute) }.is_ok());
+    let mut text = format!("{name} ({})", if hardware { "hardware" } else { "software" });
+    let Ok(api) = encoder.cast::<ICodecAPI>() else {
+        return text;
+    };
+    let get = |key: &GUID| -> Option<u32> {
+        let value = unsafe { api.GetValue(key) }.ok()?;
+        u32::try_from(&value).ok()
+    };
+    let mode = match get(&CODECAPI_AVEncCommonRateControlMode).map(|m| m as i32) {
+        None => "not reported".to_owned(),
+        Some(m) if m == eAVEncCommonRateControlMode_CBR.0 => "CBR".to_owned(),
+        Some(m) if m == eAVEncCommonRateControlMode_PeakConstrainedVBR.0 => {
+            "peak-constrained VBR".to_owned()
+        }
+        Some(m) if m == eAVEncCommonRateControlMode_UnconstrainedVBR.0 => "VBR".to_owned(),
+        Some(m) if m == eAVEncCommonRateControlMode_Quality.0 => "Quality".to_owned(),
+        Some(other) => format!("mode {other}"),
+    };
+    text.push_str(&format!(", rate control {mode}"));
+    if let Some(q) = get(&CODECAPI_AVEncCommonQuality) {
+        text.push_str(&format!(", quality {q}"));
+    }
+    if let Ok(qp) = unsafe { api.GetValue(&CODECAPI_AVEncVideoEncodeQP) }
+        && let Ok(qp) = u64::try_from(&qp)
+    {
+        text.push_str(&format!(", QP {}", qp & 0xffff));
+    }
+    if let Some(gop) = get(&CODECAPI_AVEncMPVGOPSize) {
+        text.push_str(&format!(", GOP {gop}"));
+    }
+    if let Some(mean) = get(&CODECAPI_AVEncCommonMeanBitRate) {
+        text.push_str(&format!(", mean {:.1} Mbit/s", f64::from(mean) / 1e6));
+    }
+    text
+}
+
+fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
+    let mut text = windows::core::PWSTR::null();
+    let mut len = 0;
+    unsafe { attributes.GetAllocatedString(key, &mut text, &mut len) }.ok()?;
+    let out = unsafe { text.to_string() }.ok();
+    unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(text.0 as *const _)) };
+    out
+}
+
 struct Encoder {
     writer: IMFSinkWriter,
     stream: u32,
@@ -343,13 +498,29 @@ struct Encoder {
 
 impl Encoder {
     fn new(path: &Path, width: u32, height: u32) -> Result<Self> {
+        Self::with(path, width, height, RECORDING_RATE, None, true)
+    }
+
+    /// `gop` frames between key frames (`None` keeps the encoder's: 30 here); `hardware` lets
+    /// Media Foundation pick the GPU's encoder.
+    fn with(
+        path: &Path,
+        width: u32,
+        height: u32,
+        rate: RateControl,
+        gop: Option<u32>,
+        hardware: bool,
+    ) -> Result<Self> {
         let mut attributes: Option<IMFAttributes> = None;
         unsafe { MFCreateAttributes(&mut attributes, 2) }?;
         let attributes = attributes.context("attributes")?;
-        unsafe { attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1) }?;
+        unsafe {
+            attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, u32::from(hardware))
+        }?;
         let writer = unsafe {
             MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attributes)
         }?;
+        // The average stays set in every mode: some encoders refuse a type without one.
         let bitrate = (f64::from(width) * f64::from(height) * f64::from(MAX_FPS) * 0.08) as u32;
         let output = video_type(&MFVideoFormat_H264, width, height)?;
         unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate.clamp(2_000_000, 16_000_000)) }?;
@@ -358,9 +529,13 @@ impl Encoder {
         unsafe {
             input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
             input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-            writer.SetInputMediaType(stream, &input, None)?;
-            writer.BeginWriting()?;
         }
+        set_input_type(&writer, stream, &input, rate.params(gop)?.as_ref())?;
+        unsafe { writer.BeginWriting() }?;
+        scrawl_log(format!(
+            "Recording encoder: {}",
+            describe_encoder(&writer, stream)
+        ));
         Ok(Self {
             writer,
             stream,
@@ -1264,5 +1439,223 @@ mod tests {
         );
         // Far ahead: a seek, then the walk from the key frame.
         assert_eq!(pick(&[150, 2_510], 3_000, 2_900), [(150, 100), (2_510, 2_500)]);
+    }
+
+    /// BT.709 limited-range NV12 of opaque RGBA, like the recorder's video processor.
+    fn nv12(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let px = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            (i32::from(rgba[i]), i32::from(rgba[i + 1]), i32::from(rgba[i + 2]))
+        };
+        let mut out = vec![0u8; w * h * 3 / 2];
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = px(x, y);
+                out[y * w + x] = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
+            }
+        }
+        for y in (0..h).step_by(2) {
+            for x in (0..w).step_by(2) {
+                let (mut r, mut g, mut b) = (0, 0, 0);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = px(x + dx, y + dy);
+                    (r, g, b) = (r + p.0, g + p.1, b + p.2);
+                }
+                let (r, g, b) = (r / 4, g / 4, b / 4);
+                let at = w * h + (y / 2) * w + x;
+                out[at] = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+                out[at + 1] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            }
+        }
+        out
+    }
+
+    fn lumas(rgba: &[u8], w: usize, [x0, y0, cw, ch]: [usize; 4]) -> Vec<f64> {
+        let mut out = Vec::with_capacity(cw * ch);
+        for y in y0..y0 + ch {
+            for x in x0..x0 + cw {
+                let i = (y * w + x) * 4;
+                out.push(
+                    0.2126 * f64::from(rgba[i])
+                        + 0.7152 * f64::from(rgba[i + 1])
+                        + 0.0722 * f64::from(rgba[i + 2]),
+                );
+            }
+        }
+        out
+    }
+
+    fn psnr(a: &[f64], b: &[f64]) -> f64 {
+        let mse = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>() / a.len() as f64;
+        10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
+    }
+
+    /// Mean absolute luma step to the right and down neighbour: how crisp edges are.
+    fn gradient(l: &[f64], w: usize) -> f64 {
+        let h = l.len() / w;
+        let mut sum = 0.0;
+        for y in 0..h - 1 {
+            for x in 0..w - 1 {
+                let v = l[y * w + x];
+                sum += (l[y * w + x + 1] - v).abs() + (l[(y + 1) * w + x] - v).abs();
+            }
+        }
+        sum / ((w - 1) * (h - 1)) as f64
+    }
+
+    /// Encodes a lossless screenshot (`SCRAWL_LAB_PNG`) as an 8 s screen recording under each
+    /// rate control, then reports the movie's size and how close the decoded frames' small text
+    /// (`SCRAWL_LAB_CROP=x,y,w,h`, else the busiest tile) stays to the screenshot.
+    /// `SCRAWL_LAB_ONLY=avg,q85,sw-q85,vbr2,qp20` picks the settings, `SCRAWL_LAB_GOP=60` the key
+    /// frame interval and `SCRAWL_LAB_BUSY=1` sends frames all the time instead of only while the
+    /// cursor moves:
+    /// `SCRAWL_LAB_PNG=shot.png SCRAWL_LAB_CROP=40,60,600,200 cargo test rate_control_lab -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs SCRAWL_LAB_PNG and an H.264 encoder"]
+    fn rate_control_lab() {
+        media_startup();
+        let png = std::env::var("SCRAWL_LAB_PNG").expect("SCRAWL_LAB_PNG");
+        let file = std::io::BufReader::new(std::fs::File::open(&png).unwrap());
+        let source = crate::render::decode_png(file).unwrap();
+        let (w, h) = ((source.width & !15) as usize, (source.height & !15) as usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            let row = y * source.width as usize * 4;
+            rgba.extend_from_slice(&source.rgba[row..row + w * 4]);
+        }
+        // A 16 px "cursor" moves along the bottom 32 rows, which the text crop leaves out.
+        let crop: [usize; 4] = std::env::var("SCRAWL_LAB_CROP")
+            .ok()
+            .and_then(|c| {
+                let v: Vec<usize> = c.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                <[usize; 4]>::try_from(v).ok()
+            })
+            .unwrap_or_else(|| {
+                // The busiest 512×256 tile: where the small text is.
+                let tiles = (0..h.saturating_sub(32 + 256))
+                    .step_by(64)
+                    .flat_map(|y| (0..w - 512).step_by(64).map(move |x| [x, y, 512, 256]));
+                tiles
+                    .max_by(|a, b| {
+                        let g = |c: &[usize; 4]| gradient(&lumas(&rgba, w, *c), c[2]);
+                        g(a).total_cmp(&g(b))
+                    })
+                    .unwrap_or([0, 0, w, h - 32])
+            });
+        assert!(crop[0] + crop[2] <= w && crop[1] + crop[3] <= h - 32, "crop {crop:?}");
+        let cursor_at = |t: u64| ((t as usize * 3) % (w - 16), h - 24);
+        let frame_at = |t: u64| {
+            let mut f = rgba.clone();
+            let (cx, cy) = cursor_at(t);
+            for y in cy..cy + 16 {
+                for x in cx..cx + 16 {
+                    f[(y * w + x) * 4..(y * w + x) * 4 + 3].copy_from_slice(&[255, 255, 255]);
+                }
+            }
+            nv12(&f, w, h)
+        };
+        // Like Windows.Graphics.Capture: frames while the cursor moves, none while it rests.
+        let times: Vec<u64> = if std::env::var_os("SCRAWL_LAB_BUSY").is_some() {
+            // Something small changes all the time (a caret, a clock, a spinner).
+            (0..=8_000).step_by(33).collect()
+        } else {
+            (0..2_000)
+                .step_by(33)
+                .chain((5_000..6_000).step_by(33))
+                .chain([8_000])
+                .collect()
+        };
+        let frames_nv12: Vec<(u64, Vec<u8>)> = times.iter().map(|&t| (t, frame_at(t))).collect();
+        let reference = lumas(&rgba, w, crop);
+        let source_grad = gradient(&reference, crop[2]);
+        let configs: Vec<(String, RateControl, bool)> = std::env::var("SCRAWL_LAB_ONLY")
+            .ok()
+            .map_or_else(
+                || {
+                    let mut c = vec![("average-only".to_owned(), RateControl::AverageOnly, true)];
+                    for q in [30, 50, 60, 70, 80, 90] {
+                        c.push((format!("quality-{q}"), RateControl::Quality(q), true));
+                    }
+                    for (mean, peak) in [(1, 8), (2, 12), (3, 16)] {
+                        c.push((
+                            format!("peak-vbr-{mean}m"),
+                            RateControl::PeakVbr {
+                                mean: mean * 1_000_000,
+                                peak: peak * 1_000_000,
+                            },
+                            true,
+                        ));
+                    }
+                    c.push(("sw-average-only".to_owned(), RateControl::AverageOnly, false));
+                    c.push(("sw-quality-70".to_owned(), RateControl::Quality(70), false));
+                    c
+                },
+                |only| {
+                    // `q80`, `qp22`, `vbr2` (mean Mbit/s, 6× peak), each with `sw-` for the
+                    // software encoder.
+                    only.split(',')
+                        .map(|name| {
+                            let (hardware, spec) = match name.strip_prefix("sw-") {
+                                Some(rest) => (false, rest),
+                                None => (true, name),
+                            };
+                            let rate = if let Some(n) = spec.strip_prefix("qp") {
+                                RateControl::Qp(n.parse().unwrap())
+                            } else if let Some(n) = spec.strip_prefix("q") {
+                                RateControl::Quality(n.parse().unwrap())
+                            } else if let Some(n) = spec.strip_prefix("vbr") {
+                                let mean: u32 = n.parse().unwrap();
+                                RateControl::PeakVbr {
+                                    mean: mean * 1_000_000,
+                                    peak: mean * 6_000_000,
+                                }
+                            } else {
+                                RateControl::AverageOnly
+                            };
+                            (name.to_owned(), rate, hardware)
+                        })
+                        .collect()
+                },
+            );
+        println!("{w}x{h}, text crop {crop:?}, source gradient {source_grad:.2}");
+        for (label, rate, hardware) in configs {
+            let out = std::env::temp_dir().join(format!("scrawl-lab-{label}.mp4"));
+            let _ = std::fs::remove_file(&out);
+            let gop = std::env::var("SCRAWL_LAB_GOP").ok().and_then(|g| g.parse().ok());
+            let mut encoder =
+                Encoder::with(&out, w as u32, h as u32, rate, gop, hardware).unwrap();
+            let used = describe_encoder(&encoder.writer, encoder.stream);
+            for (t, frame) in &frames_nv12 {
+                encoder.write(frame, *t as i64 * 10_000).unwrap();
+            }
+            encoder.finish().unwrap();
+            let bytes = std::fs::metadata(&out).unwrap().len();
+            let t0 = Instant::now();
+            let decoded = frames(&out, FrameTimes::At(&[1_000, 4_000, 7_900]), 0).unwrap();
+            let seek_ms = t0.elapsed().as_millis();
+            // Far-apart times, each a seek and a walk from the key frame before it.
+            let t0 = Instant::now();
+            for at in [3_900, 7_950] {
+                frames(&out, FrameTimes::At(&[at]), 0).unwrap();
+            }
+            let far_ms = t0.elapsed().as_millis();
+            let mut scores = Vec::new();
+            for f in &decoded {
+                assert_eq!((f.width as usize, f.height as usize), (w, h));
+                let l = lumas(&f.rgba, w, crop);
+                scores.push((psnr(&reference, &l), gradient(&l, crop[2]) / source_grad));
+            }
+            let fmt: Vec<String> = scores
+                .iter()
+                .map(|(p, g)| format!("{p:.1} dB/{:.0}%", g * 100.0))
+                .collect();
+            println!(
+                "{label:16} {:>8.0} KB {:>5.2} Mbit/s  text PSNR/gradient at 1 s, 4 s, 7.9 s: {}  decode {seek_ms} ms, 2 far frames {far_ms} ms  [{used}]",
+                bytes as f64 / 1000.0,
+                bytes as f64 * 8.0 / 8.0 / 1e6,
+                fmt.join(", ")
+            );
+            let _ = std::fs::remove_file(&out);
+        }
     }
 }
