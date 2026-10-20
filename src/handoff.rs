@@ -16,7 +16,7 @@ pub fn default_captures_dir() -> PathBuf {
             if cfg!(target_os = "windows") {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
-                    .join("scrawl/captures")
+                    .join("scrawl").join("captures")
             } else {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
