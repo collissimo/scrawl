@@ -51,7 +51,8 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
   - Decision: the default language is `en` unless config `language` is set (no locale following; experiments rule). Collin picks Deutsch in Settings.
   - Merge order: F1 first, then F2, then a full `cargo test`.
   - Language gate for Claude: done (afb45c5, in `claude_dictation::dictate`). F1's doc notes are in `docs/windows.md` (7843d4c). 363 tests pass.
-  - R4 review of the fix round is running (`C:/t/briefs/R4-fix-review.md`, clientRequestId `scrawl-win-review-R4-fixes-1`). A release build for Collin's test is at `C:/t/scrawl-up/release/scrawl.exe`. Write F1's doc notes into `docs/windows.md`.
+  - R4 review of the fix round: no blockers and no majors; I fixed its 5 minor findings (9ae53f5). 363 tests pass, and `dictation-selftest` passes (the footer error now reads through: "No speech detected.").
+  - Collin's test build is `C:/t/scrawl-test/scrawl.exe`, a release build of 9ae53f5. No `~/.config/scrawl/config.json` exists yet, so he chooses Language and Transcription in Settings. Write F1's doc notes into `docs/windows.md`.
   - Then Collin's spoken test.
 - C: Windows video export. **Done and merged** (ec4b14f), plus my fix for sheared decoded frames (513473d). 327 tests pass. Follow-ups: the AMD encoder runs near-constant bitrate, so static screens produce big files (switch to VBR via CODECAPI_AVEncCommonRateControlMode); no fast-start; `media::audio_mono` duplicates `export_audio`.
 
