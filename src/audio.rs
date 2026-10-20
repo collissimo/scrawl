@@ -165,6 +165,11 @@ impl AudioRecorder {
     }
 
     pub fn stop(mut self) -> Result<RecordedAudio> {
+        // First, before closing the device or writing the WAV: speech from now on isn't part of
+        // the recording, and a live transcriber that starts hearing after this gives up.
+        if let Some(live) = &self.live {
+            live.release();
+        }
         // Joining drops the stream and stops its callback before taking the buffer,
         // including a stop requested while the device was still being initialized.
         self.join_worker()?;
@@ -386,6 +391,37 @@ pub fn encode_wav_16k(samples_16k: &[f32]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The worker models the microphone closing, which ends only once the dictation key is up.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stopping_releases_the_dictation_key_before_closing_the_microphone() {
+        use std::sync::atomic::Ordering;
+        let (take, released, _cancelled, _answer) = crate::win::claude_dictation::test_take();
+        let worker_released = Arc::clone(&released);
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !worker_released.load(Ordering::Acquire) {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "the key was still held while the microphone closed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        });
+        let audio = AudioRecorder {
+            worker: Some(worker),
+            stop_sender: None,
+            samples: Arc::new(Mutex::new(vec![0.0; 1_600])),
+            error: Arc::new(Mutex::new(None)),
+            live: Some(crate::live_transcribe::Live::claude(take)),
+        }
+        .stop()
+        .unwrap();
+        assert_eq!(audio.sample_count, 1_600);
+        assert!(released.load(Ordering::Acquire));
+    }
 
     #[test]
     fn stop_joins_worker_before_reading_its_last_samples() {

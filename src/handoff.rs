@@ -16,7 +16,7 @@ pub fn default_captures_dir() -> PathBuf {
             if cfg!(target_os = "windows") {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
-                    .join("scrawl/captures")
+                    .join("scrawl").join("captures")
             } else {
                 dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -393,6 +393,10 @@ pub struct Config {
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
     pub hex_model: Option<String>,
+    /// The language spoken in recordings (`"de"`, `"de-DE"`), for transcribers that need one
+    /// (`transcription_language`); absent is English.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -645,6 +649,29 @@ pub fn hex_model() -> Option<String> {
         .hex_model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())
+}
+
+/// The language recordings are transcribed in, as a lowercase two-letter code: `language` in
+/// `config.json` (Settings › Recording › Language), else `en`. It never follows the PC's locale:
+/// a German Windows with an English user locale would otherwise get the wrong model and
+/// dictation language, and what every user gets by default would change without an experiment.
+pub fn transcription_language() -> String {
+    language_of(&config())
+}
+
+/// `transcription_language` for `config`.
+pub fn language_of(config: &Config) -> String {
+    config
+        .language
+        .as_deref()
+        .and_then(language_code)
+        .unwrap_or_else(|| "en".into())
+}
+
+/// `"de"`, `"de-DE"` and `"de_DE.UTF-8"` are all `de`; anything else is no language.
+pub fn language_code(raw: &str) -> Option<String> {
+    let code = raw.trim().split(['-', '_', '.']).next()?.to_ascii_lowercase();
+    (matches!(code.len(), 2 | 3) && code.bytes().all(|b| b.is_ascii_lowercase())).then_some(code)
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -1337,6 +1364,35 @@ fn existing_keyframes(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn language_codes_take_the_language_part_only() {
+        assert_eq!(language_code("de").as_deref(), Some("de"));
+        assert_eq!(language_code(" de-DE ").as_deref(), Some("de"));
+        assert_eq!(language_code("de_DE.UTF-8").as_deref(), Some("de"));
+        assert_eq!(language_code("EN").as_deref(), Some("en"));
+        assert_eq!(language_code("German"), None);
+        assert_eq!(language_code(""), None);
+        assert_eq!(language_code("C.UTF-8"), None);
+    }
+
+    #[test]
+    fn the_language_is_the_configured_one_else_english() {
+        let with = |language: Option<&str>| {
+            language_of(&Config {
+                language: language.map(str::to_owned),
+                ..Default::default()
+            })
+        };
+        assert_eq!(with(None), "en");
+        assert_eq!(with(Some("de-DE")), "de");
+        assert_eq!(with(Some("German")), "en");
+        assert_eq!(language_of(&config_from_value(serde_json::json!({}))), "en");
+        assert_eq!(
+            language_of(&config_from_value(serde_json::json!({"language": "de"}))),
+            "de"
+        );
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

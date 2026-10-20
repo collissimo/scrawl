@@ -3,7 +3,11 @@
 //! the virtual screen (Scrawl is per-monitor DPI aware), with the primary display's top-left at
 //! the origin, like CoreGraphics' points on macOS.
 
+pub mod claude_dictation;
 pub mod clipboard;
+pub mod conpty;
+pub mod export;
+pub mod languages;
 pub mod login;
 pub mod media;
 pub mod overlay;

@@ -165,7 +165,8 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
   (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
 - **Recording**: the microphone, with its input level, the transcriber (Apple Speech, or Hex while
   it runs, with its model) and, under Experimental, Video export.
-- **Storage**: how long recordings are kept, how much space the captures take, and Show in Finder.
+- **Storage**: how long recordings are kept, whether each capture's video is deleted once it's
+  processed, how much space the captures take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
   install command with Copy. A `scrawl` that belongs to another program is left alone.
@@ -625,7 +626,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kitlangton.scrawl.se
 sync, the red ink, pins, laser and click ripples burned in at the times they happened, cropped to
 where the activity was. It runs in `scrawl-helper` on AVFoundation (hardware decode and encode, Core
 Image for the crop, Core Graphics for the ink), so nothing is decoded into Rust and ffmpeg isn't
-needed.
+needed. On Windows it renders the same plan in process with Media Foundation (H.264 only) and
+writes to `Videos\Scrawl\<bundle>.mp4` by default.
 
 ```sh
 scrawl export latest                              # ~/Movies/Scrawl/<bundle>.mp4
@@ -662,7 +664,12 @@ daily, at low priority, and logs what it did:
 - **Keep recordings** in Settings › Storage picks Video for 7 Days (bundles 30), Video for 30 Days
   (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
   `~/.config/scrawl/config.json`; `null` keeps forever. The same pane shows how much the captures
-  take and opens the folder in Finder.
+  take and opens the folder in Finder. On Windows the Recycle Bin gives the space back only once
+  it's emptied.
+- **Delete the video after each capture** (Settings › Storage, off by default, `"keepVideo":
+  false` under `"retention"`) deletes `recording.mp4` for good a minute after each new capture is
+  processed, once it's delivered and no copy is running; frames, contact sheet, text and
+  `audio.wav` stay, and `scrawl zoom`, `export` and `reprocess` say the video was deleted.
 - Never touched: a bundle under a day old or changed in the last day (a copy just arrived from
   another Mac, a zoom), one whose media is still copying (`.media-pending` there, `.media-sending`
   here; a marker over a day old is ignored), one being recorded or re-encoded, and one with a
@@ -702,7 +709,7 @@ Or in
 { "transcriber": "hex", "hexModel": "parakeet_v3" }
 ```
 
-`"transcriber"` is `"apple"` (default) or `"hex"`; `hexModel` defaults to the first ready one of
+`"transcriber"` is `"apple"` (default), `"hex"` or, on Windows, `"claude"`; `hexModel` defaults to the first ready one of
 `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
 downloads or prepares a model: install it in Hex first.
 
@@ -716,6 +723,32 @@ downloads or prepares a model: install it in Hex first.
 - `scrawl hex status` shows whether Hex is connected, its ready models and what the next recording
   will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
   an engine for one run.
+
+### Claude Code dictation (Windows)
+
+On Windows, Scrawl can transcribe through Claude Code's voice dictation instead, which handles
+German and the other languages Claude Code lists: Settings › Recording › **Transcription** →
+**Claude Code (dictation)**, the tray's **Transcription** submenu, or `"transcriber": "claude"`
+in the config. It needs `claude.exe` on PATH and a claude.ai login (`claude auth status`);
+without `claude` the choice is greyed out with the reason.
+
+- A hidden, unmodified `claude` session runs in a pseudo console (no window) with dictation on in
+  hold mode, no tools, no MCP servers and plan mode. While you record, Scrawl holds its dictation
+  key; Claude Code records the default microphone and transcribes through Anthropic with your
+  login. When the recording stops, the text comes out through Claude Code's external editor hook
+  (`scrawl.exe claude-editor`) and is never submitted as a prompt.
+- The language is Settings › Recording › **Language** (or the tray's Transcription › Language,
+  or `"language"` in the config, a code such as `"de"`), else English. Claude Code dictates
+  [these 20 languages](https://code.claude.com/docs/en/voice-dictation#change-the-dictation-language);
+  for any other the choice is greyed out with the reason.
+- Scrawl keeps one session warm while Claude Code is the engine and ends it with Scrawl.
+- Claude Code returns text without times, so its words are spread over the recording's stretches
+  of speech (`"source": "claude-code"`, `"estimated": true`).
+- When Claude Code hears nothing, fails, or started listening too late to hear the start, the
+  recording is transcribed on this PC instead (see `%LOCALAPPDATA%\Scrawl\Logs`). Import,
+  reprocess and retranscribe always use the on-device engine.
+- `scrawl dictation-selftest` starts a session, takes typed text back out through the editor hook,
+  holds dictation for 2 s (this records the microphone) and cancels one.
 
 ### Transcribing while recording (experiment)
 
@@ -791,14 +824,22 @@ system owns differ:
   model (`%APPDATA%\voice-control\models`), Scrawl uses it. Otherwise the first launch downloads
   Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
   `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
-  captures made before it finishes get their transcript once it lands.
+  captures made before it finishes get their transcript once it lands. Recordings are English
+  unless Settings › Recording › **Language** says otherwise (never the Windows locale); another
+  language downloads Parakeet TDT 0.6b v3 (740 MB; bg cs da de el en es et fi fr hr hu it lt lv mt
+  nl pl pt ro ru sk sl sv uk) as soon as you pick it, and one v3 doesn't speak stays on the
+  English model.
+  `"transcriber": "claude"` dictates through Claude Code instead (any language Claude Code
+  supports; see [Claude Code dictation](#claude-code-dictation-windows)).
 - **Command-line tool:** **Install** in Settings › Agents writes a `scrawl.cmd` shim into
   `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is on every user's PATH, so agents and terminals
   can run `scrawl`.
 - **agentContext:** what clicks and marks land on comes from UI Automation, as it does from the
   Accessibility tree on macOS.
-- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
-  export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
+- **Video export:** `scrawl export` and the menu's **Export Last Capture as Video…** render in
+  process through Media Foundation (H.264 and AAC, no HEVC) into `Videos\Scrawl`.
+- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), Sparkle
+  updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
   (`/sdk.js` registrations still route).
 - **Releases:** a `v*` tag builds `Scrawl-<version>-windows-x64.zip` on GitHub Actions
   (`.github/workflows/release-windows.yml`) and attaches it to the release. It isn't code-signed

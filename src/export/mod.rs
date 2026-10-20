@@ -11,14 +11,17 @@
 //!
 //! The helper reads the video with AVAssetReader, composites with Core Image, draws the
 //! annotations with Core Graphics into the same pixel buffers, and hardware-encodes with
-//! AVAssetWriter. Nothing is decoded into Rust.
+//! AVAssetWriter. Nothing is decoded into Rust. Windows has no helper: `win::export` renders the
+//! same plan in process (Media Foundation decode and encode, the crop and ink on the CPU).
 
 pub mod camera;
 pub mod crop;
 pub mod ink;
 
+#[cfg(not(target_os = "windows"))]
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -74,18 +77,26 @@ pub struct Exported {
     pub bytes: u64,
 }
 
-/// Where `~/Movies/Scrawl/<bundle>.mp4` goes for a bundle.
+/// Where `~/Movies/Scrawl/<bundle>.mp4` goes for a bundle (on Windows, the Videos folder's
+/// `Scrawl\<bundle>.mp4`).
 pub fn default_output(bundle_dir: &Path) -> PathBuf {
     let name = bundle_dir
         .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("scrawl");
-    dirs::home_dir()
+    #[cfg(target_os = "windows")]
+    let folder = dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Videos")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Movies/Scrawl")
-        .join(format!("{name}.mp4"))
+        .join("Scrawl");
+    #[cfg(not(target_os = "windows"))]
+    let folder = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Movies/Scrawl");
+    folder.join(format!("{name}.mp4"))
 }
 
+/// What `helper/Export.swift` (and `win::export::plan` on Windows) reads.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Plan<'a> {
@@ -107,9 +118,9 @@ struct Plan<'a> {
 /// What the helper's `export` reports when it is done.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Done {
-    duration_ms: u64,
-    bytes: u64,
+pub(crate) struct Done {
+    pub(crate) duration_ms: u64,
+    pub(crate) bytes: u64,
 }
 
 /// Camera focuses for a bundle, on the video's clock: clicks, drags, drawn marks and laser
@@ -337,8 +348,16 @@ fn wav_duration_ms(path: &Path) -> Result<u64> {
     Ok(u64::from(reader.duration()) * 1_000 / u64::from(spec.sample_rate))
 }
 
+/// Renders the plan in process (`win::export`), on this thread; `background` lowers its
+/// priority like `taskpolicy -c utility` does for the helper.
+#[cfg(target_os = "windows")]
+fn run_helper(plan: &Path, background: bool, progress: &mut dyn FnMut(f32)) -> Result<Done> {
+    crate::win::export::run(plan, background, progress)
+}
+
 /// Runs `scrawl-helper export PLAN`, reading its JSON lines: `{"progress": f}` and a final
 /// `{"done": {...}}`.
+#[cfg(not(target_os = "windows"))]
 fn run_helper(plan: &Path, background: bool, progress: &mut dyn FnMut(f32)) -> Result<Done> {
     let helper = crate::helper::path()?;
     let mut command = if background {
@@ -454,6 +473,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn default_output_lands_in_movies_scrawl() {
         let path = default_output(Path::new("/x/scrawl-17-9.scrawl"));
         assert!(
@@ -461,5 +481,85 @@ mod tests {
             "{}",
             path.display()
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn default_output_lands_in_videos_scrawl() {
+        let path = default_output(Path::new("C:/x/scrawl-17-9.scrawl"));
+        assert!(path.ends_with("Scrawl/scrawl-17-9.mp4"), "{}", path.display());
+        assert!(path.parent().and_then(Path::parent) == dirs::video_dir().as_deref());
+    }
+
+    /// The plan `export` writes is the one the Windows renderer reads.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_windows_renderer_reads_the_plan() {
+        let mut b = bundle();
+        b.strokes.push(serde_json::from_value(serde_json::json!({
+            "t0": 5000, "t1": 5100, "fw": 2560, "fh": 1440, "pin": 2,
+            "pts": [1000, 500, 0]
+        }))
+        .unwrap());
+        let ink = ink::plan(&b, (2560, 1440), ink::Layers { ink: true, clicks: true });
+        assert!(!ink.strokes.is_empty() && !ink.pins.is_empty() && !ink.ripples.is_empty());
+        let crop = [0.1, 0.2, 0.9, 0.8];
+        let camera = camera_rows(&b, crop, (2560, 1440), 15_000);
+        let plan = Plan {
+            video: Path::new("C:/x/recording.mp4"),
+            out: Path::new("C:/x/out.partial.mp4"),
+            audio: Some(Path::new("C:/x/audio.wav")),
+            audio_start_ms: 100,
+            audio_length_ms: 14_900,
+            width: 1536,
+            height: 864,
+            fps: 30,
+            codec: "h264",
+            duration_ms: 15_000,
+            crop,
+            camera: Some(
+                camera
+                    .iter()
+                    .map(|k| {
+                        [
+                            k.t_ms,
+                            k.rect[0] as f64,
+                            k.rect[1] as f64,
+                            k.rect[2] as f64,
+                            k.rect[3] as f64,
+                        ]
+                    })
+                    .collect(),
+            ),
+            ink: &ink,
+        };
+        let json = serde_json::to_vec(&plan).unwrap();
+        let read = crate::win::export::plan::Plan::parse(&json).unwrap();
+        assert_eq!(read.video, Path::new("C:/x/recording.mp4"));
+        assert_eq!(read.audio.as_deref(), Some(Path::new("C:/x/audio.wav")));
+        assert_eq!((read.audio_start_ms, read.audio_length_ms), (100, 14_900));
+        assert_eq!((read.width, read.height, read.fps), (1536, 864, 30));
+        assert_eq!(read.frames(), 450);
+        assert_eq!(read.ink.strokes.len(), ink.strokes.len());
+        assert_eq!(read.ink.pins[0].n, 2);
+        assert_eq!(read.ink.ripples.len(), ink.ripples.len());
+        assert!((read.ink.k - f64::from(ink.k)).abs() < 1e-6);
+        let snap = &read.ink.strokes[0].snaps.last().unwrap();
+        assert_eq!(snap.poly.len(), ink.strokes[0].snaps.last().unwrap().poly.len());
+        // The camera rectangle comes back interpolated between the rows, held at both ends.
+        let rows = plan.camera.as_ref().unwrap();
+        let first = [rows[0][1], rows[0][2], rows[0][3], rows[0][4]];
+        assert_eq!(read.camera_rect(-5.0), first);
+        let mid = (rows[1][0] + rows[2][0]) / 2.0;
+        let rect = read.camera_rect(mid);
+        for i in 0..4 {
+            let want = (rows[1][i + 1] + rows[2][i + 1]) / 2.0;
+            assert!((rect[i] - want).abs() < 1e-9, "{rect:?}");
+        }
+        // Without a camera, the crop.
+        let still = Plan { camera: None, ..plan };
+        let read = crate::win::export::plan::Plan::parse(&serde_json::to_vec(&still).unwrap());
+        let rect = read.unwrap().camera_rect(3_000.0);
+        assert!((0..4).all(|i| (rect[i] - f64::from(crop[i])).abs() < 1e-6), "{rect:?}");
     }
 }

@@ -114,6 +114,24 @@ struct Transcriber {
     hex_enabled: bool,
     models: Vec<ModelOption>,
     speech: Speech,
+    claude_offered: bool,
+    claude_title: String,
+    claude_enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct LanguageOption {
+    id: String,
+    title: String,
+}
+
+/// `settings::LanguageView`: the Language popup.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+struct Language {
+    chosen: String,
+    options: Vec<LanguageOption>,
+    note: Option<String>,
 }
 
 /// `speech_model::Status`: the local model's download.
@@ -132,11 +150,13 @@ struct RetentionOption {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(rename_all = "camelCase", default)]
 struct Retention {
     preset: Option<String>,
     options: Vec<RetentionOption>,
     note: String,
+    delete_video: bool,
+    video_note: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -157,6 +177,7 @@ struct ViewState {
     auto_send: bool,
     shortcuts: Vec<Shortcut>,
     transcriber: Transcriber,
+    language: Option<Language>,
     video_export: bool,
     retention: Retention,
     captures_size: Option<String>,
@@ -1027,17 +1048,28 @@ impl SettingsWindow {
     fn recording_pane(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
         let t = &state.transcriber;
         let hex = t.engine == "hex";
+        let claude = t.engine == "claude";
         let local = crate::transcribe::LOCAL_ENGINE_TITLE;
-        let engines = vec![
+        let mut engines = vec![
             ("apple".to_owned(), local.to_owned(), true),
             ("hex".to_owned(), t.hex_title.clone(), t.hex_enabled),
         ];
+        if t.claude_offered {
+            engines.push(("claude".to_owned(), t.claude_title.clone(), t.claude_enabled));
+        }
+        let chosen_title = if hex {
+            "Hex"
+        } else if claude {
+            crate::transcribe::CLAUDE_ENGINE_TITLE
+        } else {
+            local
+        };
         let chosen = t.models.iter().find(|m| m.chosen);
         let mut rows = vec![row(
             theme,
             "Transcription",
             true,
-            popup(theme, "settings-transcriber", if hex { "Hex" } else { local }).on_click(
+            popup(theme, "settings-transcriber", chosen_title).on_click(
                 cx.listener({
                     let selected = t.engine.clone();
                     move |view, event: &ClickEvent, _, cx| {
@@ -1048,6 +1080,33 @@ impl SettingsWindow {
             ),
         )
         .into_any_element()];
+        if let Some(language) = &state.language {
+            let options: Vec<(String, String, bool)> = language
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.title.clone(), true))
+                .collect();
+            let title = language
+                .options
+                .iter()
+                .find(|o| o.id == language.chosen)
+                .map_or(language.chosen.clone(), |o| o.title.clone());
+            let selected = language.chosen.clone();
+            rows.push(
+                row(
+                    theme,
+                    "Language",
+                    true,
+                    popup(theme, "settings-language", &title).on_click(cx.listener(
+                        move |view, event: &ClickEvent, _, cx| {
+                            view.open_menu("language", options.clone(), Some(selected.clone()), event);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element(),
+            );
+        }
         if hex && !t.models.is_empty() {
             let options: Vec<(String, String, bool)> = t
                 .models
@@ -1076,6 +1135,9 @@ impl SettingsWindow {
             );
         }
         let note = match (WINDOWS, t.hex_enabled || hex) {
+            _ if claude => {
+                "Claude Code dictates while you record, through your claude.ai login, in the language chosen above. Word times are estimates. When it hears nothing or fails, Parakeet transcribes the recording."
+            }
             (true, true) => {
                 "Parakeet runs on this PC and times each word. Hex uses a model you have in Hex, and its word times are estimates."
             }
@@ -1112,11 +1174,18 @@ impl SettingsWindow {
             _ => None,
         };
         let video = state.video_export;
+        // Hex brings its own model; Parakeet's limits don't apply to it.
+        let language_note = state
+            .language
+            .as_ref()
+            .and_then(|l| l.note.clone())
+            .filter(|_| !hex);
         div()
             .flex()
             .flex_col()
             .child(group(theme, rows))
             .child(caption(theme, note, false))
+            .when_some(language_note, |pane, text| pane.child(caption(theme, &text, false)))
             .when_some(speech, |pane, (text, error)| {
                 pane.child(caption(theme, &text, error))
             })
@@ -1157,6 +1226,7 @@ impl SettingsWindow {
             .map(|o| (o.id.clone(), o.label.clone(), true))
             .collect();
         let selected = r.preset.clone();
+        let delete_video = r.delete_video;
         let show = if WINDOWS {
             "Show in File Explorer"
         } else {
@@ -1183,6 +1253,23 @@ impl SettingsWindow {
                 ],
             ))
             .when(!r.note.is_empty(), |d| d.child(caption(theme, &r.note, false)))
+            .child(group(
+                theme,
+                vec![
+                    row(
+                        theme,
+                        "Delete the video after each capture",
+                        true,
+                        switch(theme, "settings-delete-video", delete_video, true).on_click(
+                            cx.listener(move |view, _, _, _| {
+                                view.set("deleteVideo", (!delete_video).into());
+                            }),
+                        ),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+            .child(caption(theme, &r.video_note, false))
             .child(header(theme, "Captures"))
             .child(group(
                 theme,
@@ -1539,7 +1626,8 @@ impl SettingsWindow {
         let menu = self.menu.as_ref()?;
         let item_h = 26.0;
         let w = 220.0;
-        let h = menu.options.len() as f32 * item_h + 10.0;
+        // A long list (Language) scrolls inside the window.
+        let h = (menu.options.len() as f32 * item_h + 10.0).min(f32::from(viewport.height) - 16.0);
         let x = f32::from(menu.at.x).min(f32::from(viewport.width) - w - 8.0).max(8.0);
         let y = (f32::from(menu.at.y) - item_h * 0.5)
             .min(f32::from(viewport.height) - h - 8.0)
@@ -1552,6 +1640,8 @@ impl SettingsWindow {
             .left(px(x))
             .top(px(y))
             .w(px(w))
+            .max_h(px(h))
+            .overflow_y_scroll()
             .py(px(5.0))
             .rounded(px(8.0))
             .bg(theme.menu())
@@ -1573,6 +1663,7 @@ impl SettingsWindow {
                 div()
                     .id(("settings-menu-item", index))
                     .h(px(item_h))
+                    .flex_none()
                     .mx(px(5.0))
                     .px(px(8.0))
                     .rounded(px(5.0))
@@ -1737,3 +1828,59 @@ impl Render for SettingsWindow {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_language_row_reads_from_the_settings_view() {
+        let state: ViewState = serde_json::from_value(serde_json::json!({
+            "type": "state",
+            "language": {
+                "chosen": "de",
+                "options": [{"id": "en", "title": "English"}, {"id": "de", "title": "Deutsch"}],
+            },
+        }))
+        .unwrap();
+        let language = state.language.unwrap();
+        assert_eq!(language.chosen, "de");
+        assert_eq!(language.options[1].title, "Deutsch");
+        assert_eq!(language.note, None);
+        // Off Windows the view has no language row.
+        let state: ViewState = serde_json::from_value(serde_json::json!({"type": "state"})).unwrap();
+        assert!(state.language.is_none());
+    }
+
+    #[test]
+    fn the_storage_pane_reads_the_delete_video_switch_from_the_settings_view() {
+        let dir = std::env::temp_dir().join(format!(
+            "scrawl-settings-window-{}-{}",
+            std::process::id(),
+            crate::make_bundle_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"retention":{"keepVideo":false}}"#).unwrap();
+        let policy = crate::retention::Policy::load_from(&config);
+        let _ = std::fs::remove_dir_all(&dir);
+        // What `settings::Panel::view` sends for that policy, as the window reads it.
+        let sent = serde_json::json!({
+            "retention": crate::settings::RetentionView {
+                preset: Some("week"),
+                options: Vec::new(),
+                note: String::new(),
+                delete_video: !policy.keep_video,
+                video_note: crate::settings::DELETE_VIDEO_NOTE,
+            },
+        });
+        let state: ViewState = serde_json::from_value(sent).unwrap();
+        assert!(state.retention.delete_video);
+        assert_eq!(state.retention.preset.as_deref(), Some("week"));
+        assert!(state.retention.video_note.contains("not to the Recycle Bin"));
+        // An older view without the switch reads as keeping videos.
+        let state: ViewState =
+            serde_json::from_value(serde_json::json!({"retention": {"note": ""}})).unwrap();
+        assert!(!state.retention.delete_video);
+    }
+}
