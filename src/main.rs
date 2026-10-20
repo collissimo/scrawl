@@ -1579,6 +1579,7 @@ fn main() -> Result<()> {
                 note,
                 activity,
             )?;
+            retention::after_capture(&bundle_dir);
             print!("{summary}");
             Ok(())
         }
@@ -2024,6 +2025,9 @@ fn main() -> Result<()> {
                     }
                     retention::Action::Shrink { video, .. } => {
                         format!("shrink       {}", video.display())
+                    }
+                    retention::Action::DeleteVideo { video, .. } => {
+                        format!("delete video {}", video.display())
                     }
                 };
                 println!("{line}");
