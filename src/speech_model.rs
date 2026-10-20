@@ -84,8 +84,15 @@ fn update(change: impl FnOnce(&mut Status)) {
 }
 
 /// Checks the model in the background and installs it if it's missing, unless the transcriber
-/// is Hex (whose users don't need it) or a check is already running. Cheap to call again.
+/// is Hex (whose users don't need it) or a check is already running. Cheap to call again. On
+/// Windows the first call also starts `watch`, so a language changed anywhere (Settings, the
+/// tray, a hand edit of `config.json`) gets its model at once, not at the next capture.
 pub fn ensure() {
+    #[cfg(target_os = "windows")]
+    {
+        static WATCH: std::sync::Once = std::sync::Once::new();
+        WATCH.call_once(watch);
+    }
     if crate::transcribe::Engine::configured() == crate::transcribe::Engine::Hex {
         return;
     }
@@ -115,6 +122,46 @@ fn settled(status: &Status) -> bool {
         State::Ready => true,
         _ => false,
     }
+}
+
+/// What `watch` compares between checks: the language and the configured engine.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+type Watched = (String, crate::transcribe::Engine);
+
+/// Every 5 s, calls `ensure` when the language or the engine changed, or when the model is
+/// ready for a language that's no longer chosen (it changed while a download ran). A failed
+/// download isn't retried here: `work` has its own waits, and then stops until the next launch.
+#[cfg(target_os = "windows")]
+fn watch() {
+    let spawned = std::thread::Builder::new()
+        .name("scrawl-speech-watch".into())
+        .spawn(|| {
+            let mut last = Some(watched());
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if should_ensure(&mut last, watched(), &current()) {
+                    ensure();
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        crate::capture::scrawl_log(format!("speech model: the watcher didn't start: {error}"));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn watched() -> Watched {
+    (
+        crate::handoff::transcription_language(),
+        crate::transcribe::Engine::configured(),
+    )
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn should_ensure(last: &mut Option<Watched>, now: Watched, status: &Status) -> bool {
+    let changed = last.as_ref() != Some(&now);
+    *last = Some(now);
+    changed || (status.state == State::Ready && !settled(status))
 }
 
 fn work() {
@@ -298,6 +345,35 @@ mod tests {
         assert!(settled(&status(State::Unavailable, "xx")));
         assert!(!settled(&status(State::Downloading, &language)));
         assert!(!settled(&status(State::Failed, &language)));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_watcher_checks_again_when_the_language_or_engine_changes() {
+        use crate::transcribe::Engine;
+        let language = crate::handoff::transcription_language();
+        let status = |state: State, locale: &str| Status {
+            state,
+            locale: Some(locale.into()),
+            ..Default::default()
+        };
+        let ready = status(State::Ready, &language);
+        let failed = status(State::Failed, &language);
+        let mut last = Some((language.clone(), Engine::Apple));
+        // Nothing changed: no check, not even to retry a failed download.
+        assert!(!should_ensure(&mut last, (language.clone(), Engine::Apple), &ready));
+        assert!(!should_ensure(&mut last, (language.clone(), Engine::Apple), &failed));
+        // The language changed (Settings, the tray or config.json): check once.
+        assert!(should_ensure(&mut last, ("xx".into(), Engine::Apple), &failed));
+        assert!(!should_ensure(&mut last, ("xx".into(), Engine::Apple), &failed));
+        // Hex to Claude Code, which falls back to the local model.
+        assert!(should_ensure(&mut last, ("xx".into(), Engine::Claude), &failed));
+        // A download for the old language finished after the change: check again.
+        assert!(should_ensure(
+            &mut last,
+            ("xx".into(), Engine::Claude),
+            &status(State::Ready, "xx-old")
+        ));
     }
 
     #[test]
