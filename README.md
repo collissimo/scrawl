@@ -625,7 +625,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kitlangton.scrawl.se
 sync, the red ink, pins, laser and click ripples burned in at the times they happened, cropped to
 where the activity was. It runs in `scrawl-helper` on AVFoundation (hardware decode and encode, Core
 Image for the crop, Core Graphics for the ink), so nothing is decoded into Rust and ffmpeg isn't
-needed.
+needed. On Windows it renders the same plan in process with Media Foundation (H.264 only) and
+writes to `Videos\Scrawl\<bundle>.mp4` by default.
 
 ```sh
 scrawl export latest                              # ~/Movies/Scrawl/<bundle>.mp4
@@ -797,8 +798,10 @@ system owns differ:
   can run `scrawl`.
 - **agentContext:** what clicks and marks land on comes from UI Automation, as it does from the
   Accessibility tree on macOS.
-- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), video
-  export, Sparkle updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
+- **Video export:** `scrawl export` and the menu's **Export Last Capture as Video…** render in
+  process through Media Foundation (H.264 and AAC, no HEVC) into `Videos\Scrawl`.
+- **Not on Windows:** the cabled iPhone (it needs AVFoundation's screen capture devices), Sparkle
+  updates (**Check for Updates…** opens the releases page) and the dev-site tab URL
   (`/sdk.js` registrations still route).
 - **Releases:** a `v*` tag builds `Scrawl-<version>-windows-x64.zip` on GitHub Actions
   (`.github/workflows/release-windows.yml`) and attaches it to the release. It isn't code-signed
