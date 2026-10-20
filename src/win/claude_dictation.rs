@@ -870,7 +870,9 @@ fn dictate(
     released: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<Heard> {
-    if let Some(reason) = other_microphone() {
+    if let Some(reason) = unsupported_language(&crate::handoff::transcription_language())
+        .or_else(other_microphone)
+    {
         static LOGGED: Mutex<Option<String>> = Mutex::new(None);
         let mut logged = LOGGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if logged.as_deref() != Some(reason.as_str()) {
@@ -930,6 +932,13 @@ impl std::fmt::Display for Skipped {
 }
 
 impl std::error::Error for Skipped {}
+
+/// Why Claude Code can't dictate `language`, if it can't: it would dictate English instead
+/// (Settings and the tray grey the choice out, but a hand-edited config can still pick it).
+fn unsupported_language(language: &str) -> Option<String> {
+    (!crate::win::languages::claude_supports(language))
+        .then(|| format!("it can't dictate {}", crate::win::languages::name(language)))
+}
 
 /// Why Claude Code would hear another microphone than the recording, if it would: it always
 /// records the system default, and Scrawl records the one chosen in Settings (or the default
@@ -1154,6 +1163,16 @@ mod tests {
         // `AudioRecorder::stop` has emptied the buffer: never "listening from the start".
         samples.lock().unwrap().clear();
         assert_eq!(hearing_point(&samples, &released), None);
+    }
+
+    #[test]
+    fn claude_is_skipped_for_a_language_it_cannot_dictate() {
+        assert_eq!(unsupported_language("de"), None);
+        assert_eq!(unsupported_language("en"), None);
+        assert_eq!(
+            unsupported_language("fi").as_deref(),
+            Some("it can't dictate Suomi")
+        );
     }
 
     #[test]
