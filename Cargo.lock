@@ -4725,6 +4725,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tiny-skia",
  "transcribe-cpp",
  "tray-icon",
  "windows 0.61.3",
