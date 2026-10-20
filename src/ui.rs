@@ -2935,6 +2935,7 @@ impl ScrawlCoordinator {
                     if let Some(dest) = bundle.destination.clone() {
                         coord.send_completed(dir.clone(), dest, cx);
                     }
+                    crate::retention::after_capture(&dir);
                     coord.set_review_bundle((dir.clone(), bundle), coord.completed_note.clone());
                     if let Some((judgement, url)) = judged {
                         coord.act_on_route(dir, judgement, url, cx);

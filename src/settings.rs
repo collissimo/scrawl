@@ -4,7 +4,8 @@
 //! and its `0600` mode (it holds the ingest token).
 //!
 //! Panes: General (launch at login, sending dev-site captures, the two shortcuts), Recording
-//! (transcriber, video export), Storage (how long recordings are kept), Permissions (the
+//! (transcriber, video export), Storage (how long recordings are kept, deleting each capture's
+//! video), Permissions (the
 //! onboarding checklist, to fix things later), Agents (`scrawl` on PATH, the skill's install
 //! command) and About.
 //!
@@ -833,12 +834,22 @@ pub struct ModelView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RetentionView {
     /// The chosen preset, or `None` for a policy written by hand.
     pub preset: Option<&'static str>,
     pub options: Vec<OptionView>,
     pub note: String,
+    /// "Delete the video after each capture" (`"keepVideo": false`).
+    pub delete_video: bool,
+    pub video_note: &'static str,
 }
+
+/// Under the "Delete the video after each capture" switch.
+pub const DELETE_VIDEO_NOTE: &str = "A minute after each capture is processed, its video is \
+    deleted for good, not to the Recycle Bin. Its frames, contact sheet, text and audio stay; \
+    zooming in, re-cutting keyframes and video export then no longer work for it. Applies to \
+    new captures.";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OptionView {
@@ -878,8 +889,8 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
     } else {
         "Trash"
     };
-    match (policy.media_days, policy.bundle_days) {
-        (None, None) => String::new(),
+    let what = match (policy.media_days, policy.bundle_days) {
+        (None, None) => return String::new(),
         (Some(media), Some(bundle)) => format!(
             "Video and audio go to the {bin} after {}, the rest of each capture after {}.",
             days(media),
@@ -887,7 +898,8 @@ fn retention_note(policy: &crate::retention::Policy) -> String {
         ),
         (Some(media), None) => format!("Video and audio go to the {bin} after {}.", days(media)),
         (None, Some(bundle)) => format!("Captures go to the {bin} after {}.", days(bundle)),
-    }
+    };
+    format!("{what} The disk space comes back once the {bin} is emptied.")
 }
 
 fn shortcut_view(
@@ -920,7 +932,8 @@ fn shortcut_view(
 pub enum Action {
     /// A toggle or popup: `launchAtLogin`, `autoSend`, `videoExport` (bool), `microphone`
     /// ("default" or a device id), `transcriber` ("apple"/"hex"/"claude"), `hexModel` (an id),
-    /// `language` (a code from `LanguageView::options`), `retention` (a preset id).
+    /// `language` (a code from `LanguageView::options`), `retention` (a preset id),
+    /// `deleteVideo` (bool).
     Set {
         key: String,
         value: serde_json::Value,
@@ -1164,11 +1177,22 @@ impl Panel {
                     .into_iter()
                     .find(|p| preset_id(*p) == id)
                 {
-                    if let Err(error) = preset.policy().save_to(&path) {
+                    let policy = crate::retention::Policy::load_from(&path).with_preset(preset);
+                    if let Err(error) = policy.save_to(&path) {
                         crate::capture::scrawl_log(format!("Saving retention failed: {error:#}"));
                     }
                     return Effect::Measure;
                 }
+            }
+            ("deleteVideo", serde_json::Value::Bool(on)) => {
+                let policy = crate::retention::Policy {
+                    keep_video: !on,
+                    ..crate::retention::Policy::load_from(&path)
+                };
+                if let Err(error) = policy.save_to(&path) {
+                    crate::capture::scrawl_log(format!("Saving keepVideo failed: {error:#}"));
+                }
+                return Effect::Measure;
             }
             _ => crate::capture::scrawl_log(format!("Settings: ignoring {key}={value}")),
         }
@@ -1288,6 +1312,8 @@ impl Panel {
                     })
                     .collect(),
                 note: retention_note(&policy),
+                delete_video: !policy.keep_video,
+                video_note: DELETE_VIDEO_NOTE,
             },
             captures_size: self.captures_size.map(crate::retention::format_bytes),
             permissions: order
@@ -2136,13 +2162,33 @@ mod tests {
         let view = panel.view(&host);
         assert!(!view.auto_send && view.video_export);
         assert_eq!(view.retention.preset, Some("month"));
+        let bin = if WIN { "Recycle Bin" } else { "Trash" };
         assert_eq!(
             view.retention.note,
             format!(
-                "Video and audio go to the {} after 30 days, the rest of each capture after 90 days.",
-                if WIN { "Recycle Bin" } else { "Trash" }
+                "Video and audio go to the {bin} after 30 days, the rest of each capture after 90 days. The disk space comes back once the {bin} is emptied."
             )
         );
+        assert!(!view.retention.delete_video, "videos are kept by default");
+        // Deleting each video is its own switch: it keeps the preset, and the preset keeps it.
+        assert_eq!(
+            set(&mut panel, &mut host, "deleteVideo", true.into()),
+            Effect::Measure
+        );
+        assert_eq!(read_json(&host.path)["retention"]["keepVideo"], false);
+        let view = panel.view(&host);
+        assert!(view.retention.delete_video);
+        assert_eq!(view.retention.preset, Some("month"));
+        assert!(view.retention.video_note.contains("deleted for good"));
+        set(&mut panel, &mut host, "retention", "week".into());
+        let view = panel.view(&host);
+        assert!(view.retention.delete_video);
+        assert_eq!(view.retention.preset, Some("week"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["retention"]["deleteVideo"], true);
+        set(&mut panel, &mut host, "deleteVideo", false.into());
+        assert_eq!(read_json(&host.path)["retention"]["keepVideo"], true);
+        set(&mut panel, &mut host, "retention", "month".into());
         let config = read_json(&host.path);
         assert_eq!(config["transcriber"], "hex");
         assert_eq!(config["ingestToken"], "secret");

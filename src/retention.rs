@@ -10,6 +10,11 @@
 //!
 //! Cabled-iPhone videos are also re-encoded to HEVC at the size keyframes use (`shrink`), which
 //! makes them about ten times smaller.
+//!
+//! With `"keepVideo": false` (Settings › Storage › Delete the video after each capture), each
+//! finished capture is marked (`.drop-video`) and its video deleted for good, not to the Trash:
+//! a minute later or, while a guard above still holds the bundle, by a later pass. Its frames,
+//! contact sheet, text and `audio.wav` stay.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -30,6 +35,8 @@ pub const PINNED: &str = ".pinned";
 pub const MEDIA_SENDING: &str = ".media-sending";
 /// Written when the heavy media went to the Trash: when, and after how many days.
 pub const MEDIA_CLEANED: &str = ".media-cleaned";
+/// Marks a capture finished with `keepVideo` off: its video is deleted once nothing needs it.
+pub const DROP_VIDEO: &str = ".drop-video";
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// A sync marker older than this belongs to a copy that died.
@@ -42,8 +49,11 @@ const SHRINK_ABOVE_BPS: u64 = 6_000_000;
 /// How long after a capture its video is shrunk, so pasting and sending go first.
 const SHRINK_DELAY: Duration = Duration::from_secs(60);
 /// A daily pass shrinks bundles left alone this long (a capture whose shrink was missed, or one
-/// copied from another Mac).
+/// copied from another Mac), and deletes their marked videos.
 const SHRINK_SETTLE_MS: u64 = 10 * 60 * 1000;
+/// How long after a capture its video is deleted (`keepVideo` off), so pasting, sending and a
+/// first look go first.
+const DROP_VIDEO_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +64,13 @@ pub struct Policy {
     /// Days to keep the bundle itself; `None` keeps it.
     #[serde(default = "default_bundle_days")]
     pub bundle_days: Option<u32>,
+    /// `false` deletes each new capture's video for good once the capture is finished.
+    #[serde(default = "default_keep_video")]
+    pub keep_video: bool,
+}
+
+fn default_keep_video() -> bool {
+    true
 }
 
 fn default_media_days() -> Option<u32> {
@@ -98,13 +115,26 @@ impl Preset {
         Policy {
             media_days,
             bundle_days,
+            keep_video: true,
         }
     }
 }
 
 impl Policy {
+    /// The preset with these days (`keepVideo` is a switch of its own).
     pub fn preset(&self) -> Option<Preset> {
-        Preset::ALL.into_iter().find(|p| p.policy() == *self)
+        Preset::ALL.into_iter().find(|p| {
+            let days = p.policy();
+            (days.media_days, days.bundle_days) == (self.media_days, self.bundle_days)
+        })
+    }
+
+    /// This policy with `preset`'s days.
+    pub fn with_preset(self, preset: Preset) -> Self {
+        Self {
+            keep_video: self.keep_video,
+            ..preset.policy()
+        }
     }
 
     pub fn load() -> Self {
@@ -214,6 +244,8 @@ pub enum Action {
     TrashBundle(PathBuf),
     /// Re-encode the bundle's iPhone video.
     Shrink { bundle: PathBuf, video: PathBuf },
+    /// Delete the video of a capture finished with `keepVideo` off, for good.
+    DeleteVideo { bundle: PathBuf, video: PathBuf },
 }
 
 fn modified_ago(path: &Path, now: SystemTime) -> Option<Duration> {
@@ -297,8 +329,11 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
         if !settled(SHRINK_SETTLE_MS) {
             continue;
         }
+        let doomed = video_to_delete(&dir, &manifest, policy);
         if !settled(DAY_MS) {
-            if let Some(video) = shrinkable(&dir, &manifest) {
+            if let Some(video) = doomed {
+                actions.push(Action::DeleteVideo { bundle: dir, video });
+            } else if let Some(video) = shrinkable(&dir, &manifest) {
                 actions.push(Action::Shrink { bundle: dir, video });
             }
             continue;
@@ -306,6 +341,10 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
         let due = |days: Option<u32>| days.is_some_and(|d| age_ms >= u64::from(d.max(1)) * DAY_MS);
         if due(policy.bundle_days) {
             actions.push(Action::TrashBundle(dir));
+            continue;
+        }
+        if let Some(video) = doomed {
+            actions.push(Action::DeleteVideo { bundle: dir, video });
             continue;
         }
         if due(policy.media_days) {
@@ -324,6 +363,15 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
         }
     }
     actions
+}
+
+/// The video of a capture marked `DROP_VIDEO`, while `keepVideo` is off.
+fn video_to_delete(dir: &Path, manifest: &Manifest, policy: &Policy) -> Option<PathBuf> {
+    if policy.keep_video || !dir.join(DROP_VIDEO).exists() {
+        return None;
+    }
+    let video = dir.join(manifest.video.as_deref().unwrap_or("recording.mp4"));
+    video.is_file().then_some(video)
 }
 
 /// A cabled-iPhone video recorded at native size and rate.
@@ -413,6 +461,7 @@ pub struct Report {
     pub bundles_trashed: usize,
     pub freed: u64,
     pub shrunk: usize,
+    pub videos_deleted: usize,
     pub errors: usize,
 }
 
@@ -440,11 +489,15 @@ fn trash_media(bundle: &Path, items: &[PathBuf], days: u32, trasher: Trasher) ->
         std::fs::rename(item, staging.join(file))?;
         moved.push(file.to_string_lossy().into_owned());
     }
-    let note = serde_json::json!({
+    let mut note = serde_json::json!({
         "cleanedAtMs": crate::now_epoch_ms(),
         "afterDays": days,
         "trashed": moved,
     });
+    // The video went earlier, deleted after the capture.
+    if deleted_after_capture(bundle) {
+        note["afterCapture"] = true.into();
+    }
     std::fs::write(
         bundle.join(MEDIA_CLEANED),
         serde_json::to_vec_pretty(&note)?,
@@ -462,7 +515,8 @@ pub fn apply(actions: &[Action], policy: &Policy, trasher: Trasher, shrink: bool
         let bundle = match action {
             Action::TrashMedia { bundle, .. }
             | Action::TrashBundle(bundle)
-            | Action::Shrink { bundle, .. } => bundle,
+            | Action::Shrink { bundle, .. }
+            | Action::DeleteVideo { bundle, .. } => bundle,
         };
         let Some(_claim) = claim(bundle) else {
             continue;
@@ -501,6 +555,10 @@ pub fn apply(actions: &[Action], policy: &Policy, trasher: Trasher, shrink: bool
                 })
             }
             Action::Shrink { .. } => Ok(()),
+            Action::DeleteVideo { bundle, video } => delete_video(bundle, video).map(|freed| {
+                report.videos_deleted += 1;
+                report.freed += freed;
+            }),
         };
         if let Err(error) = result {
             report.errors += 1;
@@ -575,6 +633,95 @@ pub fn shrink_video(bundle: &Path, video: &Path) -> Result<Option<Shrunk>> {
     Ok(Some(shrunk))
 }
 
+/// Deletes `video` (inside `bundle`) for good and notes it in `MEDIA_CLEANED`, so whatever
+/// needs the video can say why it's gone.
+fn delete_video(bundle: &Path, video: &Path) -> Result<u64> {
+    let size = size_of(video);
+    std::fs::remove_file(video).with_context(|| format!("Could not delete {}", video.display()))?;
+    let name = video
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let note = serde_json::json!({
+        "cleanedAtMs": crate::now_epoch_ms(),
+        "afterCapture": true,
+        "deleted": [name],
+    });
+    std::fs::write(
+        bundle.join(MEDIA_CLEANED),
+        serde_json::to_vec_pretty(&note)?,
+    )?;
+    let _ = std::fs::remove_file(bundle.join(DROP_VIDEO));
+    scrawl_log(format!(
+        "retention: deleted {} ({}) after the capture",
+        video.display(),
+        format_bytes(size)
+    ));
+    Ok(size)
+}
+
+fn deleted_after_capture(bundle: &Path) -> bool {
+    std::fs::read(bundle.join(MEDIA_CLEANED))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|note| note["afterCapture"] == true)
+}
+
+/// Marks a just-finished capture for deleting its video, when `policy` doesn't keep videos.
+fn mark_for_deletion(bundle: &Path, policy: &Policy) -> bool {
+    if policy.keep_video || !bundle.is_dir() {
+        return false;
+    }
+    match std::fs::write(bundle.join(DROP_VIDEO), "") {
+        Ok(()) => true,
+        Err(error) => {
+            scrawl_log(format!("retention: {}: {error:#}", bundle.display()));
+            false
+        }
+    }
+}
+
+/// Deletes a marked capture's video unless something still needs it. `Err` while it's waiting
+/// to be delivered, copying or claimed (try again later); a pinned bundle keeps its video.
+fn delete_video_now(dir: &Path, policy: &Policy) -> std::result::Result<(), ()> {
+    if !dir.join(DROP_VIDEO).exists() {
+        return Ok(());
+    }
+    if policy.keep_video {
+        // Switched back on meanwhile.
+        let _ = std::fs::remove_file(dir.join(DROP_VIDEO));
+        return Ok(());
+    }
+    if dir.join(PINNED).exists() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    if dir.join(crate::delivery::PENDING).exists()
+        || live_marker(dir, crate::handoff::MEDIA_PENDING, now)
+        || live_marker(dir, MEDIA_SENDING, now)
+    {
+        return Err(());
+    }
+    let Some(_claim) = claim(dir) else {
+        return Err(());
+    };
+    let manifest: Manifest = std::fs::read(dir.join("scrawl.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    match video_to_delete(dir, &manifest, policy) {
+        Some(video) => {
+            if let Err(error) = delete_video(dir, &video) {
+                scrawl_log(format!("retention: {}: {error:#}", dir.display()));
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(dir.join(DROP_VIDEO));
+        }
+    }
+    Ok(())
+}
+
 /// Removes what a crash mid-cleanup or mid-shrink left beside the bundles.
 fn sweep_leftovers(captures: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(captures) else {
@@ -610,10 +757,11 @@ pub fn run_pass(
     let report = apply(&actions, policy, &trash, true);
     if report != Report::default() {
         scrawl_log(format!(
-            "retention: media of {} bundle(s) and {} whole bundle(s) to the Trash, {} video(s) shrunk, {} freed, {} error(s)",
+            "retention: media of {} bundle(s) and {} whole bundle(s) to the Trash, {} video(s) shrunk, {} deleted after their capture, {} freed, {} error(s)",
             report.media_trashed,
             report.bundles_trashed,
             report.shrunk,
+            report.videos_deleted,
             format_bytes(report.freed),
             report.errors
         ));
@@ -625,17 +773,29 @@ pub fn run_pass(
 pub fn missing_media_reason(dir: &Path) -> Option<String> {
     let note: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join(MEDIA_CLEANED)).ok()?).ok()?;
+    if note["afterCapture"] == true {
+        return Some(
+            "The bundle's video was deleted after the capture (Settings › Storage › Delete the \
+             video after each capture); its frames, contact sheet, text and audio are kept"
+                .to_owned(),
+        );
+    }
     let days = note
         .get("afterDays")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let (bin, setting) = if cfg!(windows) {
+        ("Recycle Bin", "Settings › Storage › Keep recordings")
+    } else {
+        ("Trash", "Scrawl menu › Keep Recordings")
+    };
     Some(if days > 0 {
         format!(
-            "The bundle's video was cleaned up after {days} days and is in the Trash \
-             (Scrawl menu › Keep Recordings sets how long video is kept)"
+            "The bundle's video was cleaned up after {days} days and is in the {bin} \
+             ({setting} sets how long video is kept)"
         )
     } else {
-        "The bundle's video was cleaned up and is in the Trash".to_owned()
+        format!("The bundle's video was cleaned up and is in the {bin}")
     })
 }
 
@@ -644,6 +804,7 @@ pub fn missing_media_reason(dir: &Path) -> Option<String> {
 enum Job {
     Pass,
     Shrink(PathBuf),
+    DeleteVideo(PathBuf),
 }
 
 static WORKER: std::sync::OnceLock<flume::Sender<Job>> = std::sync::OnceLock::new();
@@ -680,6 +841,24 @@ pub fn nudge() {
     }
 }
 
+/// A capture is finished: frames, contact sheet, text and transcript are written. With
+/// `keepVideo` off its video is deleted: a minute later in the app, right away from the command
+/// line, and by a later pass while it's still being delivered or copied.
+pub fn after_capture(bundle: &Path) {
+    let policy = Policy::load();
+    if !mark_for_deletion(bundle, &policy) {
+        return;
+    }
+    match WORKER.get() {
+        Some(worker) => {
+            let _ = worker.send(Job::DeleteVideo(bundle.to_path_buf()));
+        }
+        None => {
+            let _ = delete_video_now(bundle, &policy);
+        }
+    }
+}
+
 /// Queues a just-finished iPhone capture for shrinking (only in the app).
 pub fn after_phone_capture(bundle: &Path) {
     if let Some(worker) = WORKER.get() {
@@ -692,12 +871,14 @@ fn worker(jobs: &flume::Receiver<Job>) {
     let captures = crate::handoff::default_captures_dir();
     let mut next_pass = Instant::now() + Duration::from_secs(90);
     let mut last_pass: Option<SystemTime> = None;
-    let mut shrinks: Vec<(Instant, Instant, PathBuf)> = Vec::new();
+    // Shrinks and video deletions waiting: when, when to give up, the bundle, and whether it's
+    // a deletion.
+    let mut shrinks: Vec<(Instant, Instant, PathBuf, bool)> = Vec::new();
     loop {
         let now = Instant::now();
         let wake = shrinks
             .iter()
-            .map(|(due, _, _)| *due)
+            .map(|(due, ..)| *due)
             .chain([next_pass])
             .min()
             .unwrap_or(next_pass);
@@ -708,23 +889,32 @@ fn worker(jobs: &flume::Receiver<Job>) {
             Ok(Job::Pass) => next_pass = Instant::now() + Duration::from_secs(5),
             Ok(Job::Shrink(dir)) => {
                 let due = Instant::now() + SHRINK_DELAY;
-                shrinks.push((due, due + Duration::from_secs(2 * 3600), dir));
+                shrinks.push((due, due + Duration::from_secs(2 * 3600), dir, false));
+            }
+            Ok(Job::DeleteVideo(dir)) => {
+                let due = Instant::now() + DROP_VIDEO_DELAY;
+                shrinks.push((due, due + Duration::from_secs(2 * 3600), dir, true));
             }
             Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => return,
         }
         let now = Instant::now();
         let mut later = Vec::new();
-        for (due, give_up, dir) in shrinks.drain(..) {
+        for (due, give_up, dir, delete) in shrinks.drain(..) {
             if due > now {
-                later.push((due, give_up, dir));
+                later.push((due, give_up, dir, delete));
                 continue;
             }
-            match shrink_now(&dir) {
-                // Busy: a capture is running or the media is still copying. Try again soon; a
-                // daily pass catches anything that gives up.
+            let done = if delete {
+                delete_video_now(&dir, &Policy::load())
+            } else {
+                shrink_now(&dir)
+            };
+            match done {
+                // Busy: a capture is running, the media is still copying or waiting to be
+                // delivered. Try again soon; a daily pass catches anything that gives up.
                 Err(()) if now < give_up => {
-                    later.push((now + Duration::from_secs(30), give_up, dir))
+                    later.push((now + Duration::from_secs(30), give_up, dir, delete))
                 }
                 _ => {}
             }
@@ -881,7 +1071,8 @@ mod tests {
             loaded,
             Policy {
                 media_days: None,
-                bundle_days: Some(30)
+                bundle_days: Some(30),
+                keep_video: true,
             }
         );
         assert_eq!(loaded.preset(), None);
@@ -897,7 +1088,8 @@ mod tests {
             Policy::load_from(&path),
             Policy {
                 media_days: Some(30),
-                bundle_days: Some(90)
+                bundle_days: Some(90),
+                keep_video: true,
             }
         );
     }
@@ -929,6 +1121,7 @@ mod tests {
         let short = Policy {
             media_days: Some(0),
             bundle_days: None,
+            keep_video: true,
         };
         assert_eq!(planned(&tmp.0, &short).len(), 3);
     }
@@ -1064,6 +1257,7 @@ mod tests {
         let short = Policy {
             media_days: Some(1),
             bundle_days: None,
+            keep_video: true,
         };
         assert!(
             planned(&tmp.0, &short)
@@ -1076,5 +1270,167 @@ mod tests {
     fn sizes_read_plainly() {
         assert_eq!(format_bytes(72_247_194), "72 MB");
         assert_eq!(format_bytes(2_512_000_000), "2.5 GB");
+    }
+
+    fn without_video() -> Policy {
+        Policy {
+            keep_video: false,
+            ..Policy::default()
+        }
+    }
+
+    #[test]
+    fn keep_video_is_its_own_switch_beside_the_presets() {
+        let tmp = TempDir::new("keep-video");
+        let path = tmp.0.join("config.json");
+        assert!(Policy::load_from(&path).keep_video, "kept unless switched off");
+        std::fs::write(&path, r#"{"ingestToken":"abc","retention":{"keepVideo":false}}"#).unwrap();
+        let loaded = Policy::load_from(&path);
+        assert_eq!(loaded, without_video());
+        assert_eq!(loaded.preset(), Some(Preset::Week), "the days still read as Week");
+        let month = loaded.with_preset(Preset::Month);
+        assert_eq!(
+            (month.media_days, month.bundle_days, month.keep_video),
+            (Some(30), Some(90), false)
+        );
+        month.save_to(&path).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["retention"]["keepVideo"], false);
+        assert_eq!(config["ingestToken"], "abc");
+        assert_eq!(Policy::load_from(&path), month);
+        // A bad value drops the whole key back to the defaults, like before.
+        std::fs::write(&path, r#"{"retention":{"keepVideo":"no"}}"#).unwrap();
+        assert_eq!(Policy::load_from(&path), Policy::default());
+    }
+
+    #[test]
+    fn a_marked_capture_loses_only_its_video_and_for_good() {
+        let tmp = TempDir::new("drop");
+        let fresh = bundle(&tmp.0, "scrawl-fresh", 0.5, false);
+        let unmarked = bundle(&tmp.0, "scrawl-unmarked", 0.5, false);
+        assert!(!mark_for_deletion(&fresh, &Policy::default()), "videos are kept");
+        assert!(!fresh.join(DROP_VIDEO).exists());
+        assert!(mark_for_deletion(&fresh, &without_video()));
+        // Only captures finished with the switch off; older videos follow the days.
+        assert_eq!(
+            planned(&tmp.0, &without_video()),
+            vec![Action::DeleteVideo {
+                bundle: fresh.clone(),
+                video: fresh.join("recording.mp4")
+            }]
+        );
+        assert!(planned(&tmp.0, &Policy::default()).is_empty());
+        assert_eq!(delete_video_now(&fresh, &without_video()), Ok(()));
+        assert!(!fresh.join("recording.mp4").exists());
+        assert!(!fresh.join(DROP_VIDEO).exists());
+        for kept in [
+            "scrawl.json",
+            "summary.md",
+            "contact-sheet.png",
+            "frames/frame-01.png",
+            "audio.wav",
+        ] {
+            assert!(fresh.join(kept).is_file(), "{kept} kept");
+        }
+        assert!(unmarked.join("recording.mp4").is_file());
+        assert!(!tmp.0.join(".trash-staging").exists(), "not via the Trash");
+        let reason = missing_media_reason(&fresh).unwrap();
+        assert!(reason.contains("deleted after the capture"), "{reason}");
+        assert!(planned(&tmp.0, &without_video()).is_empty(), "nothing left to do");
+    }
+
+    #[test]
+    fn delivery_copies_and_claims_hold_the_video_until_a_later_pass() {
+        let tmp = TempDir::new("drop-guards");
+        let off = without_video();
+        let undelivered = bundle(&tmp.0, "scrawl-undelivered", 0.5, false);
+        let sending = bundle(&tmp.0, "scrawl-sending", 0.5, false);
+        let busy = bundle(&tmp.0, "scrawl-busy", 0.5, false);
+        let pinned = bundle(&tmp.0, "scrawl-pinned", 0.5, false);
+        for dir in [&undelivered, &sending, &busy, &pinned] {
+            assert!(mark_for_deletion(dir, &off));
+        }
+        std::fs::write(undelivered.join(crate::delivery::PENDING), "{}").unwrap();
+        marker(&sending, MEDIA_SENDING, SystemTime::now());
+        std::fs::write(pinned.join(PINNED), "").unwrap();
+        let held = claim(&busy).unwrap();
+        assert_eq!(delete_video_now(&undelivered, &off), Err(()));
+        assert_eq!(delete_video_now(&sending, &off), Err(()));
+        assert_eq!(delete_video_now(&busy, &off), Err(()));
+        assert_eq!(delete_video_now(&pinned, &off), Ok(()), "pinned: nothing to retry");
+        for dir in [&undelivered, &sending, &busy, &pinned] {
+            assert!(dir.join("recording.mp4").is_file(), "{} kept", dir.display());
+            assert!(dir.join(DROP_VIDEO).exists(), "{} still marked", dir.display());
+        }
+        // Only the copy's marker has gone stale by the time of the pass.
+        assert_eq!(
+            planned(&tmp.0, &off),
+            vec![Action::DeleteVideo {
+                bundle: sending.clone(),
+                video: sending.join("recording.mp4")
+            }]
+        );
+        // Delivered, and the claim let go: the next pass deletes those two.
+        std::fs::remove_file(undelivered.join(crate::delivery::PENDING)).unwrap();
+        drop(held);
+        let actions = planned(&tmp.0, &off);
+        assert_eq!(actions.len(), 3);
+        let trash_nothing = |path: &Path| -> Result<()> {
+            panic!("{} sent to the Trash", path.display());
+        };
+        let report = apply(&actions, &off, &trash_nothing, false);
+        assert_eq!((report.videos_deleted, report.errors), (2, 0), "{report:?}");
+        assert_eq!(report.freed, 2000);
+        assert!(!undelivered.join("recording.mp4").exists());
+        assert!(!busy.join("recording.mp4").exists());
+        // The copy started again meanwhile (`apply` checks again), and pinned stays pinned.
+        assert!(sending.join("recording.mp4").is_file());
+        assert!(pinned.join("recording.mp4").is_file());
+        // Switched back on: the marks go and the videos stay.
+        assert_eq!(delete_video_now(&pinned, &Policy::default()), Ok(()));
+        assert!(!pinned.join(DROP_VIDEO).exists());
+        assert!(pinned.join("recording.mp4").is_file());
+    }
+
+    #[test]
+    fn days_still_apply_to_a_capture_whose_video_was_deleted() {
+        let tmp = TempDir::new("drop-days");
+        let off = without_video();
+        let ancient = bundle(&tmp.0, "scrawl-ancient", 31.0, false);
+        let old = bundle(&tmp.0, "scrawl-old", 8.0, false);
+        assert!(mark_for_deletion(&ancient, &off) && mark_for_deletion(&old, &off));
+        assert_eq!(
+            planned(&tmp.0, &off),
+            vec![
+                Action::TrashBundle(ancient),
+                Action::DeleteVideo {
+                    bundle: old.clone(),
+                    video: old.join("recording.mp4")
+                },
+            ]
+        );
+        assert_eq!(delete_video_now(&old, &off), Ok(()));
+        let trash_dir = tmp.0.join("Trash");
+        std::fs::create_dir_all(&trash_dir).unwrap();
+        let fake_trash = |path: &Path| -> Result<()> {
+            std::fs::rename(path, trash_dir.join(path.file_name().unwrap()))?;
+            Ok(())
+        };
+        let media: Vec<Action> = planned(&tmp.0, &off)
+            .into_iter()
+            .filter(|a| matches!(a, Action::TrashMedia { .. }))
+            .collect();
+        assert_eq!(
+            media,
+            vec![Action::TrashMedia {
+                bundle: old.clone(),
+                items: vec![old.join("audio.wav")],
+            }]
+        );
+        apply(&media, &off, &fake_trash, false);
+        assert!(!old.join("audio.wav").exists());
+        let reason = missing_media_reason(&old).unwrap();
+        assert!(reason.contains("deleted after the capture"), "{reason}");
     }
 }
