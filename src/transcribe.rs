@@ -2,8 +2,9 @@
 //! timings), or Hex when `"transcriber": "hex"` is set and Hex is connected (`crate::hex`; word
 //! times estimated). Any Hex trouble falls back to Apple for that recording. On Windows,
 //! `"transcriber": "claude"` dictates through a hidden Claude Code session while recording
-//! (`crate::win::claude_dictation`, word times estimated); without that live result the
-//! recording is transcribed on this PC as usual.
+//! (`crate::win::claude_dictation`) while Parakeet transcribes the finished recording alongside:
+//! Claude Code's words take Parakeet's measured times (estimated when too few line up), and
+//! without Claude Code's text Parakeet's transcript is used.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -180,30 +181,111 @@ pub fn transcribe(wav: Option<&Path>, audio: Option<&RecordedAudio>) -> Transcri
         Engine::preferred(),
         || try_hex(audio),
         || {
-            live.and_then(|live| finish_live(live, audio))
+            #[cfg(target_os = "windows")]
+            let live = match live.map(crate::live_transcribe::Live::into_claude) {
+                Some(Ok(take)) => {
+                    return claude(take, audio, || crate::helper::transcribe(wav));
+                }
+                Some(Err(live)) => Some(live),
+                None => None,
+            };
+            live.and_then(|live| finish_live(|| live.finish(&audio.wav_bytes), audio))
                 .unwrap_or_else(|| {
                     if Engine::preferred() == Engine::Claude {
                         crate::capture::scrawl_log(format!(
                             "No Claude Code dictation for this recording, using {LOCAL_ENGINE_TITLE}"
                         ));
                     }
-                    apple(wav)
+                    local(crate::helper::transcribe(wav))
                 })
         },
     )
 }
 
-/// The transcript made while recording, or `None` (logged) to transcribe the WAV instead.
+/// Claude Code's dictation of `audio` with Parakeet (`parakeet`, which transcribes the recording's
+/// file) running alongside, so finishing takes as long as the slower of the two. Claude Code's
+/// words take Parakeet's times; when Claude Code has no text, Parakeet's transcript is the
+/// answer. Parakeet runs once either way.
+#[cfg(target_os = "windows")]
+pub(crate) fn claude(
+    mut take: crate::win::claude_dictation::Take,
+    audio: &RecordedAudio,
+    parakeet: impl FnOnce() -> Result<TranscriptData> + Send,
+) -> TranscriptData {
+    std::thread::scope(|scope| {
+        let started = std::time::Instant::now();
+        let running = scope.spawn(move || {
+            let transcript = parakeet();
+            crate::capture::scrawl_log(format!(
+                "{LOCAL_ENGINE_TITLE} alongside Claude Code: done in {} ms",
+                started.elapsed().as_millis()
+            ));
+            transcript
+        });
+        let mut alongside = Alongside {
+            running: Some(running),
+            done: None,
+        };
+        let claude = finish_live(
+            || {
+                take.finish(&audio.wav_bytes, || match alongside.wait() {
+                    Ok(transcript) => Some(transcript.clone()),
+                    Err(error) => {
+                        crate::capture::scrawl_log(format!(
+                            "Claude Code dictation: word times estimated, {LOCAL_ENGINE_TITLE} failed: {error:#}"
+                        ));
+                        None
+                    }
+                })
+            },
+            audio,
+        );
+        crate::capture::scrawl_log(format!(
+            "Claude Code dictation and {LOCAL_ENGINE_TITLE} finished in {} ms",
+            started.elapsed().as_millis()
+        ));
+        claude.unwrap_or_else(|| local(alongside.into_result()))
+    })
+}
+
+/// Parakeet's transcript while it runs alongside Claude Code, joined once.
+#[cfg(target_os = "windows")]
+struct Alongside<'scope> {
+    running: Option<std::thread::ScopedJoinHandle<'scope, Result<TranscriptData>>>,
+    done: Option<Result<TranscriptData>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Alongside<'_> {
+    fn wait(&mut self) -> &Result<TranscriptData> {
+        let running = &mut self.running;
+        self.done.get_or_insert_with(|| match running.take() {
+            Some(running) => running
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} panicked"))),
+            None => Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} never ran")),
+        })
+    }
+
+    fn into_result(mut self) -> Result<TranscriptData> {
+        self.wait();
+        self.done
+            .unwrap_or_else(|| Err(anyhow::anyhow!("{LOCAL_ENGINE_TITLE} never ran")))
+    }
+}
+
+/// The transcript made while recording, or `None` (logged) to use the file's instead.
 fn finish_live(
-    live: crate::live_transcribe::Live,
+    finish: impl FnOnce() -> Result<crate::live_transcribe::Finished>,
     audio: &RecordedAudio,
 ) -> Option<TranscriptData> {
     let finishing = std::time::Instant::now();
-    match live.finish(&audio.wav_bytes) {
+    match finish() {
         Ok(done) => {
             crate::capture::scrawl_log(format!(
-                "Live transcription ({}): {} words, {} of {} ms streamed, tail {} ms",
+                "Live transcription ({}, {}): {} words, {} of {} ms streamed, tail {} ms",
                 done.transcript.source,
+                done.transcript.model.as_deref().unwrap_or("no model"),
                 done.transcript.words.len(),
                 done.streamed_samples as u64 * 1_000 / 16_000,
                 audio.duration_ms,
@@ -215,7 +297,7 @@ fn finish_live(
         Err(error) if error.is::<crate::win::claude_dictation::Skipped>() => None,
         Err(error) => {
             crate::capture::scrawl_log(format!(
-                "Live transcription failed after {} ms, transcribing the recording: {error:#}",
+                "Live transcription failed after {} ms, using the recording's file: {error:#}",
                 finishing.elapsed().as_millis()
             ));
             None
@@ -265,8 +347,10 @@ fn try_hex(audio: &RecordedAudio) -> Result<Option<TranscriptData>> {
     crate::hex::transcribe_audio(&client, &model, audio).map(Some)
 }
 
-fn apple(wav: &Path) -> TranscriptData {
-    let transcript = crate::helper::transcribe(wav).unwrap_or_else(|error| {
+/// The on-device engine's transcript of the recording's file (`helper::transcribe`), or what was
+/// missing, logged.
+fn local(transcript: Result<TranscriptData>) -> TranscriptData {
+    let transcript = transcript.unwrap_or_else(|error| {
         crate::capture::scrawl_log(format!("{LOCAL_ENGINE_TITLE} failed: {error:#}"));
         TranscriptData {
             source: "offline".into(),
