@@ -33,7 +33,7 @@ Upstream `kitlangton/scrawl` main ships native Windows support. Hona's PR #3 was
 
 Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own target dir `C:/t/scrawl-<id>`.
 
-- A: German file transcription (Parakeet TDT v3), clientRequestId `scrawl-win-A-german-1`
+- A: German file transcription (Parakeet TDT v3). **Done and merged** (b614a2c). 316 tests pass. Follow-up: Settings must call `speech_model::ensure()` after the language changes (B owns settings.rs, or do it at integration).
 - B: Claude Code dictation engine, clientRequestId `scrawl-win-B-claude-1`
 - C: Windows video export, clientRequestId `scrawl-win-C-export-1`
 
