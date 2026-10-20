@@ -9,9 +9,11 @@
 //! no tools and runs in plan mode, so even a stray Enter could not act.
 //!
 //! One session is kept warm while Claude is the engine (`watch`), and reused after each
-//! recording. Every failure returns an error and the recording is transcribed from its file
-//! instead (`transcribe::transcribe`).
+//! recording. Parakeet transcribes the recording's file alongside the finish
+//! (`transcribe::transcribe`): Claude Code's words take its measured times (`align`), and every
+//! failure returns an error and Parakeet's transcript is used instead.
 
+mod align;
 mod screen;
 mod spread;
 #[cfg(test)]
@@ -33,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::live_transcribe::Finished;
+use crate::model::TranscriptData;
 use screen::{COLS, ROWS, Settle, State, Trust};
 
 const KEY_REPEAT: Duration = Duration::from_millis(30);
@@ -833,9 +836,16 @@ impl Take {
         self.released.store(true, Ordering::Release);
     }
 
-    /// Releases the key and turns the text into a transcript of `wav_bytes`, the recording. A
-    /// recording without speech gives up at once, without waiting for Claude Code.
-    pub fn finish(&mut self, wav_bytes: &[u8]) -> Result<Finished> {
+    /// Releases the key and turns the text into a transcript of `wav_bytes`, the recording, with
+    /// the word times of `measured` (Parakeet's transcript of the same recording, waited for
+    /// only once Claude Code has answered; `None` when it failed) when enough words line up,
+    /// else spread over the speech. A recording without speech gives up at once, without
+    /// waiting for Claude Code.
+    pub fn finish(
+        &mut self,
+        wav_bytes: &[u8],
+        measured: impl FnOnce() -> Option<TranscriptData>,
+    ) -> Result<Finished> {
         let finishing = Instant::now();
         self.finished = true;
         let samples = crate::audio::decode_wav_16k(wav_bytes);
@@ -865,16 +875,34 @@ impl Take {
         let duration_ms = samples.len() as u64 / 16;
         let heard_from_ms = heard.from_sample as u64 / 16;
         crate::capture::scrawl_log(format!(
-            "Claude Code dictation: listening from {heard_from_ms} of {duration_ms} ms, {} characters",
-            heard.text.chars().count()
+            "Claude Code dictation: listening from {heard_from_ms} of {duration_ms} ms, {} characters, answered {} ms after the stop",
+            heard.text.chars().count(),
+            finishing.elapsed().as_millis()
         ));
-        let transcript = spread::transcript(
-            &heard.text,
-            &islands,
-            heard_from_ms,
-            duration_ms,
-            &crate::handoff::transcription_language(),
-        )?;
+        let language = crate::handoff::transcription_language();
+        let spread =
+            spread::transcript(&heard.text, &islands, heard_from_ms, duration_ms, &language)?;
+        let transcript = match measured() {
+            Some(parakeet) => {
+                match align::transcript(
+                    &spread.text,
+                    &parakeet,
+                    &islands,
+                    heard_from_ms,
+                    duration_ms,
+                    &language,
+                ) {
+                    Ok((aligned, _)) => aligned,
+                    Err(why) => {
+                        crate::capture::scrawl_log(format!(
+                            "Claude Code dictation: word times estimated, {why}"
+                        ));
+                        spread
+                    }
+                }
+            }
+            None => spread,
+        };
         Ok(Finished {
             transcript,
             tail_ms: finishing.elapsed().as_millis() as u64,
@@ -1236,7 +1264,9 @@ mod tests {
         let (mut take, released, cancelled, _answer) = test_take();
         let wav = crate::audio::encode_wav_16k(&recording(3_000, &[])).unwrap();
         let started = Instant::now();
-        let error = take.finish(&wav).unwrap_err();
+        let error = take
+            .finish(&wav, || panic!("Parakeet is never waited for without speech"))
+            .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -1246,40 +1276,164 @@ mod tests {
         assert!(cancelled.load(Ordering::Acquire) && released.load(Ordering::Acquire));
     }
 
-    /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`.
+    /// How long finishing takes on a real recording with Parakeet installed, with a stand-in
+    /// Claude Code that answers 1.1 s after the stop (as the real one does), once with text and
+    /// once failing. Run with `SCRAWL_CONFIG` naming `"language"`, `SCRAWL_MODELS_DIR` and
+    /// `SCRAWL_TIMING_WAV` (a 16 kHz mono WAV) set, `-- --ignored --nocapture finish_timings`.
     #[test]
-    fn dictated_text_reaches_the_summary_under_the_keyframe_it_was_said_at() {
-        let samples = recording(8_000, &[(1_000, 2_500), (5_000, 6_500)]);
-        let islands = crate::audio::speech_islands(&samples);
-        assert_eq!(islands.len(), 2, "{islands:?}");
-        let (take, _released, _cancelled, answer) = test_take();
-        answer
-            .send(Ok(Heard {
-                text: "Erstens das hier oben. Zweitens das dort unten.".into(),
-                from_sample: 0,
-            }))
-            .unwrap();
-        let audio = crate::audio::RecordedAudio {
-            sample_count: samples.len(),
-            duration_ms: 8_000,
-            wav_bytes: crate::audio::encode_wav_16k(&samples).unwrap(),
-            live: crate::live_transcribe::Slot::new(Some(crate::live_transcribe::Live::claude(
-                take,
-            ))),
-        };
-        let transcript =
-            crate::transcribe::transcribe(Some(Path::new("never-read.wav")), Some(&audio));
-        assert_eq!(transcript.source, "claude-code");
-        assert!(transcript.estimated);
-        assert_eq!(
-            transcript.text,
-            "Erstens das hier oben. Zweitens das dort unten."
-        );
-        let (first, last) = (&transcript.words[0], transcript.words.last().unwrap());
-        assert!(first.t0 >= 900 && last.t1 <= 6_600, "{first:?} {last:?}");
+    #[ignore]
+    fn finish_timings() {
+        let wav = PathBuf::from(std::env::var_os("SCRAWL_TIMING_WAV").expect("SCRAWL_TIMING_WAV"));
+        let bytes = std::fs::read(&wav).unwrap();
+        let samples = crate::audio::decode_wav_16k(&bytes).unwrap();
+        let text = std::env::var("SCRAWL_TIMING_TEXT").unwrap_or_else(|_| "Hallo Welt.".into());
+        for claude_answers in [true, false] {
+            let (take, _released, _cancelled, answer) = test_take();
+            let text = text.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(1_100));
+                let _ = answer.send(if claude_answers {
+                    Ok(Heard {
+                        text,
+                        from_sample: 0,
+                    })
+                } else {
+                    Err(anyhow!("the Claude Code session stopped while recording"))
+                });
+            });
+            let audio = crate::audio::RecordedAudio {
+                sample_count: samples.len(),
+                duration_ms: samples.len() as u64 / 16,
+                wav_bytes: bytes.clone(),
+                live: crate::live_transcribe::Slot::new(Some(
+                    crate::live_transcribe::Live::claude(take),
+                )),
+            };
+            let started = Instant::now();
+            let transcript = crate::transcribe::transcribe(Some(&wav), Some(&audio));
+            println!(
+                "finish timing: Claude {}, {} ms of audio, finished in {} ms: source {}, model {:?}, estimated {}, {} words",
+                if claude_answers { "answers" } else { "fails" },
+                audio.duration_ms,
+                started.elapsed().as_millis(),
+                transcript.source,
+                transcript.model,
+                transcript.estimated,
+                transcript.words.len()
+            );
+        }
+    }
 
-        let times = [1_500, 4_800];
-        let said = crate::keyframes::said_per_keyframe(&times, &[], &transcript);
+    /// A recording with speech at 1.0-2.5 s and 5.0-6.5 s, whose take answers `heard`, ready
+    /// for `transcribe::claude`.
+    fn two_sentences(heard: Result<Heard>) -> (Take, crate::audio::RecordedAudio) {
+        let samples = recording(8_000, &[(1_000, 2_500), (5_000, 6_500)]);
+        assert_eq!(crate::audio::speech_islands(&samples).len(), 2);
+        let (take, _released, _cancelled, answer) = test_take();
+        answer.send(heard).unwrap();
+        (take, audio_of(&samples))
+    }
+
+    fn audio_of(samples: &[f32]) -> crate::audio::RecordedAudio {
+        crate::audio::RecordedAudio {
+            sample_count: samples.len(),
+            duration_ms: samples.len() as u64 / 16,
+            wav_bytes: crate::audio::encode_wav_16k(samples).unwrap(),
+            live: crate::live_transcribe::Slot::default(),
+        }
+    }
+
+    const SAID: &str = "Erstens das hier oben. Zweitens das dort unten.";
+
+    fn said(text: &str) -> Result<Heard> {
+        Ok(Heard {
+            text: text.into(),
+            from_sample: 0,
+        })
+    }
+
+    /// Parakeet's words, each `(start ms, text)`, 250 ms long.
+    fn parakeet(words: &[(u64, &str)]) -> TranscriptData {
+        TranscriptData {
+            source: "parakeet:parakeet-tdt-0.6b-v3-Q8_0".into(),
+            model: Some("parakeet-tdt-0.6b-v3-Q8_0".into()),
+            text: words.iter().map(|w| w.1).collect::<Vec<_>>().join(" "),
+            words: words
+                .iter()
+                .map(|&(t0, text)| WordTiming {
+                    t0,
+                    t1: t0 + 250,
+                    text: text.into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claude_failing_uses_the_parakeet_transcript_made_alongside() {
+        let failures = [
+            Err(anyhow!("the Claude Code session stopped while recording")),
+            Err(anyhow!(Skipped)),
+            said(""),
+        ];
+        for failure in failures {
+            let (take, audio) = two_sentences(failure);
+            let runs = AtomicU32::new(0);
+            let transcript = crate::transcribe::claude(take, &audio, || {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(parakeet(&[(1_000, "Erstens"), (5_000, "Zweitens")]))
+            });
+            assert_eq!(runs.into_inner(), 1, "Parakeet runs once");
+            assert_eq!(transcript.source, "parakeet:parakeet-tdt-0.6b-v3-Q8_0");
+            assert_eq!(transcript.text, "Erstens Zweitens");
+        }
+
+        // A recording without speech doesn't wait for Claude Code, and runs Parakeet once.
+        let (take, _released, _cancelled, _answer) = test_take();
+        let audio = audio_of(&recording(3_000, &[]));
+        let runs = AtomicU32::new(0);
+        let transcript = crate::transcribe::claude(take, &audio, || {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(parakeet(&[]))
+        });
+        assert_eq!((runs.into_inner(), transcript.words.len()), (1, 0));
+    }
+
+    #[test]
+    fn claude_and_parakeet_run_side_by_side() {
+        let (take, _released, _cancelled, answer) = test_take();
+        let audio = audio_of(&recording(3_000, &[(500, 2_000)]));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = answer.send(said("Hallo Welt."));
+        });
+        let started = Instant::now();
+        let transcript = crate::transcribe::claude(take, &audio, || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(parakeet(&[(600, "Hallo"), (1_200, "Welt.")]))
+        });
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(550), "one after the other takes 600 ms: {took:?}");
+        assert!(!transcript.estimated);
+        assert_eq!(transcript.words[1].t0, 1_200);
+    }
+
+    /// `summary.md` for an 8 s recording with scene changes at `times`.
+    fn summary_with_keyframes(transcript: TranscriptData, times: &[u64]) -> String {
+        summary_with(transcript, times, &[], 8_000)
+    }
+
+    /// `summary.md` for a `duration_ms` recording with keyframes at `times`, each anchored where
+    /// its span starts (`anchors`, as `said_per_keyframe` takes them; a mark's starts with its
+    /// stroke).
+    fn summary_with(
+        transcript: TranscriptData,
+        times: &[u64],
+        anchors: &[u64],
+        duration_ms: u64,
+    ) -> String {
+        let said = crate::keyframes::said_per_keyframe(times, anchors, &transcript);
         let keyframes = times
             .iter()
             .zip(said)
@@ -1299,7 +1453,7 @@ mod tests {
             version: 1,
             id: "t".into(),
             created_at_ms: 0,
-            duration_ms: 8_000,
+            duration_ms,
             target: TargetInfo {
                 mode: CaptureMode::Display,
                 app: None,
@@ -1335,13 +1489,134 @@ mod tests {
             autocrop: None,
             destination: None,
         };
-        let summary = crate::sketch::summary_markdown(&bundle, Path::new("/recordings/t"));
+        crate::sketch::summary_markdown(&bundle, Path::new("/recordings/t"))
+    }
+
+    /// Claude Code's text (`SCRAWL_ALIGN_TEXT`) for a real recording (`SCRAWL_ALIGN_WAV`) with
+    /// the real Parakeet alongside: prints each word's aligned start next to Parakeet's words,
+    /// and `summary.md` with scene changes at `SCRAWL_ALIGN_KEYFRAMES` (ms, comma separated;
+    /// without it, 300 ms before each of Parakeet's sentences), anchored at
+    /// `SCRAWL_ALIGN_ANCHORS` (one per keyframe). Needs `SCRAWL_CONFIG` naming
+    /// the language and `SCRAWL_MODELS_DIR`; `-- --ignored --nocapture real_parakeet_times`.
+    #[test]
+    #[ignore]
+    fn real_parakeet_times() {
+        let wav = PathBuf::from(std::env::var_os("SCRAWL_ALIGN_WAV").expect("SCRAWL_ALIGN_WAV"));
+        let samples = crate::audio::decode_wav_16k(&std::fs::read(&wav).unwrap()).unwrap();
+        let audio = audio_of(&samples);
+        let measured = crate::helper::transcribe(&wav).unwrap();
+        println!("Parakeet ({:?}): {}", measured.model, measured.text);
+        for segment in &measured.segments {
+            println!("Parakeet segment {}-{}: {}", segment.t0, segment.t1, segment.text);
+        }
+        let text = std::env::var("SCRAWL_ALIGN_TEXT").unwrap_or_else(|_| measured.text.clone());
+        let (take, _released, _cancelled, answer) = test_take();
+        answer.send(said(&text)).unwrap();
+        let alongside = measured.clone();
+        let transcript = crate::transcribe::claude(take, &audio, || Ok(alongside));
+        println!(
+            "model {:?}, estimated {}",
+            transcript.model, transcript.estimated
+        );
+        println!("{:<24} {:>13}   Parakeet", "Claude Code", "aligned");
+        for word in &transcript.words {
+            let near: Vec<String> = measured
+                .words
+                .iter()
+                .filter(|w| w.t1 > word.t0.saturating_sub(150) && w.t0 < word.t1 + 150)
+                .map(|w| format!("{}@{}", w.text, w.t0))
+                .collect();
+            println!(
+                "{:<24} {:>6}-{:<6}   {}",
+                word.text,
+                word.t0,
+                word.t1,
+                near.join(" ")
+            );
+        }
+        let times: Vec<u64> = match std::env::var("SCRAWL_ALIGN_KEYFRAMES") {
+            Ok(list) => list.split(',').map(|t| t.trim().parse().unwrap()).collect(),
+            Err(_) => measured
+                .segments
+                .iter()
+                .map(|s| s.t0.saturating_sub(300))
+                .collect(),
+        };
+        let anchors: Vec<u64> = std::env::var("SCRAWL_ALIGN_ANCHORS")
+            .map(|list| list.split(',').map(|t| t.trim().parse().unwrap()).collect())
+            .unwrap_or_default();
+        println!("keyframes at {times:?}, anchors {anchors:?}");
+        println!(
+            "{}",
+            summary_with(transcript.clone(), &times, &anchors, audio.duration_ms)
+        );
+        assert!(!transcript.estimated);
+        assert_eq!(transcript.text, text.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+
+    /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`,
+    /// when Parakeet has nothing.
+    #[test]
+    fn dictated_text_reaches_the_summary_under_the_keyframe_it_was_said_at() {
+        let (take, audio) = two_sentences(said(SAID));
+        let transcript =
+            crate::transcribe::claude(take, &audio, || Err(anyhow!("no speech model")));
+        assert_eq!(transcript.source, "claude-code");
+        assert!(transcript.estimated);
+        assert_eq!(transcript.text, SAID);
+        let (first, last) = (&transcript.words[0], transcript.words.last().unwrap());
+        assert!(first.t0 >= 900 && last.t1 <= 6_600, "{first:?} {last:?}");
+
+        let summary = summary_with_keyframes(transcript, &[1_500, 4_800]);
         assert!(summary.contains("Word times are estimated"), "{summary}");
         assert!(
             summary.contains("Erstens das hier oben.")
                 && summary.find("- #1 (0:01)") < summary.find("Erstens")
                 && summary.find("Erstens") < summary.find("- #2 (0:04)")
                 && summary.find("- #2 (0:04)") < summary.find("Zweitens das dort unten."),
+            "{summary}"
+        );
+    }
+
+    /// With Parakeet's times a sentence lands under the keyframe it was said at where the
+    /// estimate puts it one keyframe off: the second sentence starts late in its island, after
+    /// a keyframe the spread gives it to.
+    #[test]
+    fn parakeets_times_put_each_sentence_under_its_keyframe() {
+        let heard = parakeet(&[
+            (1_000, "Erstens"),
+            (1_250, "das"),
+            (1_500, "hier"),
+            (1_750, "oben."),
+            (5_900, "Zweitens"),
+            (6_000, "das"),
+            (6_100, "dort"),
+            (6_250, "unten."),
+        ]);
+        let times = [1_000, 5_000, 5_800];
+        let (take, audio) = two_sentences(said(SAID));
+        let spread = crate::transcribe::claude(take, &audio, || Err(anyhow!("no speech model")));
+        let estimated = summary_with_keyframes(spread, &times);
+        assert!(
+            estimated.contains("- #2 (0:05) “Zweitens das”"),
+            "the estimate starts it under #2: {estimated}"
+        );
+
+        let (take, audio) = two_sentences(said(SAID));
+        let transcript = crate::transcribe::claude(take, &audio, || Ok(heard));
+        assert!(!transcript.estimated);
+        assert_eq!(transcript.text, SAID);
+        let model = transcript.model.clone().unwrap_or_default();
+        assert!(
+            model.starts_with("Claude Code dictation (") && model.ends_with("), Parakeet timing"),
+            "{model}"
+        );
+        assert_eq!(transcript.words[4].t0, 5_900);
+        let summary = summary_with_keyframes(transcript, &times);
+        assert!(!summary.contains("Word times are estimated"), "{summary}");
+        assert!(
+            summary.contains("- #1 (0:01) “Erstens das hier oben.”")
+                && summary.contains("- #3 (0:05) “Zweitens das dort unten.”"),
             "{summary}"
         );
     }

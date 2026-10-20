@@ -156,13 +156,25 @@ impl Live {
         Self(Inner::Claude(take))
     }
 
+    /// Claude Code dictation's take, which `transcribe` finishes with Parakeet alongside, or
+    /// this stream back.
+    #[cfg(target_os = "windows")]
+    pub fn into_claude(self) -> std::result::Result<crate::win::claude_dictation::Take, Self> {
+        match self.0 {
+            Inner::Claude(take) => Ok(take),
+            stream => Err(Self(stream)),
+        }
+    }
+
     /// Sends what the helper hasn't had of `wav_bytes` (the recording's `audio.wav`), ends its
     /// input and collects the transcript.
     pub fn finish(mut self, wav_bytes: &[u8]) -> Result<Finished> {
         match &mut self.0 {
             Inner::Stream(stream) => stream.finish_within(wav_bytes, TAIL_TIMEOUT),
             #[cfg(target_os = "windows")]
-            Inner::Claude(take) => take.finish(wav_bytes),
+            // `transcribe` takes Claude Code's take out first (`into_claude`) to finish it with
+            // Parakeet's times; this way has none.
+            Inner::Claude(take) => take.finish(wav_bytes, || None),
         }
     }
 
