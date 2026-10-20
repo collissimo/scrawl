@@ -10,6 +10,10 @@ Upstream `kitlangton/scrawl` main ships native Windows support. Hona's PR #3 was
 - The working branch `t3/port-scrawl-to-windows` was reset to `origin/main` (6449367). T3 renamed the branch, so don't rename it again.
 - The official 0.3.6 zip, unpacked in `C:\t\scrawl-036\Scrawl`, works on this PC (Win10 19045). `record --duration 5` produced mp4, frames, a contact sheet and `summary.md`. There was no transcript: the English Parakeet model had not been downloaded.
 
+## Scope decision (Collin, 2026-10-20)
+
+macOS support does NOT need to be preserved in this fork: Collin has no Mac. Windows correctness comes first. Still keep Windows code in `src/win/` and behind cfg where it's cheap, so upstream merges stay easy, but never trade Windows quality for the Mac. Review R1 (macOS) was cancelled for this reason.
+
 ## Goal now: what upstream lacks for Collin
 
 1. **Transcription like T3 Voice.** Upstream Windows uses transcribe.cpp with Parakeet Unified **English**, but Collin speaks German.
@@ -35,7 +39,7 @@ Each brief is `C:/t/briefs/common.md` plus its task file. Each task has its own 
 
 - A: German file transcription (Parakeet TDT v3). **Done and merged** (b614a2c). 316 tests pass. Follow-up: Settings must call `speech_model::ensure()` after the language changes (B owns settings.rs, or do it at integration).
 - B: Claude Code dictation engine. **Done and merged** (cfc45d8); A+B+C together: 341 tests pass. Not yet tested with real speech (needs Collin). Risks: it hears only the Windows default mic; a cold start begins listening 2-3 s late; npm `claude.cmd` isn't found.
-- Reviews running (read-only, fastMode): R1 macOS preservation, R2 Windows robustness, R3 product/docs. Brief: `C:/t/briefs/review-common.md`. clientRequestIds `scrawl-win-review-R{1,2,3}-*-1`
+- Reviews running (read-only, fastMode): R2 Windows robustness, R3 product/docs. (R1 macOS cancelled.) Brief: `C:/t/briefs/review-common.md`. clientRequestIds `scrawl-win-review-R{1,2,3}-*-1`
 - C: Windows video export. **Done and merged** (ec4b14f), plus my fix for sheared decoded frames (513473d). 327 tests pass. Follow-ups: the AMD encoder runs near-constant bitrate, so static screens produce big files (switch to VBR via CODECAPI_AVEncCommonRateControlMode); no fast-start; `media::audio_mono` duplicates `export_audio`.
 
 Stopped agents from the old plan are obsolete and must not be resumed: T3 "Scrawl Windows: foundation commit" and the workflow "foundation".
