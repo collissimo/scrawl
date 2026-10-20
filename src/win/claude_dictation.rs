@@ -17,10 +17,11 @@ mod spread;
 #[cfg(test)]
 mod fixtures;
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -40,10 +41,17 @@ const ESC: &[u8] = b"\x1b";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(6);
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(45);
-const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long finishing a recording waits for the dictation's text.
-const FINISH_TIMEOUT: Duration = Duration::from_secs(70);
+/// Claude Code transcribes while it listens, so the last words follow the release within a
+/// second or two; anything slower falls back to the file engine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
+/// The editor shim runs in about 30 ms.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long finishing a recording waits for the dictation's text: the settle and the capture,
+/// so the session thread is never abandoned in the middle of either.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(12);
+/// Claude Code reads the emptied prompt file back after the editor exits; keys sent before then
+/// can be lost.
+const EDITOR_RETURN: Duration = Duration::from_millis(300);
 /// The environment variable the editor shim finds its capture file in.
 const CAPTURE_ENV: &str = "SCRAWL_CLAUDE_CAPTURE";
 /// Copies everything the session prints to this file (for test fixtures).
@@ -51,22 +59,45 @@ const TRACE_ENV: &str = "SCRAWL_CLAUDE_TRACE";
 
 // --- finding claude ---------------------------------------------------------------------------
 
-/// `claude.exe` on PATH, looked up again at most every 30 s.
+/// `claude.exe` on PATH. Only the first call searches PATH itself; later ones answer from the
+/// cache at once and, once it is 30 s old, search again in the background, so a PATH entry on an
+/// unreachable drive never stalls a recording's start on the UI thread.
 pub fn claude_path() -> Option<PathBuf> {
     static CACHE: Mutex<Option<(Instant, Option<PathBuf>)>> = Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((at, path)) = cache.as_ref()
-        && at.elapsed() < Duration::from_secs(30)
-    {
-        return path.clone();
+    static SEARCHING: AtomicBool = AtomicBool::new(false);
+    let store = |found: &Option<PathBuf>| {
+        *CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Instant::now(), found.clone()));
+    };
+    let cached = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some((at, path)) = cached else {
+        let found = find_claude();
+        store(&found);
+        return found;
+    };
+    if at.elapsed() >= Duration::from_secs(30) && !SEARCHING.swap(true, Ordering::AcqRel) {
+        let spawned = std::thread::Builder::new()
+            .name("scrawl-claude-path".into())
+            .spawn(move || {
+                store(&find_claude());
+                SEARCHING.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            SEARCHING.store(false, Ordering::Release);
+        }
     }
-    let found = std::env::var_os("PATH").and_then(|path| {
+    path
+}
+
+fn find_claude() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join("claude.exe"))
             .find(|candidate| candidate.is_file())
-    });
-    *cache = Some((Instant::now(), found.clone()));
-    found
+    })
 }
 
 /// Why Claude Code dictation can't be chosen now, or `None` when it can.
@@ -89,13 +120,77 @@ fn runtime_dir() -> PathBuf {
 
 /// The environment for `claude`: a session started from inside another Claude Code session
 /// inherits its identity and auth overrides, and this one needs the user's own login.
-fn claude_environment() -> Vec<(String, String)> {
-    std::env::vars()
+/// Variables that aren't Unicode pass through as they are.
+fn claude_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os()
         .filter(|(key, _)| {
-            let key = key.to_ascii_uppercase();
+            let key = key.to_string_lossy().to_ascii_uppercase();
             !key.starts_with("CLAUDE") && !key.starts_with("ANTHROPIC")
         })
         .collect()
+}
+
+/// This process's settings file and a capture file for its `session`-th session. Each process
+/// (the app and a `scrawl record` beside it) and each session has its own, so neither a second
+/// process nor a killed session's late editor run can swap or delete another's text.
+fn session_files(dir: &Path, pid: u32, session: u32) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("claude-settings-{pid}.json")),
+        dir.join(format!("capture-{pid}-{session}.txt")),
+    )
+}
+
+/// The process id in a file name `session_files` made (or the old shared names, `None`).
+fn file_pid(name: &str) -> Option<Option<u32>> {
+    if matches!(name, "claude-settings.json" | "capture.txt" | "capture.tmp") {
+        return Some(None);
+    }
+    let id = name
+        .strip_prefix("claude-settings-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .or_else(|| {
+            let rest = name.strip_prefix("capture-")?;
+            let rest = rest.strip_suffix(".txt").or_else(|| rest.strip_suffix(".tmp"))?;
+            Some(rest.split_once('-')?.0)
+        })?;
+    Some(Some(id.parse().ok()?))
+}
+
+/// Deletes files left by Scrawl processes that are no longer running.
+fn remove_stale_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let own = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let stale = match file_pid(&name.to_string_lossy()) {
+            Some(None) => true,
+            Some(Some(pid)) => pid != own && !process_running(pid),
+            None => false,
+        };
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn process_running(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: opens the process for a status query only and closes the handle.
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0_u32;
+        let running = GetExitCodeProcess(process, &mut code).is_ok()
+            && code == STILL_ACTIVE.0 as u32;
+        let _ = CloseHandle(process);
+        running
+    }
 }
 
 /// The `EDITOR` command: this executable's `claude-editor`, quoted only when it has to be.
@@ -112,6 +207,11 @@ pub struct Session {
     holding: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     capture_file: PathBuf,
+    /// A step failed and left the prompt in an unknown state (old text, a late editor run), so
+    /// the session is not used again (`give_back`).
+    broken: AtomicBool,
+    /// When Claude Code is back from the last editor run (`EDITOR_RETURN`).
+    editor_back: Mutex<Option<Instant>>,
     pub language: String,
 }
 
@@ -124,7 +224,13 @@ impl Session {
         let dir = runtime_dir();
         let cwd = dir.join("claude-cwd");
         std::fs::create_dir_all(&cwd).context("Could not create the Claude Code folder")?;
-        let settings = dir.join("claude-settings.json");
+        remove_stale_files(&dir);
+        static SESSIONS: AtomicU32 = AtomicU32::new(0);
+        let (settings, capture_file) = session_files(
+            &dir,
+            std::process::id(),
+            SESSIONS.fetch_add(1, Ordering::Relaxed),
+        );
         std::fs::write(
             &settings,
             serde_json::json!({
@@ -147,15 +253,15 @@ impl Session {
             "--tools".into(),
             String::new(),
         ];
-        let capture_file = dir.join("capture.txt");
         let editor = editor_command()?;
         let mut env = claude_environment();
         env.retain(|(key, _)| {
-            !["EDITOR", "VISUAL", CAPTURE_ENV].contains(&key.to_ascii_uppercase().as_str())
+            !["EDITOR", "VISUAL", CAPTURE_ENV]
+                .contains(&key.to_string_lossy().to_ascii_uppercase().as_str())
         });
-        env.push(("EDITOR".into(), editor.clone()));
-        env.push(("VISUAL".into(), editor));
-        env.push((CAPTURE_ENV.into(), capture_file.to_string_lossy().into_owned()));
+        env.push(("EDITOR".into(), editor.clone().into()));
+        env.push(("VISUAL".into(), editor.into()));
+        env.push((CAPTURE_ENV.into(), capture_file.clone().into_os_string()));
 
         // SAFETY: reads which window has the foreground.
         let in_front = unsafe { GetForegroundWindow() }.0 as isize;
@@ -175,6 +281,8 @@ impl Session {
             holding,
             stopped,
             capture_file,
+            broken: AtomicBool::new(false),
+            editor_back: Mutex::new(None),
             language: language.to_owned(),
         };
         session.wait_ready(START_TIMEOUT)?;
@@ -242,32 +350,43 @@ impl Session {
     }
 
     /// Starts holding the dictation key and returns once Claude Code is listening. `on_hearing`
-    /// runs the moment it is (to note how much of the recording it missed). `give_up` ends the
-    /// wait early.
-    pub fn begin(&self, give_up: &AtomicBool, mut on_hearing: impl FnMut()) -> Result<()> {
+    /// runs the moment it is (to note how much of the recording it missed) and returns false
+    /// when that was too late (the recording had already stopped). `give_up` ends the wait
+    /// early. Any failure leaves the session broken: dictation may still start a moment later.
+    pub fn begin(&self, give_up: &AtomicBool, mut on_hearing: impl FnMut() -> bool) -> Result<()> {
+        self.wait_editor_back();
         self.holding.store(true, Ordering::Release);
         let deadline = Instant::now() + LISTEN_TIMEOUT;
+        let mut late = false;
         while Instant::now() < deadline && !give_up.load(Ordering::Acquire) {
             if self.state().listening {
-                on_hearing();
-                return Ok(());
+                if on_hearing() {
+                    return Ok(());
+                }
+                late = true;
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         self.holding.store(false, Ordering::Release);
-        let reason = self.state().error;
-        self.clear_prompt();
-        if give_up.load(Ordering::Acquire) {
+        self.broken.store(true, Ordering::Release);
+        if late || give_up.load(Ordering::Acquire) {
             bail!("the recording ended before Claude Code was listening");
         }
-        bail!(reason.unwrap_or_else(|| "Claude Code did not start listening".into()))
+        bail!(
+            self.state()
+                .error
+                .unwrap_or_else(|| "Claude Code did not start listening".into())
+        )
     }
 
     /// Releases the key, waits for the text to settle, and takes it out of the session. Empty
-    /// text is an error with Claude Code's own reason (e.g. "No speech detected").
+    /// text is an error with Claude Code's own reason (e.g. "No speech detected"); a timeout
+    /// leaves the session broken.
     pub fn end(&self) -> Result<String> {
         self.holding.store(false, Ordering::Release);
-        self.wait_settled(SETTLE_TIMEOUT)?;
+        self.wait_settled(SETTLE_TIMEOUT)
+            .inspect_err(|_| self.broken.store(true, Ordering::Release))?;
         let text = self.capture(CAPTURE_TIMEOUT)?.trim().to_owned();
         if text.is_empty() {
             bail!(
@@ -304,25 +423,47 @@ impl Session {
         bail!("Timed out waiting for Claude Code's transcript")
     }
 
-    /// The prompt's text, through Ctrl+G and the editor shim, which also empties the prompt.
+    /// The prompt's text, through Ctrl+G and the editor shim, which also empties the prompt. A
+    /// timeout leaves the session broken (the editor may still write the file later).
     pub fn capture(&self, timeout: Duration) -> Result<String> {
+        self.wait_editor_back();
         let _ = std::fs::remove_file(&self.capture_file);
-        self.write(CTRL_G)?;
+        self.write(CTRL_G)
+            .inspect_err(|_| self.broken.store(true, Ordering::Release))?;
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Ok(text) = std::fs::read_to_string(&self.capture_file) {
                 let _ = std::fs::remove_file(&self.capture_file);
-                // Claude Code reads the emptied file back after the editor exits.
-                std::thread::sleep(Duration::from_millis(300));
+                *self.editor_back_lock() = Some(Instant::now() + EDITOR_RETURN);
                 return Ok(text);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         }
+        self.broken.store(true, Ordering::Release);
         bail!("Could not read the text from Claude Code (Ctrl+G editor)")
     }
 
+    fn editor_back_lock(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.editor_back
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Waits until Claude Code has read the prompt back from the last editor run, which is
+    /// paid before the next keys rather than while a recording finishes.
+    fn wait_editor_back(&self) {
+        let back = self.editor_back_lock().take();
+        if let Some(wait) = back.and_then(|at| at.checked_duration_since(Instant::now())) {
+            std::thread::sleep(wait);
+        }
+    }
+
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::Acquire)
+    }
+
     fn clear_prompt(&self) {
-        if let Err(error) = self.capture(Duration::from_secs(5)) {
+        if let Err(error) = self.capture(CAPTURE_TIMEOUT) {
             crate::capture::scrawl_log(format!(
                 "Claude Code dictation: could not clear the prompt: {error:#}"
             ));
@@ -455,25 +596,61 @@ pub fn warm() {
         }
         *slot = Slot::Starting;
     }
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("scrawl-claude-start".into())
         .spawn(move || {
-            let started = Session::start(&language);
-            let mut slot = pool();
-            *slot = match started {
-                Ok(session) => Slot::Ready(session),
-                Err(error) => {
-                    crate::capture::scrawl_log(format!(
-                        "Claude Code dictation: could not start the session: {error:#}"
-                    ));
-                    *LAST_FAILURE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-                    Slot::Empty
-                }
-            };
-            CHANGED.notify_all();
+            let starting = Starting::new(&POOL);
+            match Session::start(&language) {
+                Ok(session) => starting.ready(session),
+                Err(error) => crate::capture::scrawl_log(format!(
+                    "Claude Code dictation: could not start the session: {error:#}"
+                )),
+            }
         });
+    if let Err(error) = spawned {
+        crate::capture::scrawl_log(format!(
+            "Claude Code dictation: could not start the session: {error}"
+        ));
+        drop(Starting::new(&POOL));
+    }
+}
+
+/// A session being started into `slot`. Dropped without `ready` (an error, a panic, a thread
+/// that never ran), it empties the slot and notes the failure, so the slot never stays
+/// `Starting` and later recordings wait for nothing.
+struct Starting<'a> {
+    slot: &'a Mutex<Slot>,
+    done: bool,
+}
+
+impl<'a> Starting<'a> {
+    fn new(slot: &'a Mutex<Slot>) -> Self {
+        Self { slot, done: false }
+    }
+
+    fn ready(mut self, session: Session) {
+        self.done = true;
+        self.set(Slot::Ready(session));
+    }
+
+    fn set(&self, to: Slot) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = to;
+        CHANGED.notify_all();
+    }
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            *LAST_FAILURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            self.set(Slot::Empty);
+        }
+    }
 }
 
 /// Ends the warm session, if any.
@@ -551,15 +728,15 @@ fn failed_recently() -> bool {
         .is_some_and(|at| at.elapsed() < RETRY_AFTER)
 }
 
-/// Puts a session back for the next recording; a dead one is replaced, and one no longer
-/// wanted ends.
+/// Puts a session back for the next recording; a dead or broken one is replaced, and one no
+/// longer wanted ends.
 fn give_back(session: Session) {
-    let alive = session.is_alive();
-    let wanted = wanted();
+    let (alive, broken, wanted) = (session.is_alive(), session.is_broken(), wanted());
+    let keep = keep(alive, broken, wanted);
     {
         let mut slot = pool();
         if matches!(&*slot, Slot::InUse) {
-            *slot = if alive && wanted {
+            *slot = if keep {
                 Slot::Ready(session)
             } else {
                 Slot::Empty
@@ -567,18 +744,25 @@ fn give_back(session: Session) {
             CHANGED.notify_all();
         }
     }
-    if !alive {
-        crate::capture::scrawl_log("Claude Code dictation: the session ended");
-        if wanted {
-            warm();
-        }
+    if !keep && wanted {
+        crate::capture::scrawl_log(if alive {
+            "Claude Code dictation: replacing the session after a failed step"
+        } else {
+            "Claude Code dictation: the session ended"
+        });
+        warm();
     }
+}
+
+/// Whether a session goes back into the slot for the next recording.
+fn keep(alive: bool, broken: bool, wanted: bool) -> bool {
+    alive && !broken && wanted
 }
 
 // --- one recording ----------------------------------------------------------------------------
 
 /// What the session made of one recording.
-struct Heard {
+pub(crate) struct Heard {
     text: String,
     /// Samples the recorder had when Claude Code started listening.
     from_sample: usize,
@@ -613,11 +797,30 @@ impl Take {
         })
     }
 
-    /// Releases the key and turns the text into a transcript of `wav_bytes`, the recording.
+    /// Releases the dictation key: the recording has stopped, and nothing said from now on is
+    /// part of it (`AudioRecorder::stop`, before its buffer is taken).
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    /// Releases the key and turns the text into a transcript of `wav_bytes`, the recording. A
+    /// recording without speech gives up at once, without waiting for Claude Code.
     pub fn finish(&mut self, wav_bytes: &[u8]) -> Result<Finished> {
         let finishing = Instant::now();
         self.finished = true;
-        self.released.store(true, Ordering::Release);
+        let samples = crate::audio::decode_wav_16k(wav_bytes);
+        let islands = samples
+            .as_deref()
+            .map(crate::audio::speech_islands)
+            .unwrap_or_default();
+        if islands.is_empty() {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        self.release();
+        let samples = samples?;
+        if islands.is_empty() {
+            bail!("the recording has no speech");
+        }
         let heard = match self.result.recv_timeout(FINISH_TIMEOUT) {
             Ok(heard) => heard?,
             Err(RecvTimeoutError::Timeout) => {
@@ -629,7 +832,6 @@ impl Take {
             }
             Err(RecvTimeoutError::Disconnected) => bail!("the Claude Code dictation vanished"),
         };
-        let samples = crate::audio::decode_wav_16k(wav_bytes)?;
         let duration_ms = samples.len() as u64 / 16;
         let heard_from_ms = heard.from_sample as u64 / 16;
         crate::capture::scrawl_log(format!(
@@ -638,7 +840,7 @@ impl Take {
         ));
         let transcript = spread::transcript(
             &heard.text,
-            &crate::audio::speech_islands(&samples),
+            &islands,
             heard_from_ms,
             duration_ms,
             &crate::handoff::transcription_language(),
@@ -665,13 +867,25 @@ fn dictate(
     released: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<Heard> {
+    if let Some(reason) = other_microphone() {
+        static LOGGED: Mutex<Option<String>> = Mutex::new(None);
+        let mut logged = LOGGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if logged.as_deref() != Some(reason.as_str()) {
+            crate::capture::scrawl_log(format!(
+                "Claude Code dictation: {reason}; transcribing recordings from their file"
+            ));
+            *logged = Some(reason);
+        }
+        return Err(anyhow!(Skipped));
+    }
     let session = acquire(released)?;
     let mut from_sample = 0;
-    let began = session.begin(released, || {
-        from_sample = samples
-            .lock()
-            .map(|samples| samples.len())
-            .unwrap_or_default();
+    let began = session.begin(released, || match hearing_point(samples, released) {
+        Some(at) => {
+            from_sample = at;
+            true
+        }
+        None => false,
     });
     if let Err(error) = began {
         give_back(session);
@@ -699,6 +913,45 @@ fn dictate(
         text: text?,
         from_sample,
     })
+}
+
+/// Claude Code dictation wasn't tried for this recording, for a reason already logged once
+/// (`transcribe::finish_live` stays quiet about it).
+#[derive(Debug)]
+pub struct Skipped;
+
+impl std::fmt::Display for Skipped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Claude Code dictation skipped")
+    }
+}
+
+impl std::error::Error for Skipped {}
+
+/// Why Claude Code would hear another microphone than the recording, if it would: it always
+/// records the system default, and Scrawl records the one chosen in Settings (or the default
+/// when the chosen one isn't connected, as `AudioRecorder::open_stream` does).
+fn other_microphone() -> Option<String> {
+    let choice = crate::mic::choice()?;
+    other_microphone_of(&choice, &crate::mic::inputs())
+}
+
+fn other_microphone_of(choice: &crate::mic::Choice, inputs: &crate::mic::Inputs) -> Option<String> {
+    let used = inputs.find(&choice.id)?;
+    (inputs.default.as_deref() != Some(used.id.as_str())).then(|| {
+        format!(
+            "Scrawl records {} but Claude Code dictates from the default microphone",
+            used.name
+        )
+    })
+}
+
+/// How many samples the recording has as Claude Code starts listening, or `None` once it has
+/// stopped. `released` is read under the buffer's lock, which `AudioRecorder::stop` takes only
+/// after releasing, so an emptied buffer is never read as "listening from the start".
+fn hearing_point(samples: &Mutex<Vec<f32>>, released: &AtomicBool) -> Option<usize> {
+    let samples = samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (!released.load(Ordering::Acquire)).then(|| samples.len())
 }
 
 // --- the editor shim and the self-test ----------------------------------------------------------
@@ -743,7 +996,7 @@ pub fn selftest() -> Result<bool> {
 
     let never = AtomicBool::new(false);
     let started = Instant::now();
-    match session.begin(&never, || {}) {
+    match session.begin(&never, || true) {
         Ok(()) => {
             println!(
                 "listening after {:.2} s",
@@ -771,7 +1024,7 @@ pub fn selftest() -> Result<bool> {
         }
     }
 
-    match session.begin(&never, || {}) {
+    match session.begin(&never, || true) {
         Ok(()) => {
             std::thread::sleep(Duration::from_secs(1));
             session.cancel();
@@ -787,4 +1040,257 @@ pub fn selftest() -> Result<bool> {
     println!("alive at the end: {}", session.is_alive());
     println!("{}", if ok { "PASS" } else { "FAIL" });
     Ok(ok)
+}
+
+/// A take without a session: its thread's answer is sent by hand on the returned sender (or
+/// never), and its `released` and `cancelled` flags are returned to look at.
+#[cfg(test)]
+pub(crate) fn test_take() -> (
+    Take,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    std::sync::mpsc::Sender<Result<Heard>>,
+) {
+    let released = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (answer, result) = std::sync::mpsc::channel();
+    let take = Take {
+        released: Arc::clone(&released),
+        cancelled: Arc::clone(&cancelled),
+        result,
+        finished: false,
+    };
+    (take, released, cancelled, answer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::*;
+
+    /// 16 kHz samples, quiet room noise with louder noise (speech, as `speech_islands` sees it)
+    /// in `bursts` (ms).
+    fn recording(duration_ms: u64, bursts: &[(u64, u64)]) -> Vec<f32> {
+        let mut seed = 12_345_u32;
+        (0..duration_ms * 16)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let noise = (seed >> 16) as f32 / 32_768.0 - 1.0;
+                let ms = i / 16;
+                let loud = bursts.iter().any(|&(from, to)| (from..to).contains(&ms));
+                noise * if loud { 0.3 } else { 0.000_5 }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_a_sound_session_goes_back_for_the_next_recording() {
+        assert!(keep(true, false, true));
+        assert!(
+            !keep(true, true, true),
+            "a failed step leaves old text or a late editor run"
+        );
+        assert!(!keep(false, false, true));
+        assert!(!keep(true, false, false));
+    }
+
+    #[test]
+    fn a_session_that_fails_or_panics_while_starting_empties_the_slot() {
+        let slot = Mutex::new(Slot::Starting);
+        drop(Starting::new(&slot));
+        assert!(matches!(*slot.lock().unwrap(), Slot::Empty), "an error");
+
+        *slot.lock().unwrap() = Slot::Starting;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _starting = Starting::new(&slot);
+            panic!("a non-Unicode variable");
+        }));
+        assert!(panicked.is_err());
+        let slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(*slot, Slot::Empty), "a panic");
+    }
+
+    #[test]
+    fn every_process_and_session_has_its_own_files() {
+        let dir = Path::new(r"C:\x");
+        let (settings, capture) = session_files(dir, 41, 0);
+        assert_eq!(settings, dir.join("claude-settings-41.json"));
+        assert_eq!(capture, dir.join("capture-41-0.txt"));
+        assert_ne!(
+            session_files(dir, 42, 0),
+            (settings.clone(), capture.clone())
+        );
+        assert_eq!(session_files(dir, 41, 1).0, settings);
+        assert_ne!(
+            session_files(dir, 41, 1).1,
+            capture,
+            "a killed session's late editor run"
+        );
+        for (name, pid) in [
+            ("claude-settings-41.json", Some(Some(41))),
+            ("capture-41-3.txt", Some(Some(41))),
+            ("capture-41-3.tmp", Some(Some(41))),
+            ("capture.txt", Some(None)),
+            ("claude-settings.json", Some(None)),
+            ("claude-cwd", None),
+            ("capture-x-1.txt", None),
+        ] {
+            assert_eq!(file_pid(name), pid, "{name}");
+        }
+        assert!(process_running(std::process::id()));
+    }
+
+    #[test]
+    fn listening_that_starts_after_the_recording_stopped_does_not_count() {
+        let samples = Mutex::new(vec![0.0; 3_200]);
+        let released = AtomicBool::new(false);
+        assert_eq!(hearing_point(&samples, &released), Some(3_200));
+        released.store(true, Ordering::Release);
+        // `AudioRecorder::stop` has emptied the buffer: never "listening from the start".
+        samples.lock().unwrap().clear();
+        assert_eq!(hearing_point(&samples, &released), None);
+    }
+
+    #[test]
+    fn claude_is_used_only_with_the_default_microphone() {
+        let input = |id: &str| crate::mic::Input {
+            id: id.into(),
+            name: format!("Mic {id}"),
+        };
+        let inputs = crate::mic::Inputs {
+            devices: vec![input("a"), input("b")],
+            default: Some("a".into()),
+        };
+        let choice = |id: &str| crate::mic::Choice {
+            id: id.into(),
+            name: "old name".into(),
+        };
+        assert_eq!(other_microphone_of(&choice("a"), &inputs), None);
+        assert_eq!(
+            other_microphone_of(&choice("gone"), &inputs),
+            None,
+            "the recorder uses the default then"
+        );
+        assert_eq!(
+            other_microphone_of(&choice("b"), &inputs).as_deref(),
+            Some("Scrawl records Mic b but Claude Code dictates from the default microphone")
+        );
+    }
+
+    #[test]
+    fn a_recording_without_speech_falls_back_at_once() {
+        let (mut take, released, cancelled, _answer) = test_take();
+        let wav = crate::audio::encode_wav_16k(&recording(3_000, &[])).unwrap();
+        let started = Instant::now();
+        let error = take.finish(&wav).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(error.to_string(), "the recording has no speech");
+        assert!(cancelled.load(Ordering::Acquire) && released.load(Ordering::Acquire));
+    }
+
+    /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`.
+    #[test]
+    fn dictated_text_reaches_the_summary_under_the_keyframe_it_was_said_at() {
+        let samples = recording(8_000, &[(1_000, 2_500), (5_000, 6_500)]);
+        let islands = crate::audio::speech_islands(&samples);
+        assert_eq!(islands.len(), 2, "{islands:?}");
+        let (take, _released, _cancelled, answer) = test_take();
+        answer
+            .send(Ok(Heard {
+                text: "Erstens das hier oben. Zweitens das dort unten.".into(),
+                from_sample: 0,
+            }))
+            .unwrap();
+        let audio = crate::audio::RecordedAudio {
+            sample_count: samples.len(),
+            duration_ms: 8_000,
+            wav_bytes: crate::audio::encode_wav_16k(&samples).unwrap(),
+            live: crate::live_transcribe::Slot::new(Some(crate::live_transcribe::Live::claude(
+                take,
+            ))),
+        };
+        let transcript =
+            crate::transcribe::transcribe(Some(Path::new("never-read.wav")), Some(&audio));
+        assert_eq!(transcript.source, "claude-code");
+        assert!(transcript.estimated);
+        assert_eq!(
+            transcript.text,
+            "Erstens das hier oben. Zweitens das dort unten."
+        );
+        let (first, last) = (&transcript.words[0], transcript.words.last().unwrap());
+        assert!(first.t0 >= 900 && last.t1 <= 6_600, "{first:?} {last:?}");
+
+        let times = [1_500, 4_800];
+        let said = crate::keyframes::said_per_keyframe(&times, &[], &transcript);
+        let keyframes = times
+            .iter()
+            .zip(said)
+            .enumerate()
+            .map(|(i, (&t, said))| Keyframe {
+                index: i + 1,
+                t,
+                reason: KeyframeReason::SceneChange,
+                file: format!("frames/frame-{:02}.png", i + 1),
+                event: "scene changed".into(),
+                said,
+                mark_id: None,
+                cursor: None,
+            })
+            .collect();
+        let bundle = ScrawlBundle {
+            version: 1,
+            id: "t".into(),
+            created_at_ms: 0,
+            duration_ms: 8_000,
+            target: TargetInfo {
+                mode: CaptureMode::Display,
+                app: None,
+                bundle_id: None,
+                window_title: None,
+                window_id: None,
+                display_id: 1,
+                frame: TargetFrame {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1000.0,
+                    height: 1000.0,
+                    scale: 1.0,
+                },
+            },
+            transcript,
+            note: None,
+            strokes: Vec::new(),
+            marks: Vec::new(),
+            events: Vec::new(),
+            keyframes,
+            contact_sheet: "contact-sheet.png".into(),
+            video: None,
+            video_offset_ms: 0,
+            audio: None,
+            source: None,
+            device: None,
+            context: Default::default(),
+            context_changes: Vec::new(),
+            screens: Vec::new(),
+            windows: Vec::new(),
+            cursor: Vec::new(),
+            autocrop: None,
+            destination: None,
+        };
+        let summary = crate::sketch::summary_markdown(&bundle, Path::new("/recordings/t"));
+        assert!(summary.contains("Word times are estimated"), "{summary}");
+        assert!(
+            summary.contains("Erstens das hier oben.")
+                && summary.find("- #1 (0:01)") < summary.find("Erstens")
+                && summary.find("Erstens") < summary.find("- #2 (0:04)")
+                && summary.find("- #2 (0:04)") < summary.find("Zweitens das dort unten."),
+            "{summary}"
+        );
+    }
 }

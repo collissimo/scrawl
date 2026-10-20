@@ -77,14 +77,16 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// `--transcriber` for `import` and `reprocess`, which transcribe a saved file: Claude Code
+/// dictation listens to the microphone, so it can't.
 fn parse_engine(name: &str) -> Result<crate::transcribe::Engine, String> {
-    crate::transcribe::Engine::parse(name).ok_or_else(|| {
-        if cfg!(target_os = "windows") {
-            "expected `apple`, `hex` or `claude`".to_owned()
-        } else {
-            "expected `apple` or `hex`".to_owned()
+    match crate::transcribe::Engine::parse(name) {
+        Some(crate::transcribe::Engine::Claude) => {
+            Err("Claude Code dictation only runs while recording".to_owned())
         }
-    })
+        Some(engine) => Ok(engine),
+        None => Err("expected `apple` or `hex`".to_owned()),
+    }
 }
 
 /// `scrawl hex status`: connection, models and what the next recording would use.
@@ -2348,6 +2350,29 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_files_cannot_be_transcribed_by_claude_code_dictation() {
+        assert_eq!(parse_engine("hex"), Ok(transcribe::Engine::Hex));
+        assert_eq!(parse_engine("apple"), Ok(transcribe::Engine::Apple));
+        assert_eq!(parse_engine("whisper"), Err("expected `apple` or `hex`".to_owned()));
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                parse_engine("claude"),
+                Err("Claude Code dictation only runs while recording".to_owned())
+            );
+        }
+        let parsed = Cli::try_parse_from([
+            "scrawl",
+            "reprocess",
+            "latest",
+            "--out",
+            "x",
+            "--transcriber",
+            "claude",
+        ]);
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn artifact_failures_do_not_publish_a_manifest() {
