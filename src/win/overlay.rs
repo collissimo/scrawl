@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(none, [-1920, 0, 400, 100]);
     }
 
-    /// Collin's desk: a 1080p primary and a 1440p display to its right, both at 100 %.
+    /// A desk with a 1080p primary and a 1440p display to its right, both at 100 %.
     fn desk() -> Vec<Monitor> {
         let monitor = |handle, rect: [f64; 4], primary| Monitor {
             handle,
