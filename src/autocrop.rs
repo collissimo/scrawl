@@ -1931,6 +1931,7 @@ mod tests {
             said: None,
             mark_id: None,
             cursor: Some([0.5, 0.5]),
+            narration: None,
         }
     }
 

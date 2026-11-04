@@ -29,6 +29,7 @@ mod laser_overlay;
 mod live_transcribe;
 mod mic;
 mod model;
+mod narration;
 mod native;
 mod onboarding;
 mod onboarding_window;
@@ -2551,6 +2552,7 @@ mod tests {
             said: None,
             mark_id: None,
             cursor: None,
+            narration: None,
         };
         let small = |t: u64| RgbaFrame::new(t, 32, 32, vec![10; 32 * 32 * 4]);
         let large = |t: u64| RgbaFrame::new(t, 160, 160, vec![200; 160 * 160 * 4]);

@@ -841,7 +841,9 @@ pub fn summary_markdown_with(
         (change.t, text)
     }));
     app_events.sort_by_key(|(t, _)| *t);
-    if agent_context && !bundle.keyframes.is_empty() {
+    // Keyframes built from whole sentences carry their own text; agentContext's split would cut it.
+    let narrated = bundle.keyframes.iter().any(|k| k.narration.is_some());
+    if agent_context && !narrated && !bundle.keyframes.is_empty() {
         let texts = crate::agent_context::keyframe_texts(bundle);
         let mut shown_screen = start_screen;
         for (frame, text) in bundle.keyframes.iter().zip(texts) {
@@ -893,39 +895,58 @@ pub fn summary_markdown_with(
                 .and_then(|id| bundle.marks.iter().find(|m| &m.id == id))
                 .is_some_and(|m| m.shape == Shape::Flag);
             let flag_marker = if flag { " ⚑" } else { "" };
-            match frame
-                .said
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                Some(said) => {
-                    let action_marker = if flag {
-                        " ⚑".to_owned()
-                    } else if frame.reason == KeyframeReason::Click {
-                        let compact = frame
-                            .event
-                            .split(" (")
-                            .next()
-                            .unwrap_or(&frame.event)
-                            .trim();
-                        if compact.is_empty() {
-                            String::new()
+            if let Some(narration) = &frame.narration {
+                let flagged = bundle
+                    .marks
+                    .iter()
+                    .any(|m| m.shape == Shape::Flag && mark_on_keyframe(m, frame));
+                let head = format!(
+                    "- #{} ({clock}){screen_marker}{}",
+                    frame.index,
+                    if flagged { " ⚑" } else { "" }
+                );
+                out.push_str(&crate::narration::summary_text(
+                    &head,
+                    frame.said.as_deref(),
+                    flagged,
+                    narration,
+                ));
+                out.push('\n');
+            } else {
+                match frame
+                    .said
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(said) => {
+                        let action_marker = if flag {
+                            " ⚑".to_owned()
+                        } else if frame.reason == KeyframeReason::Click {
+                            let compact = frame
+                                .event
+                                .split(" (")
+                                .next()
+                                .unwrap_or(&frame.event)
+                                .trim();
+                            if compact.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{compact}]")
+                            }
                         } else {
-                            format!(" [{compact}]")
-                        }
-                    } else {
-                        String::new()
-                    };
-                    out.push_str(&format!(
-                        "- #{} ({clock}){screen_marker}{action_marker} “{said}”\n",
-                        frame.index
-                    ));
+                            String::new()
+                        };
+                        out.push_str(&format!(
+                            "- #{} ({clock}){screen_marker}{action_marker} “{said}”\n",
+                            frame.index
+                        ));
+                    }
+                    None => out.push_str(&format!(
+                        "- #{} ({clock}){screen_marker}{flag_marker} {}\n",
+                        frame.index, frame.event
+                    )),
                 }
-                None => out.push_str(&format!(
-                    "- #{} ({clock}){screen_marker}{flag_marker} {}\n",
-                    frame.index, frame.event
-                )),
             }
             let next = bundle.keyframes.get(i + 1).map_or(u64::MAX, |k| k.t);
             for (t, label) in &app_events {
@@ -2090,6 +2111,7 @@ mod tests {
                 said: Some("This row is too dense.".into()),
                 mark_id: Some("m1".into()),
                 cursor: None,
+                narration: None,
             }],
             contact_sheet: "contact.png".into(),
             video: None,
@@ -2172,6 +2194,7 @@ mod tests {
             said: None,
             mark_id: Some("f1".into()),
             cursor: None,
+            narration: None,
         });
         phone.events = vec![
             InteractionEvent::AppEvent {
@@ -2228,6 +2251,7 @@ mod tests {
             said: Some("And then I scroll up.".into()),
             mark_id: None,
             cursor: Some([0.50, 0.20]),
+            narration: None,
         });
         let summary_with_action =
             summary_markdown(&phone, std::path::Path::new("/recordings/phone"));
@@ -2257,6 +2281,7 @@ mod tests {
             said: said.map(str::to_owned),
             mark_id: None,
             cursor: None,
+            narration: None,
         };
         bundle.keyframes = vec![
             keyframe(

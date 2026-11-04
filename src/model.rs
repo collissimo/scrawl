@@ -577,6 +577,10 @@ pub struct Keyframe {
     pub mark_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<[f32; 2]>,
+    /// Built from whole sentences (experiment `sentenceNarration`): what `summary.md` says
+    /// besides `said`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narration: Option<crate::narration::Narrated>,
 }
 
 /// Raw RGBA8 frame buffer in memory used for candidate selection and compositing.

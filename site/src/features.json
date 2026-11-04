@@ -185,6 +185,16 @@
       "docs": ["docs/onboarding-and-settings.md"]
     },
     {
+      "id": "sentence-narration",
+      "group": "agent",
+      "name": "Whole sentences own keyframes",
+      "says": "Each keyframe takes whole sentences and lists what was done over them; click bursts fold into one, and a click the screen didn't answer reads as pointing.",
+      "status": "experiment:sentenceNarration",
+      "platforms": ["mac", "windows", "linux"],
+      "added": "2026-11-04",
+      "docs": ["docs/keyframes-and-text.md"]
+    },
+    {
       "id": "speech-follows-marks",
       "group": "agent",
       "name": "Speech follows the mark",

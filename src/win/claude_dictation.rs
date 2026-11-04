@@ -14,10 +14,10 @@
 //! failure returns an error and Parakeet's transcript is used instead.
 
 mod align;
-mod screen;
-mod spread;
 #[cfg(test)]
 mod fixtures;
+mod screen;
+mod spread;
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -69,7 +69,9 @@ pub fn claude_path() -> Option<PathBuf> {
     static CACHE: Mutex<Option<(Instant, Option<PathBuf>)>> = Mutex::new(None);
     static SEARCHING: AtomicBool = AtomicBool::new(false);
     let store = |found: &Option<PathBuf>| {
-        *CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        *CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((Instant::now(), found.clone()));
     };
     let cached = CACHE
@@ -153,7 +155,9 @@ fn file_pid(name: &str) -> Option<Option<u32>> {
         .and_then(|rest| rest.strip_suffix(".json"))
         .or_else(|| {
             let rest = name.strip_prefix("capture-")?;
-            let rest = rest.strip_suffix(".txt").or_else(|| rest.strip_suffix(".tmp"))?;
+            let rest = rest
+                .strip_suffix(".txt")
+                .or_else(|| rest.strip_suffix(".tmp"))?;
             Some(rest.split_once('-')?.0)
         })?;
     Some(Some(id.parse().ok()?))
@@ -196,8 +200,8 @@ fn process_running(pid: u32) -> bool {
             return false;
         };
         let mut code = 0_u32;
-        let running = GetExitCodeProcess(process, &mut code).is_ok()
-            && code == STILL_ACTIVE.0 as u32;
+        let running =
+            GetExitCodeProcess(process, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
         let _ = CloseHandle(process);
         running
     }
@@ -384,8 +388,8 @@ impl Session {
             // anyway, let the screen settle and empty the prompt, so the session can serve the
             // next recording. Only a failure there leaves it broken.
             let _ = self.write(ESC);
-            let cleared = self.wait_settled(SETTLE_TIMEOUT).is_ok()
-                && self.capture(CAPTURE_TIMEOUT).is_ok();
+            let cleared =
+                self.wait_settled(SETTLE_TIMEOUT).is_ok() && self.capture(CAPTURE_TIMEOUT).is_ok();
             if !cleared {
                 self.broken.store(true, Ordering::Release);
             }
@@ -596,7 +600,8 @@ static LAST_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
 const RETRY_AFTER: Duration = Duration::from_secs(60);
 
 fn pool() -> std::sync::MutexGuard<'static, Slot> {
-    POOL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    POOL.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether recordings use Claude Code dictation now, so a session is worth keeping warm: the
@@ -927,7 +932,9 @@ fn dictate(
 ) -> Result<Heard> {
     if let Some(reason) = skip_reason() {
         static LOGGED: Mutex<Option<String>> = Mutex::new(None);
-        let mut logged = LOGGED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut logged = LOGGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if logged.as_deref() != Some(reason.as_str()) {
             crate::capture::scrawl_log(format!(
                 "Claude Code dictation: {reason}; transcribing recordings from their file"
@@ -1020,7 +1027,9 @@ fn other_microphone_of(choice: &crate::mic::Choice, inputs: &crate::mic::Inputs)
 /// stopped. `released` is read under the buffer's lock, which `AudioRecorder::stop` takes only
 /// after releasing, so an emptied buffer is never read as "listening from the start".
 fn hearing_point(samples: &Mutex<Vec<f32>>, released: &AtomicBool) -> Option<usize> {
-    let samples = samples.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let samples = samples
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     (!released.load(Ordering::Acquire)).then(|| samples.len())
 }
 
@@ -1029,9 +1038,8 @@ fn hearing_point(samples: &Mutex<Vec<f32>>, released: &AtomicBool) -> Option<usi
 /// `scrawl.exe claude-editor <file>`, run by Claude Code as `$EDITOR` on its prompt: copies the
 /// file to the capture file and empties it, so the text leaves exactly as dictated.
 pub fn editor_main(file: &Path) -> Result<()> {
-    let target = PathBuf::from(
-        std::env::var_os(CAPTURE_ENV).context("SCRAWL_CLAUDE_CAPTURE is not set")?,
-    );
+    let target =
+        PathBuf::from(std::env::var_os(CAPTURE_ENV).context("SCRAWL_CLAUDE_CAPTURE is not set")?);
     let text = std::fs::read(file).with_context(|| format!("Could not read {}", file.display()))?;
     let pending = target.with_extension("tmp");
     std::fs::write(&pending, &text)?;
@@ -1068,10 +1076,7 @@ pub fn selftest() -> Result<bool> {
     let started = Instant::now();
     match session.begin(&never, || true) {
         Ok(()) => {
-            println!(
-                "listening after {:.2} s",
-                started.elapsed().as_secs_f64()
-            );
+            println!("listening after {:.2} s", started.elapsed().as_secs_f64());
             std::thread::sleep(Duration::from_secs(2));
             println!("while holding: {}", session.state().summary());
             println!("preview: {:?}", screen::preview(&session.rows()));
@@ -1265,7 +1270,9 @@ mod tests {
         let wav = crate::audio::encode_wav_16k(&recording(3_000, &[])).unwrap();
         let started = Instant::now();
         let error = take
-            .finish(&wav, || panic!("Parakeet is never waited for without speech"))
+            .finish(&wav, || {
+                panic!("Parakeet is never waited for without speech")
+            })
             .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -1414,7 +1421,10 @@ mod tests {
             Ok(parakeet(&[(600, "Hallo"), (1_200, "Welt.")]))
         });
         let took = started.elapsed();
-        assert!(took < Duration::from_millis(550), "one after the other takes 600 ms: {took:?}");
+        assert!(
+            took < Duration::from_millis(550),
+            "one after the other takes 600 ms: {took:?}"
+        );
         assert!(!transcript.estimated);
         assert_eq!(transcript.words[1].t0, 1_200);
     }
@@ -1447,6 +1457,7 @@ mod tests {
                 said,
                 mark_id: None,
                 cursor: None,
+                narration: None,
             })
             .collect();
         let bundle = ScrawlBundle {
@@ -1507,7 +1518,10 @@ mod tests {
         let measured = crate::helper::transcribe(&wav).unwrap();
         println!("Parakeet ({:?}): {}", measured.model, measured.text);
         for segment in &measured.segments {
-            println!("Parakeet segment {}-{}: {}", segment.t0, segment.t1, segment.text);
+            println!(
+                "Parakeet segment {}-{}: {}",
+                segment.t0, segment.t1, segment.text
+            );
         }
         let text = std::env::var("SCRAWL_ALIGN_TEXT").unwrap_or_else(|_| measured.text.clone());
         let (take, _released, _cancelled, answer) = test_take();
@@ -1551,7 +1565,10 @@ mod tests {
             summary_with(transcript.clone(), &times, &anchors, audio.duration_ms)
         );
         assert!(!transcript.estimated);
-        assert_eq!(transcript.text, text.split_whitespace().collect::<Vec<_>>().join(" "));
+        assert_eq!(
+            transcript.text,
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 
     /// Release → Claude Code's text → spread over the speech → `summary.md`, without `claude`,

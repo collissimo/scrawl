@@ -487,6 +487,18 @@ impl DragRun {
     }
 }
 
+/// One drag as its line says it (`dragged right`, `scrubbed slider “Playback”`), or `None` for
+/// the hand's short unnamed moves.
+pub(crate) fn drag_line(event: &InteractionEvent) -> Option<String> {
+    let t = event.timestamp_ms();
+    drag_text(event).map(|drag| DragRun::new(drag, t, t).line().1)
+}
+
+/// What a mark is, as a keyframe's text says it (`circled “Area” (2 strokes)`).
+pub(crate) fn mark_line(mark: &Mark) -> String {
+    mark_text(mark)
+}
+
 /// A click, scroll, point or key press without coordinates; `None` for a point nothing names.
 fn event_text(event: &InteractionEvent) -> Option<String> {
     match event {
@@ -847,6 +859,7 @@ mod tests {
             said: (!said.is_empty()).then(|| said.into()),
             mark_id: None,
             cursor: None,
+            narration: None,
         }
     }
 

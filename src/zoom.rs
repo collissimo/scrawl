@@ -309,6 +309,7 @@ pub fn zoom(
             // From the moment the mark starts, its whole ink stays drawn.
             mark_id: mark.filter(|e| t >= e.mark.t0).map(|e| e.mark.id.clone()),
             cursor: None,
+            narration: None,
         };
         let view =
             crate::autocrop::crop_view(rect, &keyframe, &bundle.strokes, &bundle.marks, &events);
