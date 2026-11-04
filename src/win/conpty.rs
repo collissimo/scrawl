@@ -3,9 +3,9 @@
 //! joins a kill-on-close job object, so it (and anything it starts) ends with Scrawl.
 
 use std::ffi::{OsString, c_void};
-use std::os::windows::ffi::OsStrExt as _;
 use std::fs::File;
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -21,10 +21,9 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -275,6 +274,16 @@ mod tests {
         // An unpaired surrogate (not Unicode) survives as is.
         let odd = OsString::from_wide(&[0xD800, u16::from(b'x')]);
         let block = environment_block(&[("K".into(), odd)]);
-        assert_eq!(block, [u16::from(b'K'), u16::from(b'='), 0xD800, u16::from(b'x'), 0, 0]);
+        assert_eq!(
+            block,
+            [
+                u16::from(b'K'),
+                u16::from(b'='),
+                0xD800,
+                u16::from(b'x'),
+                0,
+                0
+            ]
+        );
     }
 }

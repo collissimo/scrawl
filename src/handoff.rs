@@ -809,7 +809,11 @@ pub fn language_of(config: &Config) -> String {
 
 /// `"de"`, `"de-DE"` and `"de_DE.UTF-8"` are all `de`; anything else is no language.
 pub fn language_code(raw: &str) -> Option<String> {
-    let code = raw.trim().split(['-', '_', '.']).next()?.to_ascii_lowercase();
+    let code = raw
+        .trim()
+        .split(['-', '_', '.'])
+        .next()?
+        .to_ascii_lowercase();
     (matches!(code.len(), 2 | 3) && code.bytes().all(|b| b.is_ascii_lowercase())).then_some(code)
 }
 

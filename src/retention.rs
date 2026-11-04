@@ -1308,11 +1308,22 @@ mod tests {
     fn keep_video_is_its_own_switch_beside_the_presets() {
         let tmp = TempDir::new("keep-video");
         let path = tmp.0.join("config.json");
-        assert!(Policy::load_from(&path).keep_video, "kept unless switched off");
-        std::fs::write(&path, r#"{"ingestToken":"abc","retention":{"keepVideo":false}}"#).unwrap();
+        assert!(
+            Policy::load_from(&path).keep_video,
+            "kept unless switched off"
+        );
+        std::fs::write(
+            &path,
+            r#"{"ingestToken":"abc","retention":{"keepVideo":false}}"#,
+        )
+        .unwrap();
         let loaded = Policy::load_from(&path);
         assert_eq!(loaded, without_video());
-        assert_eq!(loaded.preset(), Some(Preset::Week), "the days still read as Week");
+        assert_eq!(
+            loaded.preset(),
+            Some(Preset::Week),
+            "the days still read as Week"
+        );
         let month = loaded.with_preset(Preset::Month);
         assert_eq!(
             (month.media_days, month.bundle_days, month.keep_video),
@@ -1334,7 +1345,10 @@ mod tests {
         let tmp = TempDir::new("drop");
         let fresh = bundle(&tmp.0, "scrawl-fresh", 0.5, false);
         let unmarked = bundle(&tmp.0, "scrawl-unmarked", 0.5, false);
-        assert!(!mark_for_deletion(&fresh, &Policy::default()), "videos are kept");
+        assert!(
+            !mark_for_deletion(&fresh, &Policy::default()),
+            "videos are kept"
+        );
         assert!(!fresh.join(DROP_VIDEO).exists());
         assert!(mark_for_deletion(&fresh, &without_video()));
         // Only captures finished with the switch off; older videos follow the days.
@@ -1362,7 +1376,10 @@ mod tests {
         assert!(!tmp.0.join(".trash-staging").exists(), "not via the Trash");
         let reason = missing_media_reason(&fresh).unwrap();
         assert!(reason.contains("deleted after the capture"), "{reason}");
-        assert!(planned(&tmp.0, &without_video()).is_empty(), "nothing left to do");
+        assert!(
+            planned(&tmp.0, &without_video()).is_empty(),
+            "nothing left to do"
+        );
     }
 
     #[test]
@@ -1383,10 +1400,22 @@ mod tests {
         assert_eq!(delete_video_now(&undelivered, &off), Err(()));
         assert_eq!(delete_video_now(&sending, &off), Err(()));
         assert_eq!(delete_video_now(&busy, &off), Err(()));
-        assert_eq!(delete_video_now(&pinned, &off), Ok(()), "pinned: nothing to retry");
+        assert_eq!(
+            delete_video_now(&pinned, &off),
+            Ok(()),
+            "pinned: nothing to retry"
+        );
         for dir in [&undelivered, &sending, &busy, &pinned] {
-            assert!(dir.join("recording.mp4").is_file(), "{} kept", dir.display());
-            assert!(dir.join(DROP_VIDEO).exists(), "{} still marked", dir.display());
+            assert!(
+                dir.join("recording.mp4").is_file(),
+                "{} kept",
+                dir.display()
+            );
+            assert!(
+                dir.join(DROP_VIDEO).exists(),
+                "{} still marked",
+                dir.display()
+            );
         }
         // Only the copy's marker has gone stale by the time of the pass.
         assert_eq!(

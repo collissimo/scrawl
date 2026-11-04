@@ -40,23 +40,23 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoEncodeQP,
-    ICodecAPI, IMF2DBuffer, IMFAttributes, IMFMediaType,
-    IMFSample, IMFSinkWriter, IMFSinkWriterEx, IMFSourceReader, IMFTransform,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute,
-    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
-    eAVEncCommonRateControlMode_Quality, eAVEncCommonRateControlMode_UnconstrainedVBR,
-    MF_E_INVALIDSTREAMNUMBER, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AUDIO_BITS_PER_SAMPLE,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE,
-    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
+    ICodecAPI, IMF2DBuffer, IMFAttributes, IMFMediaType, IMFSample, IMFSinkWriter, IMFSinkWriterEx,
+    IMFSourceReader, IMFTransform, MF_E_INVALIDSTREAMNUMBER, MF_MT_ALL_SAMPLES_INDEPENDENT,
+    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+    MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION, MFAudioFormat_Float, MFCreateAttributes,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL,
     MFCreateSourceReaderFromURL, MFMediaType_Audio, MFMediaType_Video, MFSTARTUP_FULL, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_HARDWARE_URL_Attribute, MFT_FRIENDLY_NAME_Attribute,
     MFVideoArea, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoFormat_RGB32,
-    MFVideoInterlace_Progressive,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_Quality,
+    eAVEncCommonRateControlMode_UnconstrainedVBR,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -430,7 +430,9 @@ pub(crate) fn describe_encoder(writer: &IMFSinkWriter, stream: u32) -> String {
             let mut transform: Option<IMFTransform> = None;
             unsafe { ex.GetTransformForStream(stream, index, Some(&mut category), &mut transform) }
                 .ok()?;
-            (category == MFT_CATEGORY_VIDEO_ENCODER).then_some(transform).flatten()
+            (category == MFT_CATEGORY_VIDEO_ENCODER)
+                .then_some(transform)
+                .flatten()
         })
     });
     let Some(encoder) = encoder else {
@@ -444,7 +446,10 @@ pub(crate) fn describe_encoder(writer: &IMFSinkWriter, stream: u32) -> String {
     let hardware = attributes
         .as_ref()
         .is_some_and(|a| unsafe { a.GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute) }.is_ok());
-    let mut text = format!("{name} ({})", if hardware { "hardware" } else { "software" });
+    let mut text = format!(
+        "{name} ({})",
+        if hardware { "hardware" } else { "software" }
+    );
     let Ok(api) = encoder.cast::<ICodecAPI>() else {
         return text;
     };
@@ -515,7 +520,10 @@ impl Encoder {
         unsafe { MFCreateAttributes(&mut attributes, 2) }?;
         let attributes = attributes.context("attributes")?;
         unsafe {
-            attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, u32::from(hardware))
+            attributes.SetUINT32(
+                &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                u32::from(hardware),
+            )
         }?;
         let writer = unsafe {
             MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attributes)
@@ -1088,7 +1096,10 @@ impl VideoReader {
                 len as usize >= self.width as usize * self.height as usize * 4,
                 "Short video frame"
             );
-            copy(data, packed_pitch(len as usize, self.width, self.height) as isize);
+            copy(
+                data,
+                packed_pitch(len as usize, self.width, self.height) as isize,
+            );
             unsafe { buffer.Unlock() }?;
         }
         Ok(shrink_to_edge(
@@ -1472,13 +1483,18 @@ mod tests {
     fn nv12(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
         let px = |x: usize, y: usize| {
             let i = (y * w + x) * 4;
-            (i32::from(rgba[i]), i32::from(rgba[i + 1]), i32::from(rgba[i + 2]))
+            (
+                i32::from(rgba[i]),
+                i32::from(rgba[i + 1]),
+                i32::from(rgba[i + 2]),
+            )
         };
         let mut out = vec![0u8; w * h * 3 / 2];
         for y in 0..h {
             for x in 0..w {
                 let (r, g, b) = px(x, y);
-                out[y * w + x] = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
+                out[y * w + x] =
+                    (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
             }
         }
         for y in (0..h).step_by(2) {
@@ -1491,7 +1507,8 @@ mod tests {
                 let (r, g, b) = (r / 4, g / 4, b / 4);
                 let at = w * h + (y / 2) * w + x;
                 out[at] = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
-                out[at + 1] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+                out[at + 1] =
+                    (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
             }
         }
         out
@@ -1544,7 +1561,10 @@ mod tests {
         let png = std::env::var("SCRAWL_LAB_PNG").expect("SCRAWL_LAB_PNG");
         let file = std::io::BufReader::new(std::fs::File::open(&png).unwrap());
         let source = crate::render::decode_png(file).unwrap();
-        let (w, h) = ((source.width & !15) as usize, (source.height & !15) as usize);
+        let (w, h) = (
+            (source.width & !15) as usize,
+            (source.height & !15) as usize,
+        );
         let mut rgba = Vec::with_capacity(w * h * 4);
         for y in 0..h {
             let row = y * source.width as usize * 4;
@@ -1569,7 +1589,10 @@ mod tests {
                     })
                     .unwrap_or([0, 0, w, h - 32])
             });
-        assert!(crop[0] + crop[2] <= w && crop[1] + crop[3] <= h - 32, "crop {crop:?}");
+        assert!(
+            crop[0] + crop[2] <= w && crop[1] + crop[3] <= h - 32,
+            "crop {crop:?}"
+        );
         let cursor_at = |t: u64| ((t as usize * 3) % (w - 16), h - 24);
         let frame_at = |t: u64| {
             let mut f = rgba.clone();
@@ -1595,9 +1618,8 @@ mod tests {
         let frames_nv12: Vec<(u64, Vec<u8>)> = times.iter().map(|&t| (t, frame_at(t))).collect();
         let reference = lumas(&rgba, w, crop);
         let source_grad = gradient(&reference, crop[2]);
-        let configs: Vec<(String, RateControl, bool)> = std::env::var("SCRAWL_LAB_ONLY")
-            .ok()
-            .map_or_else(
+        let configs: Vec<(String, RateControl, bool)> =
+            std::env::var("SCRAWL_LAB_ONLY").ok().map_or_else(
                 || {
                     let mut c = vec![("average-only".to_owned(), RateControl::AverageOnly, true)];
                     for q in [30, 50, 60, 70, 80, 90] {
@@ -1613,7 +1635,11 @@ mod tests {
                             true,
                         ));
                     }
-                    c.push(("sw-average-only".to_owned(), RateControl::AverageOnly, false));
+                    c.push((
+                        "sw-average-only".to_owned(),
+                        RateControl::AverageOnly,
+                        false,
+                    ));
                     c.push(("sw-quality-70".to_owned(), RateControl::Quality(70), false));
                     c
                 },
@@ -1648,9 +1674,10 @@ mod tests {
         for (label, rate, hardware) in configs {
             let out = std::env::temp_dir().join(format!("scrawl-lab-{label}.mp4"));
             let _ = std::fs::remove_file(&out);
-            let gop = std::env::var("SCRAWL_LAB_GOP").ok().and_then(|g| g.parse().ok());
-            let mut encoder =
-                Encoder::with(&out, w as u32, h as u32, rate, gop, hardware).unwrap();
+            let gop = std::env::var("SCRAWL_LAB_GOP")
+                .ok()
+                .and_then(|g| g.parse().ok());
+            let mut encoder = Encoder::with(&out, w as u32, h as u32, rate, gop, hardware).unwrap();
             let used = describe_encoder(&encoder.writer, encoder.stream);
             for (t, frame) in &frames_nv12 {
                 encoder.write(frame, *t as i64 * 10_000).unwrap();

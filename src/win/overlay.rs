@@ -1351,7 +1351,10 @@ mod tests {
         let retry = watch.look(&look(2_700, 1_000));
         assert!(retry.redraw && retry.reassert && retry.logs.is_empty());
         let back = watch.look(&look(2_800, 2_790));
-        assert_eq!(back.logs, vec!["ink overlay draws again after 1790 ms".to_owned()]);
+        assert_eq!(
+            back.logs,
+            vec!["ink overlay draws again after 1790 ms".to_owned()]
+        );
         assert!(!back.redraw);
     }
 
@@ -1442,11 +1445,8 @@ mod tests {
         };
         unsafe { RegisterClassW(&wc) };
         let title: Vec<u16> = name.encode_utf16().chain([0]).collect();
-        let ex = WS_EX_TRANSPARENT
-            | WS_EX_LAYERED
-            | WS_EX_TOOLWINDOW
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOPMOST;
+        let ex =
+            WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
         let hwnd = unsafe {
             CreateWindowExW(
                 ex,

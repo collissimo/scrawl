@@ -1174,7 +1174,11 @@ impl SettingsWindow {
             ("hex".to_owned(), t.hex_title.clone(), t.hex_enabled),
         ];
         if t.claude_offered {
-            engines.push(("claude".to_owned(), t.claude_title.clone(), t.claude_enabled));
+            engines.push((
+                "claude".to_owned(),
+                t.claude_title.clone(),
+                t.claude_enabled,
+            ));
         }
         let chosen_title = if hex {
             "Hex"
@@ -1184,12 +1188,12 @@ impl SettingsWindow {
             local
         };
         let chosen = t.models.iter().find(|m| m.chosen);
-        let mut rows = vec![row(
-            theme,
-            "Transcription",
-            true,
-            popup(theme, "settings-transcriber", chosen_title).on_click(
-                cx.listener({
+        let mut rows = vec![
+            row(
+                theme,
+                "Transcription",
+                true,
+                popup(theme, "settings-transcriber", chosen_title).on_click(cx.listener({
                     let selected = t.engine.clone();
                     move |view, event: &ClickEvent, _, cx| {
                         view.open_menu(
@@ -1200,10 +1204,10 @@ impl SettingsWindow {
                         );
                         cx.notify();
                     }
-                }),
-            ),
-        )
-        .into_any_element()];
+                })),
+            )
+            .into_any_element(),
+        ];
         if let Some(language) = &state.language {
             let options: Vec<(String, String, bool)> = language
                 .options
@@ -1223,7 +1227,12 @@ impl SettingsWindow {
                     true,
                     popup(theme, "settings-language", &title).on_click(cx.listener(
                         move |view, event: &ClickEvent, _, cx| {
-                            view.open_menu("language", options.clone(), Some(selected.clone()), event);
+                            view.open_menu(
+                                "language",
+                                options.clone(),
+                                Some(selected.clone()),
+                                event,
+                            );
                             cx.notify();
                         },
                     )),
@@ -1309,7 +1318,9 @@ impl SettingsWindow {
             .flex_col()
             .child(group(theme, rows))
             .child(caption(theme, note, false))
-            .when_some(language_note, |pane, text| pane.child(caption(theme, &text, false)))
+            .when_some(language_note, |pane, text| {
+                pane.child(caption(theme, &text, false))
+            })
             .when_some(speech, |pane, (text, error)| {
                 pane.child(caption(theme, &text, error))
             })
@@ -1381,7 +1392,9 @@ impl SettingsWindow {
                     .into_any_element(),
                 ],
             ))
-            .when(!r.note.is_empty(), |d| d.child(caption(theme, &r.note, false)))
+            .when(!r.note.is_empty(), |d| {
+                d.child(caption(theme, &r.note, false))
+            })
             .child(group(
                 theme,
                 vec![
@@ -1775,7 +1788,9 @@ impl SettingsWindow {
         let w = 220.0;
         // A long list (Language) scrolls inside the window.
         let h = (menu.options.len() as f32 * item_h + 10.0).min(f32::from(viewport.height) - 16.0);
-        let x = f32::from(menu.at.x).min(f32::from(viewport.width) - w - 8.0).max(8.0);
+        let x = f32::from(menu.at.x)
+            .min(f32::from(viewport.width) - w - 8.0)
+            .max(8.0);
         let y = (f32::from(menu.at.y) - item_h * 0.5)
             .min(f32::from(viewport.height) - h - 8.0)
             .max(8.0);
@@ -1971,7 +1986,6 @@ impl Render for SettingsWindow {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1991,7 +2005,8 @@ mod tests {
         assert_eq!(language.options[1].title, "Deutsch");
         assert_eq!(language.note, None);
         // Off Windows the view has no language row.
-        let state: ViewState = serde_json::from_value(serde_json::json!({"type": "state"})).unwrap();
+        let state: ViewState =
+            serde_json::from_value(serde_json::json!({"type": "state"})).unwrap();
         assert!(state.language.is_none());
     }
 
@@ -2020,7 +2035,12 @@ mod tests {
         let state: ViewState = serde_json::from_value(sent).unwrap();
         assert!(state.retention.delete_video);
         assert_eq!(state.retention.preset.as_deref(), Some("week"));
-        assert!(state.retention.video_note.contains("not to the Recycle Bin"));
+        assert!(
+            state
+                .retention
+                .video_note
+                .contains("not to the Recycle Bin")
+        );
         // An older view without the switch reads as keeping videos.
         let state: ViewState =
             serde_json::from_value(serde_json::json!({"retention": {"note": ""}})).unwrap();

@@ -692,13 +692,8 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     let languages: Vec<(&'static str, CheckMenuItem)> = crate::win::languages::OFFERED
         .iter()
         .map(|&(code, name)| {
-            let item = CheckMenuItem::with_id(
-                format!("{LANGUAGE_PREFIX}{code}"),
-                name,
-                true,
-                false,
-                None,
-            );
+            let item =
+                CheckMenuItem::with_id(format!("{LANGUAGE_PREFIX}{code}"), name, true, false, None);
             let _ = language.append(&item);
             (code, item)
         })

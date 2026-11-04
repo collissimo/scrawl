@@ -2557,7 +2557,13 @@ mod tests {
         std::fs::write(&host.path, r#"{"language":"de"}"#).unwrap();
         let view = panel.view(&host);
         let json = serde_json::to_value(&view).unwrap();
-        eprintln!("Language row: chosen {}, first options {} {}, note {}", json["language"]["chosen"], json["language"]["options"][0], json["language"]["options"][1], json["language"]["note"]);
+        eprintln!(
+            "Language row: chosen {}, first options {} {}, note {}",
+            json["language"]["chosen"],
+            json["language"]["options"][0],
+            json["language"]["options"][1],
+            json["language"]["note"]
+        );
         assert_eq!(json["language"]["chosen"], "de");
         let language = view.language.unwrap();
         let chosen = language.options.iter().find(|o| o.id == language.chosen);
@@ -2604,7 +2610,10 @@ mod tests {
         assert!(view.claude_offered && !view.claude_enabled);
         // Either reason greys it out; with claude.exe on PATH it's the language.
         if crate::win::claude_dictation::available() {
-            assert_eq!(view.claude_title, "Claude Code (dictation): no Suomi dictation");
+            assert_eq!(
+                view.claude_title,
+                "Claude Code (dictation): no Suomi dictation"
+            );
         }
         assert_eq!(view.engine, "apple");
         // Parakeet speaks Finnish: no note.
