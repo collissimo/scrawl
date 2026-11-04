@@ -1,6 +1,6 @@
 [package]
 name = "scrawl"
-version = "0.3.6"
+version = "0.3.14"
 edition = "2024"
 default-run = "scrawl"
 license = "MIT"
@@ -40,7 +40,11 @@ lyon = "1.0.19"
 raw-window-handle = "0.6.2"
 sha2 = "0.10.9"
 tiny-skia = "0.11.4"
-transcribe-cpp = "=0.2.4"
+# `dynamic-backends`: ggml's CPU code ships as one DLL per x86 tier (ggml-cpu-haswell.dll,
+# ggml-cpu-skylakex.dll, ...) and the best one this CPU runs is loaded at run time. A static build
+# compiles it for the build machine (GGML_NATIVE): CI's AVX-512 runner, which crashed on CPUs
+# without AVX-512 (#58).
+transcribe-cpp = { version = "=0.2.4", default-features = false, features = ["dynamic-backends"] }
 tray-icon = { version = "0.24.1", default-features = false }
 vt100 = "0.16.2"
 windows = { version = "0.61.3", features = [

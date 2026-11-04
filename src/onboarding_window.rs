@@ -1,7 +1,7 @@
 //! The welcome window in GPUI, drawn from `onboarding::Flow::view()` like the SwiftUI window in
 //! `helper/Onboarding.swift` (same screens, copy, sizes and palette), and driven by the same JSON
 //! messages: `state`, `request`, `open-settings`, `hide`, `show` and `close`. Its buttons report
-//! the same actions (`continue`, `back`, `later`, `relaunch`, `close`, `grant:<permission>`).
+//! the same actions (`continue`, `back`, `later`, `close`, `grant:<permission>`).
 //!
 //! Windows uses it in process (`onboarding::Session`); macOS still runs the SwiftUI window in
 //! `scrawl-helper onboarding`.
@@ -96,7 +96,6 @@ struct ViewState {
     count: usize,
     rows: Vec<RowState>,
     ready: bool,
-    relaunch: bool,
     fix: bool,
 }
 
@@ -245,7 +244,11 @@ impl OnboardingWindow {
     fn handle(&mut self, message: serde_json::Value, window: Option<&mut Window>) -> bool {
         match message["type"].as_str().unwrap_or_default() {
             "state" => {
-                let Ok(next) = serde_json::from_value::<ViewState>(message) else {
+                let Ok(next) = serde_json::from_value::<ViewState>(message).inspect_err(|error| {
+                    crate::capture::scrawl_log(format!(
+                        "onboarding: could not decode state: {error}"
+                    ));
+                }) else {
                     return true;
                 };
                 if let Some(ref old) = self.state
@@ -315,9 +318,7 @@ fn set_visible(window: Option<&mut Window>, visible: bool) {
 #[cfg(not(target_os = "windows"))]
 fn set_visible(_window: Option<&mut Window>, _visible: bool) {}
 
-fn ease_out_cubic(t: f32) -> f32 {
-    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
-}
+use crate::ui::ease_out_cubic;
 
 fn number_word(n: usize) -> String {
     ["zero", "one", "two", "three", "four", "five"]
@@ -596,7 +597,6 @@ impl OnboardingWindow {
 
     fn how_it_works(&self) -> Div {
         let (s, paste, shift) = self.labels();
-        let (mods, key) = crate::capture::shortcut_parts(&s);
         let pick = if cfg!(target_os = "windows") {
             "a window or an area"
         } else {
@@ -652,7 +652,7 @@ impl OnboardingWindow {
                     .child(row(
                         keycaps(&s, false, 26.0),
                         format!(
-                            "Tap {s} to record the screen under your pointer. Hold {mods} and press {key} again to pick {pick}."
+                            "Tap {s} to record the screen under your pointer, or hold it to pick {pick}."
                         ),
                     ))
                     .child(divider())
@@ -702,6 +702,11 @@ impl OnboardingWindow {
                 crate::icons::IPHONE,
                 "Camera",
                 "Show and record a cabled iPhone".to_owned(),
+            ),
+            Permission::SpeechRecognition => (
+                crate::icons::MIC,
+                "Speech Recognition",
+                "Write down what you say, on this computer".to_owned(),
             ),
         };
         let granted = row.status == Status::Granted;
@@ -835,10 +840,7 @@ impl OnboardingWindow {
             )
         } else if state.fix && only(Permission::Accessibility) {
             (
-                format!(
-                    "Accessibility, for {}",
-                    crate::settings::paste_label()
-                ),
+                format!("Accessibility, for {}", crate::settings::paste_label()),
                 format!(
                     "{} pastes a capture into the app in front by pressing {} for you, and that needs Accessibility. Pressing {} yourself works without it.",
                     crate::settings::paste_label(),
@@ -903,30 +905,12 @@ impl OnboardingWindow {
                     .child(body),
             )
             .child(card.w_full())
-            .child(
-                div()
-                    .h(px(18.0))
-                    .mt(px(14.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(12.0))
-                    .text_color(rgb(SOFT))
-                    .when(state.relaunch, |d| {
-                        d.child(icon(crate::icons::REOPEN, 12.0, POSITIVE)).child(if state.fix {
-                            "Screen Recording turns on when Scrawl reopens."
-                        } else {
-                            "Screen Recording turns on when Scrawl reopens. You'll pick up on the next step."
-                        })
-                    }),
-            )
     }
 
     fn footer(&self, state: &ViewState, cx: &mut Context<Self>) -> Div {
         let primary: Option<(&str, &'static str, bool)> = match state.step {
             Step::Welcome => Some(("Get Started", "continue", true)),
             Step::HowItWorks => Some(("Continue", "continue", true)),
-            Step::Permissions if state.relaunch => Some(("Reopen Scrawl", "relaunch", true)),
             Step::Permissions => Some((
                 if state.fix { "Done" } else { "Continue" },
                 "continue",
@@ -1127,5 +1111,70 @@ impl Render for OnboardingWindow {
                 .child(self.footer(&state, cx)),
         )
         .w(relative(1.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboarding::{Flow, Grants, Input};
+
+    #[test]
+    fn accepts_states_from_the_onboarding_flow() {
+        let now = Instant::now();
+        let mut window = OnboardingWindow {
+            state: None,
+            shortcut: "Alt+Shift+S".into(),
+            events: Arc::new(|_| {}),
+            step_since: now,
+            forward: true,
+            opened: now,
+        };
+        let mut flow = Flow::tour(Step::Welcome, Some(Grants::default()));
+        let granted = Grants {
+            statuses: Permission::REQUIRED
+                .into_iter()
+                .map(|permission| (permission, Status::Granted))
+                .collect(),
+            screen_needs_relaunch: false,
+        };
+        for (step, ready, input) in [
+            (Step::Welcome, false, Input::Continue),
+            (Step::HowItWorks, false, Input::Continue),
+            (
+                Step::Permissions,
+                false,
+                Input::Grants {
+                    grants: granted,
+                    now_ms: 0,
+                },
+            ),
+            (Step::Permissions, true, Input::Continue),
+            (Step::TryIt, true, Input::CaptureEnded { completed: true }),
+            (Step::Done, true, Input::Continue),
+        ] {
+            let view = flow.view();
+            let mut message = serde_json::to_value(&view).unwrap();
+            message["type"] = "state".into();
+            assert!(window.handle(message, None));
+            let state = window
+                .state
+                .as_ref()
+                .expect("the flow's state was accepted");
+            assert_eq!(state.step, step);
+            assert_eq!(state.ready, ready);
+            assert_eq!(state.index, view.index);
+            assert_eq!(state.count, view.count);
+            assert_eq!(state.fix, view.fix);
+            assert_eq!(state.rows.len(), view.rows.len());
+            for (received, sent) in state.rows.iter().zip(&view.rows) {
+                assert_eq!(received.permission, sent.permission);
+                assert_eq!(received.status, sent.status);
+                assert_eq!(received.requested, sent.requested);
+                assert_eq!(received.required, sent.required);
+                assert_eq!(received.relaunch, sent.relaunch);
+            }
+            flow.on(input);
+        }
     }
 }

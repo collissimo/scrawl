@@ -18,6 +18,7 @@
   /// movie's first frame.
   @MainActor
   protocol ScrawlRecorder: AnyObject {
+    var startupTrace: StartupTrace? { get set }
     var method: ScrawlCaptureMethod { get }
     var isAvailable: Bool { get }
     /// Whether the finished movie has the microphone in it. Read after `stop`.
@@ -47,6 +48,7 @@
   /// ReplayKit's in-app recording (`RPScreenRecorder`).
   @MainActor
   final class ReplayKitRecorder: ScrawlRecorder {
+    var startupTrace: StartupTrace?
     var onInterruption: (@MainActor @Sendable () -> Void)?
 
     var method: ScrawlCaptureMethod { .replayKit }

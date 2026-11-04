@@ -66,12 +66,18 @@ fn put(format: u32, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// NUL-terminated UTF-16LE, as `CF_UNICODETEXT` holds it.
+fn unicode_text(text: &str) -> Vec<u8> {
+    text.encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
 pub fn set_text(text: &str) -> Result<()> {
-    let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
     let _open = Open::new()?;
     unsafe { EmptyClipboard() }.context("Could not clear the clipboard")?;
-    put(u32::from(CF_UNICODETEXT.0), &bytes)
+    put(u32::from(CF_UNICODETEXT.0), &unicode_text(text))
 }
 
 /// A top-down 32-bit BGRA `BITMAPV5HEADER` DIB of an RGBA image.
@@ -134,6 +140,12 @@ fn decode_png(png_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 }
 
 pub fn set_png(png_bytes: &[u8]) -> Result<()> {
+    set_png_and_text(png_bytes, None)
+}
+
+/// The image and, with `text`, the text too, so one Ctrl+V gives each app what it takes: a
+/// browser or Electron composer attaches the image and inserts the text, a terminal the text.
+pub fn set_png_and_text(png_bytes: &[u8], text: Option<&str>) -> Result<()> {
     let (width, height, rgba) = decode_png(png_bytes)?;
     let dib = dib_v5(width, height, &rgba);
     let png_name = wide("PNG");
@@ -143,5 +155,9 @@ pub fn set_png(png_bytes: &[u8]) -> Result<()> {
     if png_format != 0 {
         put(png_format, png_bytes)?;
     }
-    put(u32::from(CF_DIBV5.0), &dib)
+    put(u32::from(CF_DIBV5.0), &dib)?;
+    if let Some(text) = text {
+        put(u32::from(CF_UNICODETEXT.0), &unicode_text(text))?;
+    }
+    Ok(())
 }

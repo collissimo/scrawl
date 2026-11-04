@@ -13,7 +13,9 @@ use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandleEx, GetFileVersionInfoSizeW, GetFileVersionInfoW, OPEN_EXISTING,
     VerQueryValueW,
 };
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
 };
@@ -26,26 +28,41 @@ use windows::core::PCWSTR;
 
 use super::wide;
 
+/// The shell, unlike the file system, rejects `/` in a path (`…\scrawl/captures\…`), so an
+/// absolute path is rebuilt from its components with `\` between them. URLs pass through.
+fn shell_path(target: &Path) -> std::path::PathBuf {
+    if target.is_absolute() {
+        target.components().collect()
+    } else {
+        target.to_owned()
+    }
+}
+
 /// Opens a file, folder or URL with its default handler.
 pub fn open(target: &Path) -> Result<()> {
-    let target = wide(&target.to_string_lossy());
+    let target = wide(&shell_path(target).to_string_lossy());
     let verb = wide("open");
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
+    // ShellExecute pumps messages while it starts the handler. On GPUI's thread that runs queued
+    // tasks while the calling event still holds the app, and their panic aborts Scrawl.
+    let result = std::thread::spawn(move || {
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        }
+        .0 as isize
+    })
+    .join()
+    .unwrap_or(0);
     // ShellExecute returns a value above 32 on success.
-    if result.0 as isize <= 32 {
-        bail!(
-            "Could not open it (ShellExecute error {})",
-            result.0 as isize
-        );
+    if result <= 32 {
+        bail!("Could not open it (ShellExecute error {result})");
     }
     Ok(())
 }
@@ -190,7 +207,10 @@ pub const RELAUNCHED_BY: &str = "SCRAWL_RELAUNCHED_BY";
 /// A copy started by `onboarding::relaunch` waits (at most 10 s) for the one that started it to
 /// quit, so there are never two running.
 pub fn wait_for_relauncher() {
-    if let Some(pid) = std::env::var(RELAUNCHED_BY).ok().and_then(|v| v.parse().ok()) {
+    if let Some(pid) = std::env::var(RELAUNCHED_BY)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         wait_for_exit(pid, Duration::from_secs(10));
     }
 }
@@ -198,7 +218,9 @@ pub fn wait_for_relauncher() {
 /// Waits for process `pid` to exit, at most `limit`. Returns whether it has (or never ran).
 fn wait_for_exit(pid: u32, limit: Duration) -> bool {
     use windows::Win32::Foundation::WAIT_TIMEOUT;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
     let Ok(process) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
         return true;
     };
@@ -253,5 +275,16 @@ mod tests {
         let _ = child.wait();
         // Already gone (or never there).
         assert!(wait_for_exit(u32::MAX - 3, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn absolute_paths_lose_their_forward_slashes_and_urls_stay() {
+        let mixed = Path::new(r"C:\Users\a\AppData\Local\scrawl/captures\one.scrawl");
+        assert_eq!(
+            shell_path(mixed).to_string_lossy(),
+            r"C:\Users\a\AppData\Local\scrawl\captures\one.scrawl"
+        );
+        let url = Path::new("https://github.com/kitlangton/scrawl/releases");
+        assert_eq!(shell_path(url), url);
     }
 }

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -121,13 +121,10 @@ pub struct ScreenRecording {
 /// Live UI events emitted by the global input monitor to drive Scrawl's HUD & Review windows.
 #[derive(Clone, Debug)]
 pub enum LiveOverlayEvent {
-    /// ⌥⇧S (or the configured shortcut) went down; `hold::Switcher` decides what it means.
+    /// ⌥⇧S (or the configured shortcut) went down; `shortcut::Shortcut` decides what it means.
     CaptureShortcut,
     PasteLatestShortcut,
     UndoStroke,
-    /// macOS's Esc hotkey; Windows polls Esc while the switcher is held.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    CancelCapture,
     RequestSnapshot,
     /// The iPhone mirror ended on its own (unplugged, never found, or access denied).
     PhoneEnded,
@@ -203,6 +200,11 @@ impl ShortcutKind {
             Self::Paste => "Paste last capture",
         }
     }
+
+    /// Whether it can be turned off. Record can't: it's the way into Scrawl.
+    pub fn can_unset(self) -> bool {
+        self == Self::Paste
+    }
 }
 
 impl ShortcutConfig {
@@ -220,6 +222,20 @@ impl ShortcutConfig {
             carbon_modifiers: CARBON_OPTION_KEY | CARBON_SHIFT_KEY,
             label: shortcut_label(CARBON_OPTION_KEY | CARBON_SHIFT_KEY, "V"),
         }
+    }
+
+    /// No shortcut: nothing is registered and no key press matches. Only the paste shortcut can
+    /// be turned off.
+    pub fn unset() -> Self {
+        Self {
+            key_code: u32::MAX,
+            carbon_modifiers: 0,
+            label: String::new(),
+        }
+    }
+
+    pub fn is_unset(&self) -> bool {
+        self.label.is_empty()
     }
 
     /// Whether this is `kind`'s default, which also answers to its aliases (⌃⌥⇧, ⌘⌥⇧, ⌃⌥⌘
@@ -323,7 +339,7 @@ pub fn scrawl_log(msg: impl AsRef<str>) {
         .as_millis();
     let line = format!("[{ts}] {}\n", msg.as_ref());
     eprint!("{line}");
-    // Tests log to stderr only: their made-up failures don't belong in the user's log.
+    // Tests log fixture failures on purpose; keep them out of the user's real log.
     if cfg!(test) {
         return;
     }
@@ -392,6 +408,9 @@ pub fn shortcut_matches(
     alt: bool,
     shift: bool,
 ) -> bool {
+    if cfg.is_unset() {
+        return false;
+    }
     let want_cmd = (cfg.carbon_modifiers & CARBON_CMD_KEY) != 0;
     let want_ctrl = (cfg.carbon_modifiers & CARBON_CONTROL_KEY) != 0;
     let want_alt = (cfg.carbon_modifiers & CARBON_OPTION_KEY) != 0;
@@ -417,6 +436,9 @@ pub fn layout_default_keycode(kind: ShortcutKind) -> u16 {
 /// The key codes and Carbon modifiers `cfg` registers: itself, plus for a default its aliases
 /// (⌃⌥⇧, ⌘⌥⇧, ⌃⌥⌘) on the active layout's key and the ANSI one.
 pub(crate) fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u32, u32)> {
+    if cfg.is_unset() {
+        return Vec::new();
+    }
     let mut combos = vec![(cfg.key_code, cfg.carbon_modifiers)];
     if !cfg.is_default_for(kind) {
         return combos;
@@ -439,10 +461,6 @@ pub(crate) fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u3
     }
     combos
 }
-
-/// No-op: do not register a global Escape hotkey because Karabiner maps CapsLock (Control)
-/// with `to_if_alone: escape`, which would cancel recordings when releasing Control.
-pub fn set_escape_hotkey_enabled(_enabled: bool) {}
 
 fn clean_label(input: &str) -> String {
     let squashed = input.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -692,6 +710,11 @@ pub struct SharedCaptureTelemetry {
     /// Scrawl's windows that let clicks through (the ink overlay), skipped when deciding whether
     /// a click landed on Scrawl itself.
     pub passthrough_window_ids: Mutex<Vec<u32>>,
+    /// The `scrawl-helper` whose window is what's being recorded (the iPhone mirror): its clicks
+    /// count, unlike those on other helper windows (Settings, onboarding). 0 when none.
+    capture_source_pid: AtomicI32,
+    /// The last `on_scrawl_window` answer (when, where, what), reused for a burst of scrolls.
+    scrawl_hit: Mutex<Option<(Instant, f64, f64, bool)>>,
     /// macOS's key event tap (`CFMachPortRef`), made once Accessibility is on (`check_key_tap`).
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     tap_port: AtomicU64,
@@ -706,7 +729,7 @@ pub struct SharedCaptureTelemetry {
     tap_tried_ms: AtomicU64,
     /// Whether key presses are arriving (macOS's key tap, Windows' keyboard hook).
     tap_live: AtomicBool,
-    /// Esc went down since the switcher last looked (`take_escape`).
+    /// Esc went down since the UI loop last looked (`take_escape`).
     escape_pressed: AtomicBool,
     /// A Screen recording started straight from the shortcut: the overlay flashes an edge glow.
     pub start_glow: AtomicBool,
@@ -753,6 +776,8 @@ impl SharedCaptureTelemetry {
             window_log_request: Arc::new(AtomicBool::new(false)),
             ui_sender,
             passthrough_window_ids: Mutex::new(Vec::new()),
+            capture_source_pid: AtomicI32::new(0),
+            scrawl_hit: Mutex::new(None),
             tap_port: AtomicU64::new(0),
             tap_run_loop: AtomicU64::new(0),
             tap_starting: AtomicBool::new(false),
@@ -931,7 +956,7 @@ impl SharedCaptureTelemetry {
         scrawl_log(format!("session clicks from {clicks}, keys from {keys}"));
     }
 
-    /// Whether Esc went down since the last call (the switcher cancels on it).
+    /// Whether Esc went down since the last call (a pending shortcut or an open picker cancels on it).
     pub fn take_escape(&self) -> bool {
         self.escape_pressed.swap(false, Ordering::AcqRel)
     }
@@ -1059,8 +1084,10 @@ impl SharedCaptureTelemetry {
     }
 
     /// The button of a ⇧-press came up (with or without ⇧ still held). A ⇧-click drops the next
-    /// numbered pin where it went down; a ⇧-drag is left to the ink the poller is drawing.
-    /// Returns whether a ⇧-press was waiting, so the release isn't also taken as a click's.
+    /// numbered pin where it went down, unless ink was already drawn in this ⇧ hold: a click in
+    /// the middle of a drawing belongs to the drawing, so it neither pins nor counts as a click.
+    /// A ⇧-drag is left to the ink the poller is drawing. Returns whether a ⇧-press was waiting,
+    /// so the release isn't also taken as a click's.
     fn shift_up(&self, t_ms: u64, screen_x: f64, screen_y: f64) -> bool {
         let Some((t0, x0, y0, start_frame)) = self
             .shift_press
@@ -1079,21 +1106,23 @@ impl SharedCaptureTelemetry {
         {
             return true;
         }
+        {
+            let mut live = self
+                .live_ink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if live.as_ref().is_some_and(|ink| drew_before(ink, t0)) {
+                return true;
+            }
+            // ⇧ draws as it's held, so the live ink is only the click's jitter; further ink
+            // starts a new stroke.
+            *live = None;
+        }
         let (nx, ny, fw, fh) = self.normalize_point(x0, y0);
-        // ⇧ draws as it's held, so the live ink ends in the click's jitter; what was drawn
-        // before the press is kept, and further ink starts a new stroke.
-        let earlier = self
-            .live_ink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .map(|ink| ink_before(ink, t0))
-            .filter(is_real_ink);
         let mut strokes = self
             .strokes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        strokes.extend(earlier);
         let number = strokes.iter().filter(|s| s.pin.is_some()).count() as u32 + 1;
         strokes.push(Stroke {
             t0,
@@ -1115,17 +1144,55 @@ impl SharedCaptureTelemetry {
         true
     }
 
+    /// The helper process whose window is the capture target (the iPhone mirror).
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn set_capture_source_pid(&self, pid: u32) {
+        self.capture_source_pid
+            .store(i32::try_from(pid).unwrap_or(0), Ordering::Release);
+    }
 
-    /// Whether the topmost window at a global point is Scrawl's own (ignoring the click-through
-    /// ink overlay).
+    /// Whether the topmost window at a global point is Scrawl's own or a `scrawl-helper`'s other
+    /// than the capture source (ignoring the click-through ink overlay). Asked once per press, and
+    /// for scrolls, which come in bursts at one point, at most every 250 ms.
     fn on_scrawl_window(&self, x: f64, y: f64) -> bool {
+        let mut hit = self
+            .scrawl_hit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, hx, hy, on)) = *hit
+            && at.elapsed() < Duration::from_millis(250)
+            && (hx - x).abs() <= 2.0
+            && (hy - y).abs() <= 2.0
+        {
+            return on;
+        }
+        let on = self.scrawl_window_in(
+            &platform::raw_windows_now(),
+            x,
+            y,
+            platform::is_helper_process,
+        );
+        *hit = Some((Instant::now(), x, y, on));
+        on
+    }
+
+    fn scrawl_window_in(
+        &self,
+        windows: &[crate::windows::RawWindow],
+        x: f64,
+        y: f64,
+        is_helper: impl Fn(i32) -> bool,
+    ) -> bool {
         let passthrough = self
             .passthrough_window_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let windows = platform::raw_windows_now();
-        crate::windows::owned_window_at(&windows, x, y, std::process::id() as i32, &passthrough)
+        let own = std::process::id() as i32;
+        let source = self.capture_source_pid.load(Ordering::Acquire);
+        crate::windows::owned_window_at(windows, x, y, &passthrough, |pid| {
+            pid == own || (pid != source && is_helper(pid))
+        })
     }
 
     pub fn normalize_point(&self, screen_x: f64, screen_y: f64) -> (f32, f32, u32, u32) {
@@ -1267,41 +1334,29 @@ fn is_pin_click(down: (u64, f64, f64), up: (u64, f64, f64)) -> bool {
         && ((up.1 - down.1).hypot(up.2 - down.2) as f32) < CLICK_SLOP_PT
 }
 
-/// How far (points) the ink reaches from where it started.
-fn ink_span_pt(stroke: &Stroke) -> f32 {
+/// Whether `stroke`'s points before `before_ms` reach at least `MIN_INK_SPAN_PT` from its start.
+fn drew_before(stroke: &Stroke, before_ms: u64) -> bool {
     let Some(first) = stroke.pts.get(0..2) else {
-        return 0.0;
+        return false;
     };
-    stroke
+    let mut points = 0_usize;
+    let mut span = 0.0_f32;
+    for p in stroke
         .pts
         .chunks_exact(3)
-        .map(|p| {
-            let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
-            let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
-            dx.hypot(dy)
-        })
-        .fold(0.0_f32, f32::max)
+        .take_while(|p| stroke.t0.saturating_add(p[2].max(0) as u64) < before_ms)
+    {
+        points += 1;
+        let dx = (p[0] - first[0]) as f32 / SCALE as f32 * stroke.fw as f32;
+        let dy = (p[1] - first[1]) as f32 / SCALE as f32 * stroke.fh as f32;
+        span = span.max(dx.hypot(dy));
+    }
+    points >= 2 && span >= MIN_INK_SPAN_PT
 }
 
 /// Whether finished ink is worth keeping as a stroke.
 fn is_real_ink(stroke: &Stroke) -> bool {
-    stroke.pts.len() >= 6 && ink_span_pt(stroke) >= MIN_INK_SPAN_PT
-}
-
-/// The part of live ink drawn before `t_ms`.
-fn ink_before(mut stroke: Stroke, t_ms: u64) -> Stroke {
-    let t0 = stroke.t0;
-    let at = |p: &[i32]| t0.saturating_add(p[2].max(0) as u64);
-    let keep = stroke
-        .pts
-        .chunks_exact(3)
-        .take_while(|p| at(p) < t_ms)
-        .count();
-    stroke.pts.truncate(keep * 3);
-    if let Some(last) = stroke.pts.chunks_exact(3).last() {
-        stroke.t1 = at(last);
-    }
-    stroke
+    drew_before(stroke, u64::MAX)
 }
 
 fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
@@ -1497,6 +1552,40 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Clicks on `scrawl-helper`'s windows (the SwiftUI capsule, Settings, onboarding) are
+    /// Scrawl's own, except on the iPhone mirror, which is what's being recorded.
+    #[test]
+    fn helper_windows_are_scrawl_s_except_the_capture_source() {
+        let (sender, _receiver) = flume::unbounded();
+        let telemetry = SharedCaptureTelemetry::new(sender);
+        let window = |id, pid, bounds| crate::windows::RawWindow {
+            id,
+            pid,
+            owner: String::new(),
+            title: String::new(),
+            bounds,
+            layer: 0,
+            alpha: 1.0,
+        };
+        let own = std::process::id() as i32;
+        let (settings, mirror, app) = (own + 1, own + 2, own + 3);
+        let windows = [
+            window(1, own, [0.0, 0.0, 1728.0, 1117.0]), // the ink overlay, click-through
+            window(2, settings, [100.0, 100.0, 600.0, 400.0]),
+            window(3, mirror, [1300.0, 100.0, 300.0, 650.0]),
+            window(4, app, [0.0, 0.0, 1728.0, 1117.0]),
+        ];
+        telemetry.passthrough_window_ids.lock().unwrap().push(1);
+        telemetry.set_capture_source_pid(mirror as u32);
+        let helper = |pid| pid == settings || pid == mirror;
+        let at = |x, y| telemetry.scrawl_window_in(&windows, x, y, helper);
+        assert!(at(300.0, 300.0), "Settings");
+        assert!(!at(1400.0, 400.0), "the iPhone mirror");
+        assert!(!at(1000.0, 900.0), "the app under the ink overlay");
+        telemetry.set_capture_source_pid(0);
+        assert!(at(1400.0, 400.0), "a helper that isn't the source");
+    }
+
     /// Kit's Screen capture on the Pro: the old listen-only event tap was off (no Input
     /// Monitoring), so his clicks on OpenCode's composer never reached the bundle. Clicks now
     /// come from the mouse monitor; polled button state stands in if it couldn't be installed.
@@ -1640,7 +1729,11 @@ mod tests {
         );
         assert_eq!(
             hotkey_combos(ShortcutKind::Record, &default).len(),
-            if u32::from(KEY_S) == default.key_code { 4 } else { 8 },
+            if u32::from(KEY_S) == default.key_code {
+                4
+            } else {
+                8
+            },
             "⌥⇧S and three aliases, on the layout's key and the ANSI one"
         );
 
@@ -1788,7 +1881,6 @@ mod tests {
         telemetry
     }
 
-
     #[test]
     fn a_long_still_shift_press_drops_no_pin() {
         let down = (1_000, 10.0, 10.0);
@@ -1799,10 +1891,11 @@ mod tests {
         assert!(!is_pin_click(down, (1_100, 10.0, 10.0 + slop)));
     }
 
-    /// The poller draws ink while ⇧ is held, so the ⇧ goes down (and the cursor may wander)
-    /// before the click: ink from before the press stays a stroke, the click's jitter doesn't.
+    /// The poller draws ink while ⇧ is held. A ⇧-click after ink was drawn in the same hold is
+    /// part of the drawing: no pin, and the stroke carries on whole. A ⇧-click with nothing drawn
+    /// first (only its own jitter) drops a pin and leaves no stroke.
     #[test]
-    fn a_shift_click_keeps_earlier_ink_and_drops_its_own_jitter() {
+    fn a_shift_click_mid_drawing_drops_no_pin() {
         let telemetry = session(1000.0, 1000.0);
         let ink = |pts: &[(i32, i32, i32)]| Stroke {
             t0: 0,
@@ -1817,27 +1910,39 @@ mod tests {
         let press = telemetry.elapsed_ms() + 50;
         let p = press as i32;
         let s = SCALE;
-        // A line drawn while ⇧ was held, then the click's jitter at its end.
-        *telemetry.live_ink.lock().unwrap() = Some(ink(&[
+        // A line drawn while ⇧ was held, then a click at its end.
+        let line = ink(&[
             (s / 10, s / 2, 0),
             (s / 5, s / 2, p - 20),
             (s / 5 + s / 500, s / 2, p + 5),
-        ]));
+        ]);
+        *telemetry.live_ink.lock().unwrap() = Some(line.clone());
         telemetry.shift_down(press, 200.0, 500.0);
         assert!(telemetry.shift_up(press + 80, 201.0, 500.0));
-        assert!(telemetry.live_ink.lock().unwrap().is_none());
+        assert_eq!(telemetry.live_ink.lock().unwrap().as_ref(), Some(&line));
+        // Letting go of ⇧ commits it as one stroke.
+        let at = (200.0, 500.0);
+        track_shift_ink(&telemetry, at, false, true);
 
-        // A ⇧-click with only its own few points of jitter leaves no stroke.
+        // Drawn long before the press still counts: the hold is a drawing.
+        *telemetry.live_ink.lock().unwrap() = Some(ink(&[(s / 10, s / 10, 0), (s / 5, s / 10, 1)]));
+        let t = telemetry.elapsed_ms() + 5_000;
+        telemetry.shift_down(t, 200.0, 100.0);
+        assert!(telemetry.shift_up(t + 60, 200.0, 100.0));
+        *telemetry.live_ink.lock().unwrap() = None;
+
+        // A ⇧-click with only its own few points of jitter is a pin.
         let jitter = ink(&[(s / 2, s / 2, 0), (s / 2 + 2, s / 2, 30)]);
         *telemetry.live_ink.lock().unwrap() = Some(jitter);
         let t = telemetry.elapsed_ms();
         telemetry.shift_down(t, 500.0, 500.0);
         assert!(telemetry.shift_up(t + 60, 500.0, 500.0));
+        assert!(telemetry.live_ink.lock().unwrap().is_none());
 
-        let (_, strokes) = telemetry.finish_session();
+        let (events, strokes) = telemetry.finish_session();
+        assert!(events.is_empty(), "{events:?}");
         let kinds: Vec<_> = strokes.iter().map(|s| (s.pin, s.pts.len() / 3)).collect();
-        assert_eq!(kinds, vec![(None, 2), (Some(1), 1), (Some(2), 1)]);
-        assert_eq!(strokes[0].t1, press - 20);
+        assert_eq!(kinds, vec![(None, 3), (Some(1), 1)]);
     }
 
     #[test]
@@ -1856,7 +1961,6 @@ mod tests {
         assert_eq!(strokes[0].pin, Some(1));
         assert_eq!(strokes[0].normalized_points(), vec![[0.25, 0.75]]);
     }
-
 
     #[test]
     fn candidate_buffer_stays_bounded_and_keeps_the_whole_timeline() {

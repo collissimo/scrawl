@@ -177,27 +177,34 @@ enum ExportInk {
       drawLaser(ctx, points: points, unit: k * s)
     }
 
+    // Clicks pulse once, small and thin, and are gone in 350 ms; nothing click-related lingers
+    // over what's shown (`render::draw_click_ripple` is the keyframe's still version).
+    let blue = (r: 0.0, g: 136.0 / 255, b: 1.0)
+    func ring(_ c: CGPoint, _ r: Double, _ width: Double, _ color: CGColor) {
+      ctx.setLineWidth(width)
+      ctx.setStrokeColor(color)
+      ctx.strokeEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+    }
+    func dot(_ c: CGPoint, _ r: Double, _ color: CGColor) {
+      ctx.setFillColor(color)
+      ctx.fillEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+    }
+    let u = k * s
     for ripple in ink.ripples {
       let age = t - ripple.t
-      guard age >= 0, age < 520 else { continue }
-      let p = age / 520
-      let ease = 1 - pow(1 - p, 3)
+      guard age >= 0, age < 350 else { continue }
+      let p = age / 350
+      let grow = 1 - pow(1 - p, 3)
+      let a = (1 - p) * (1 - p)
       let c = view.point(ripple.x, ripple.y)
-      let radius = (9 + 24 * ease) * k * s
-      let a = 1 - p
-      ctx.setFillColor(CGColor(red: 0, green: 136.0 / 255, blue: 1, alpha: 0.30 * a))
-      ctx.fillEllipse(in: CGRect(x: c.x - radius, y: c.y - radius, width: 2 * radius, height: 2 * radius))
-      ctx.setLineWidth(1.75 * k * s)
-      ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: a))
-      ctx.strokeEllipse(in: CGRect(x: c.x - radius, y: c.y - radius, width: 2 * radius, height: 2 * radius))
-      let outer = radius + 2.5 * k * s
-      ctx.setStrokeColor(CGColor(red: 0, green: 136.0 / 255, blue: 1, alpha: 0.92 * a))
-      ctx.strokeEllipse(in: CGRect(x: c.x - outer, y: c.y - outer, width: 2 * outer, height: 2 * outer))
+      let radius = (4 + 10 * grow) * u
+      ring(c, radius + 1.1 * u, 0.9 * u, CGColor(red: 1, green: 1, blue: 1, alpha: 0.35 * a))
+      ring(c, radius, 1.3 * u, CGColor(red: blue.r, green: blue.g, blue: blue.b, alpha: 0.75 * a))
     }
 
     for trail in ink.trails {
       guard t >= trail.t else { continue }
-      let alpha = fade(t, at: trail.t1 + 250, over: 350)
+      let alpha = fade(t, at: trail.t1 + 100, over: 250)
       guard alpha > 0.002 else { continue }
       let progress = trail.t1 > trail.t ? min(1, (t - trail.t) / (trail.t1 - trail.t)) : 1
       var points: [CGPoint] = []
@@ -215,20 +222,17 @@ enum ExportInk {
         let (a, b) = (points[whole], points[whole + 1])
         shown.append(CGPoint(x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f))
       }
-      for (width, color) in [(4.5, CGColor(red: 1, green: 1, blue: 1, alpha: 0.6 * alpha)),
-                             (2.6, CGColor(red: 0, green: 136.0 / 255, blue: 1, alpha: 0.9 * alpha))] {
-        ctx.setLineWidth(width * k * s)
+      for (width, color) in [(3.0, CGColor(red: 1, green: 1, blue: 1, alpha: 0.22 * alpha)),
+                             (1.6, CGColor(red: blue.r, green: blue.g, blue: blue.b, alpha: 0.7 * alpha))] {
+        ctx.setLineWidth(width * u)
         ctx.setStrokeColor(color)
         ctx.beginPath()
         ctx.addLines(between: shown)
         ctx.strokePath()
       }
       let (start, head) = (shown[0], shown[shown.count - 1])
-      ctx.setFillColor(CGColor(red: 0, green: 136.0 / 255, blue: 1, alpha: alpha))
-      let r = 3.5 * k * s
-      ctx.fillEllipse(in: CGRect(x: start.x - r, y: start.y - r, width: 2 * r, height: 2 * r))
-      let hr = 6 * k * s
-      ctx.fillEllipse(in: CGRect(x: head.x - hr, y: head.y - hr, width: 2 * hr, height: 2 * hr))
+      dot(start, 1.3 * u, CGColor(red: blue.r, green: blue.g, blue: blue.b, alpha: 0.9 * alpha))
+      dot(head, 2.0 * u, CGColor(red: blue.r, green: blue.g, blue: blue.b, alpha: 0.8 * alpha))
     }
   }
 

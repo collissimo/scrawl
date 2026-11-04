@@ -320,6 +320,18 @@ pub fn annotate_keyframe_in_place(
     stamp_keyframe_badge_in_place(frame, keyframe);
 }
 
+/// Sizes for a frame of `w × h` pixels: `(k, stroke_size, pin_scale)`.
+/// Tuned for ~1280×800 screen frames; phone frames are taller and denser.
+pub(crate) fn annotation_sizes(w: f32, h: f32) -> (f32, f32, f32) {
+    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
+    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    (k, size, (w.max(h) / 1280.0).clamp(0.75, 2.5))
+}
+
+pub(crate) fn is_long_press(label: Option<&str>) -> bool {
+    label.is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+}
+
 pub fn annotate_keyframe_marks_in_place(
     frame: &mut RgbaFrame,
     keyframe: &Keyframe,
@@ -333,9 +345,7 @@ pub fn annotate_keyframe_marks_in_place(
     if w == 0.0 || h == 0.0 {
         return;
     }
-    // Sizes are tuned for ~1280×800 screen frames; phone frames are taller and denser.
-    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
-    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
+    let (k, size, pin_scale) = annotation_sizes(w, h);
     // A mark keyframe shows every mark drawn on its screen. Flags carry no ink, so a flagged
     // keyframe still shows the strokes of its moment.
     let shown = crate::sketch::marks_on(keyframe, marks);
@@ -359,13 +369,7 @@ pub fn annotate_keyframe_marks_in_place(
             .collect();
         if let Some(number) = stroke.pin {
             if let Some(&point) = points.first() {
-                draw_pin(
-                    frame,
-                    point,
-                    number,
-                    (w.max(h) / 1280.0).clamp(0.75, 2.5),
-                    1.0,
-                );
+                draw_pin(frame, point, number, pin_scale);
             }
         } else if !points.is_empty() {
             let outline = freehand_outline(
@@ -377,9 +381,6 @@ pub fn annotate_keyframe_marks_in_place(
             );
             polygon(frame, &outline, RED);
         }
-    }
-    if shown.len() >= 2 && crate::handoff::experiment(crate::handoff::AGENT_CONTEXT) {
-        draw_mark_numbers(frame, &shown, strokes, k);
     }
     for stroke in strokes.iter().filter(|s| s.laser) {
         draw_laser(frame, stroke, keyframe.t);
@@ -398,9 +399,7 @@ pub fn annotate_keyframe_marks_in_place(
             label,
         } = event
             && button.as_deref() == Some("touch")
-            && !label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            && !is_long_press(label.as_deref())
             && *t <= keyframe.t
             && keyframe.t.saturating_sub(*t1) <= 900
         {
@@ -425,9 +424,7 @@ pub fn annotate_keyframe_marks_in_place(
                 y0,
                 label,
                 ..
-            } if label
-                .as_deref()
-                .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
+            } if is_long_press(label.as_deref())
                 && ((*t <= keyframe.t && keyframe.t.saturating_sub(*t1) <= 600)
                     || t.abs_diff(keyframe.t) <= 600) =>
             {
@@ -484,165 +481,74 @@ pub fn stamp_keyframe_badges(frames: &mut [(Keyframe, RgbaFrame)]) {
     }
 }
 
+/// Where the vertical middle of a digit sits below the top of a text mask, as a fraction of the
+/// font size: Helvetica Neue through CoreText, Arial through `ab_glyph`, the 5×7 fallback.
+const DIGIT_MIDDLE: f32 = if cfg!(target_os = "macos") {
+    0.59
+} else if cfg!(target_os = "windows") {
+    0.55
+} else {
+    0.5
+};
+
+/// The keyframe's number, bold black on a small white rounded square with a thin dark ring,
+/// inset from the top-left corner of `rect` (top-right when ink, a click or the cursor is there).
+/// `k` scales it: 1 is a 24 px square. A shaped container keeps a model from reading it as a
+/// number on the screen, and summary.md carries the time.
 fn draw_keyframe_badge(
     dst: &mut RgbaFrame,
     rect: [f32; 4],
     keyframe: &Keyframe,
-    badge_k: f32,
+    k: f32,
     dodge_top_right: bool,
 ) {
     let [rx, ry, rw, rh] = rect;
     if rw <= 0.0 || rh <= 0.0 {
         return;
     }
-    let badge_k = badge_k.max(0.45);
-    let num_label = format!("#{}", keyframe.index);
-    let time_label =
-        (!keyframe.file.is_empty() || !keyframe.event.is_empty()).then(|| format_clock(keyframe.t));
-    let num_size = 15.5 * badge_k;
-    let time_size = 12.5 * badge_k;
-    let badge_h = 28.0 * badge_k;
-    let outer_r = 8.5 * badge_k;
-    let inset = 2.5 * badge_k;
-    let cap_h = badge_h - inset * 2.0;
-    let cap_r = (outer_r - inset).max(2.0);
-    let num_w = text_width(&num_label, num_size, true);
-    let cap_w = (num_w + 12.0 * badge_k).max(cap_h);
-    let time_w = time_label
-        .as_deref()
-        .map_or(0.0, |clock| text_width(clock, time_size, true));
-    let badge_w = if time_label.is_some() {
-        inset + cap_w + 7.0 * badge_k + time_w + 9.0 * badge_k
-    } else {
-        cap_w + inset * 2.0
-    };
-
-    let margin = 7.0 * badge_k;
+    let k = k.max(0.45);
+    let label = keyframe.index.to_string();
+    let size = 16.0 * k;
+    let text_w = text_width(&label, size, true);
+    let h = size * 1.5;
+    let w = (text_w + size * 0.62).max(h);
+    let inset = 5.0 * k;
+    let ring = (1.4 * k).max(1.0);
+    let radius = size * 0.3;
     let dodge = dodge_top_right || keyframe.cursor.is_some_and(|[x, y]| x < 0.30 && y < 0.18);
-    let bx = if dodge {
-        (rx + rw - badge_w - margin).max(rx + margin)
+    let x = if dodge {
+        (rx + rw - w - inset).max(rx + inset)
     } else {
-        rx + margin
+        rx + inset
     };
-    let by = ry + margin;
-
+    let y = ry + inset;
     rounded(
         dst,
-        [
-            bx - 1.0 * badge_k,
-            by - 1.0 * badge_k,
-            badge_w + 2.0 * badge_k,
-            badge_h + 2.0 * badge_k,
-        ],
-        outer_r + 1.0 * badge_k,
-        [0, 0, 0, 96],
+        [x - ring, y - ring, w + 2.0 * ring, h + 2.0 * ring],
+        radius + ring,
+        CHIP_RING,
     );
-    rounded(
-        dst,
-        [bx, by, badge_w, badge_h],
-        outer_r,
-        [255, 255, 255, 78],
-    );
-    let border = (1.2 * badge_k).max(1.0);
-    rounded(
-        dst,
-        [
-            bx + border,
-            by + border,
-            (badge_w - border * 2.0).max(0.0),
-            (badge_h - border * 2.0).max(0.0),
-        ],
-        (outer_r - border).max(0.0),
-        [14, 15, 18, 240],
-    );
-    let cap_x = bx + inset;
-    let cap_y = by + inset;
-    rounded(
-        dst,
-        [cap_x, cap_y, cap_w, cap_h],
-        cap_r,
-        [248, 249, 252, 255],
-    );
-    // CoreText draws digits with optical cap-center at ~0.595 * font_size from top of mask.
+    rounded(dst, [x, y, w, h], radius, CHIP_FILL);
     draw_text(
         dst,
-        &num_label,
-        cap_x + (cap_w - num_w) * 0.5,
-        cap_y + cap_h * 0.5 - num_size * 0.59,
-        num_size,
-        [14, 15, 18, 255],
+        &label,
+        x + (w - text_w) * 0.5,
+        y + h * 0.5 - size * DIGIT_MIDDLE,
+        size,
+        CHIP_INK,
         true,
     );
-    if let Some(clock) = time_label {
-        draw_text(
-            dst,
-            &clock,
-            cap_x + cap_w + 7.0 * badge_k,
-            by + badge_h * 0.5 - time_size * 0.59,
-            time_size,
-            [236, 238, 244, 255],
-            true,
-        );
-    }
 }
 
-/// Small numbered discs where each mark of a shared keyframe began, in drawing order, so the
-/// summary's ①②③ point at their ink. Dark with a white ring, unlike red pins.
-fn draw_mark_numbers(frame: &mut RgbaFrame, marks: &[&Mark], strokes: &[Stroke], k: f32) {
-    let (w, h) = (frame.width as f32, frame.height as f32);
-    let radius = 11.0 * k;
-    let mut placed: Vec<[f32; 2]> = Vec::new();
-    for (n, mark) in marks.iter().enumerate() {
-        let start = mark
-            .strokes
-            .iter()
-            .filter_map(|&i| strokes.get(i))
-            .min_by_key(|s| s.t0)
-            .and_then(|s| s.normalized_points().first().copied());
-        let Some([x, y]) = start else {
-            continue;
-        };
-        let lift = radius * 1.1;
-        let clamp_x = |v: f32| v.clamp(radius + 2.0, (w - radius - 2.0).max(radius + 2.0));
-        let clamp_y = |v: f32| v.clamp(radius + 2.0, (h - radius - 2.0).max(radius + 2.0));
-        let mut center = [clamp_x(x * w - lift), clamp_y(y * h - lift)];
-        // Marks that start in one place would hide each other's numbers; step along instead.
-        for _ in 0..marks.len() {
-            let crowded = placed
-                .iter()
-                .any(|p: &[f32; 2]| (p[0] - center[0]).hypot(p[1] - center[1]) < radius * 2.3);
-            if !crowded {
-                break;
-            }
-            center = [clamp_x(center[0] + radius * 2.5), center[1]];
-        }
-        placed.push(center);
-        circle(frame, center, radius + 1.6 * k, WHITE);
-        circle(frame, center, radius, [14, 15, 18, 255]);
-        let label = (n + 1).to_string();
-        let mut size = 14.0 * k;
-        let width = text_width(&label, size, true);
-        if width > radius * 1.6 {
-            size *= radius * 1.6 / width;
-        }
-        let width = text_width(&label, size, true);
-        draw_text(
-            frame,
-            &label,
-            center[0] - width * 0.5,
-            center[1] - size * 0.58,
-            size,
-            WHITE,
-            true,
-        );
-    }
-}
+const CHIP_RING: Color = [16, 17, 20, 230];
+const CHIP_FILL: Color = [250, 250, 252, 255];
+const CHIP_INK: Color = [16, 17, 20, 255];
 
-fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alpha: f32) {
+fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32) {
     let label = number.to_string();
     let radius = 13.0 * scale;
-    circle(frame, point, radius + 2.5 * scale, opacity(WHITE, alpha));
-    circle(frame, point, radius, opacity(RED, alpha));
+    circle(frame, point, radius + 2.5 * scale, WHITE);
+    circle(frame, point, radius, RED);
     let mut size = 16.0 * scale;
     let width = text_width(&label, size, true);
     if width > radius * 1.65 {
@@ -655,7 +561,7 @@ fn draw_pin(frame: &mut RgbaFrame, point: [f32; 2], number: u32, scale: f32, alp
         point[0] - width * 0.5,
         point[1] - size * 0.58,
         size,
-        opacity(WHITE, alpha),
+        WHITE,
         true,
     );
 }
@@ -709,54 +615,77 @@ fn draw_laser(frame: &mut RgbaFrame, stroke: &Stroke, time: u64) {
     }
 }
 
+const CLICK_BLUE: Color = [0, 136, 255, 255];
+
+/// Where a click landed, without hiding what's under it: a thin translucent ring with a hairline
+/// white edge (so it reads on dark and on blue) and a small centre dot. No fill.
 fn draw_click_ripple(frame: &mut RgbaFrame, p: [f32; 2], k: f32) {
-    circle(frame, p, 14.0 * k, [0, 136, 255, 68]);
-    ring(frame, p, 15.0 * k, 1.75 * k, WHITE);
-    ring(frame, p, 17.5 * k, 1.75 * k, [0, 136, 255, 235]);
+    let r = 9.0 * k;
+    ring(frame, p, r + 1.1 * k, 0.9 * k, opacity(WHITE, 0.4));
+    ring(frame, p, r, 1.3 * k, opacity(CLICK_BLUE, 0.8));
+    circle(frame, p, 2.0 * k, opacity(WHITE, 0.5));
+    circle(frame, p, 1.3 * k, opacity(CLICK_BLUE, 0.9));
 }
 
-/// A finger's path: a haloed blue line from a small start dot to a ring where it lifted.
+/// A finger's path: a thin translucent blue line from a small dot to a slightly larger one where
+/// it lifted (a tap's ring there, when the keyframe has one, stays the only ring).
 fn draw_touch_trail(frame: &mut RgbaFrame, points: &[[f32; 2]], k: f32) {
     let (Some(&start), Some(&end)) = (points.first(), points.last()) else {
         return;
     };
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            4.5 * k,
-            4.5 * k,
-            [255, 255, 255, 150],
-        );
+    polyline(frame, points, 1.5 * k, opacity(WHITE, 0.22));
+    polyline(frame, points, 0.8 * k, opacity(CLICK_BLUE, 0.7));
+    for (point, r) in [(start, 1.3 * k), (end, 2.2 * k)] {
+        circle(frame, point, r + 0.7 * k, opacity(WHITE, 0.5));
+        circle(frame, point, r, opacity(CLICK_BLUE, 0.9));
     }
-    for pair in points.windows(2) {
-        line(
-            frame,
-            pair[0],
-            pair[1],
-            2.6 * k,
-            2.6 * k,
-            [0, 136, 255, 230],
-        );
-    }
-    circle(frame, start, 5.0 * k, WHITE);
-    circle(frame, start, 3.5 * k, [0, 136, 255, 255]);
-    circle(frame, end, 12.0 * k, [0, 136, 255, 60]);
-    ring(frame, end, 13.0 * k, 1.75 * k, WHITE);
-    ring(frame, end, 15.5 * k, 1.75 * k, [0, 136, 255, 235]);
 }
 
-pub fn render_contact_sheet(
-    bundle: &ScrawlBundle,
-    annotated_frames: &[(Keyframe, RgbaFrame)],
-) -> RgbaFrame {
-    render_contact_sheet_for_duration(bundle.duration_ms, annotated_frames)
+/// A round-capped polyline of half-width `radius`, blended once per pixel so a translucent line
+/// doesn't darken where its segments meet.
+fn polyline(frame: &mut RgbaFrame, points: &[[f32; 2]], radius: f32, color: Color) {
+    if points.len() < 2 || points.iter().flatten().any(|v| !v.is_finite()) {
+        return;
+    }
+    let reach = radius + 1.0;
+    let [bx0, by0, bx1, by1] = crate::sketch::bounds(points);
+    let x0 = ((bx0 - reach).floor() as i32).max(0);
+    let x1 = ((bx1 + reach).ceil() as i32).min(frame.width as i32);
+    let y0 = ((by0 - reach).floor() as i32).max(0);
+    let y1 = ((by1 + reach).ceil() as i32).min(frame.height as i32);
+    for py in y0..y1 {
+        let y = py as f32 + 0.5;
+        for px in x0..x1 {
+            let x = px as f32 + 0.5;
+            let mut d = f32::INFINITY;
+            for seg in points.windows(2) {
+                let (a, b) = (seg[0], seg[1]);
+                if x < a[0].min(b[0]) - reach
+                    || x > a[0].max(b[0]) + reach
+                    || y < a[1].min(b[1]) - reach
+                    || y > a[1].max(b[1]) + reach
+                {
+                    continue;
+                }
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let len2 = (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6);
+                let t = (((x - a[0]) * ab[0] + (y - a[1]) * ab[1]) / len2).clamp(0.0, 1.0);
+                d = d.min((x - a[0] - ab[0] * t).hypot(y - a[1] - ab[1] * t));
+            }
+            let coverage = (radius + 0.5 - d).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(frame, px, py, color, coverage);
+            }
+        }
+    }
 }
 
 const SHEET_PAD: u32 = 6;
 const SHEET_GAP: u32 = 6;
 const SHEET_BG: Color = [28, 29, 34, 255];
+/// One chip size on every tile, about 24 px square with its ring: the smallest that models still
+/// read on a sheet shown at half size (20 px wasn't).
+const SHEET_CHIP_K: f32 = 0.9;
 const SHEET_MAX_EDGE: f32 = 1600.0;
 const SHEET_MAX_PIXELS: f32 = 1_560_000.0;
 
@@ -1021,12 +950,9 @@ pub fn render_contact_sheet_for_duration(
     sheet.t_ms = duration_ms;
 
     let mut cells = Vec::with_capacity(frames.len());
-    let mut min_cell_w = u32::MAX;
-    let mut min_cell_h = u32::MAX;
     let mut row_y = SHEET_PAD;
     for (r_idx, row) in rows.iter().enumerate() {
         let row_h = row_heights_px[r_idx];
-        min_cell_h = min_cell_h.min(row_h);
         let k = row.len();
         let total_gap = SHEET_GAP * k.saturating_sub(1) as u32;
         let avail_w = inner_w_px.saturating_sub(total_gap);
@@ -1042,7 +968,6 @@ pub fn render_contact_sheet_for_duration(
                 (avail_w as f32 * (cum_a / a_row)).round() as u32
             };
             let cell_w = x1.saturating_sub(x0).max(1);
-            min_cell_w = min_cell_w.min(cell_w);
             let cell_x = SHEET_PAD + x0 + j as u32 * SHEET_GAP;
             let rect = [cell_x as f32, row_y as f32, cell_w as f32, row_h as f32];
             cells.push((i, rect));
@@ -1050,14 +975,10 @@ pub fn render_contact_sheet_for_duration(
         row_y += row_h + SHEET_GAP;
     }
 
-    let sheet_badge_k = 0.90_f32
-        .min(min_cell_w as f32 / 120.0)
-        .min(min_cell_h as f32 / 72.0)
-        .max(0.5);
     for (i, rect) in cells {
         let (kf, image) = &frames[i];
         blit_scaled(&mut sheet, image, rect, 0.0);
-        draw_keyframe_badge(&mut sheet, rect, kf, sheet_badge_k, image.badge_top_right);
+        draw_keyframe_badge(&mut sheet, rect, kf, SHEET_CHIP_K, image.badge_top_right);
     }
     sheet
 }
@@ -1882,52 +1803,7 @@ mod tests {
             said: Some("When I click Used 12 tools…".into()),
             mark_id: None,
             cursor: None,
-        }
-    }
-
-    fn bundle() -> ScrawlBundle {
-        ScrawlBundle {
-            version: 1,
-            id: "render-test".into(),
-            created_at_ms: 0,
-            duration_ms: 8000,
-            target: TargetInfo {
-                mode: CaptureMode::Window,
-                app: Some("Demo".into()),
-                bundle_id: None,
-                window_title: Some("Tool activity".into()),
-                window_id: None,
-                display_id: 1,
-                frame: TargetFrame {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 320.0,
-                    height: 200.0,
-                    scale: 1.0,
-                },
-            },
-            transcript: TranscriptData {
-                text: "Click the tool header and inspect the layout shift.".into(),
-                ..Default::default()
-            },
-            note: None,
-            strokes: vec![],
-            marks: vec![],
-            events: vec![],
-            keyframes: vec![],
-            contact_sheet: "contact-sheet.png".into(),
-            video: None,
-            video_offset_ms: 0,
-            audio: None,
-            source: None,
-            device: None,
-            context: Default::default(),
-            context_changes: Vec::new(),
-            screens: Vec::new(),
-            windows: Vec::new(),
-            cursor: Vec::new(),
-            autocrop: None,
-            destination: None,
+            narration: None,
         }
     }
 
@@ -1995,6 +1871,41 @@ mod tests {
         later.t = 6000;
         let stale = render_annotated_keyframe(&base, &later, &[], &[], &[swipe]);
         assert_eq!(blue(&stale), 0, "an old swipe should not be drawn");
+    }
+
+    /// A click is marked by a thin ring and a small dot: what was clicked stays visible.
+    #[test]
+    fn click_marks_leave_what_they_mark_visible() {
+        let base = solid(1280, 800, [240, 240, 240, 255]);
+        let mut keyframe = key(1);
+        keyframe.reason = KeyframeReason::Click;
+        keyframe.cursor = Some([0.5, 0.5]);
+        let after = render_annotated_keyframe(&base, &keyframe, &[], &[], &[]);
+        let changed: Vec<(usize, usize)> = (0..800)
+            .flat_map(|y| (0..1280).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let i = (y * 1280 + x) * 4;
+                after.rgba[i..i + 4] != base.rgba[i..i + 4]
+            })
+            .filter(|&(x, y)| x > 600 && x < 680 && y > 360 && y < 440)
+            .collect();
+        assert!(!changed.is_empty(), "click mark missing");
+        // A quarter of the filled 18 px disc it replaces, and the band between dot and ring is
+        // left alone.
+        assert!(changed.len() < 260, "{} px painted", changed.len());
+        for (x, y) in [(645, 400), (640, 395), (636, 400)] {
+            let i = (y * 1280 + x) * 4;
+            assert_eq!(
+                after.rgba[i..i + 4],
+                base.rgba[i..i + 4],
+                "({x}, {y}) covered"
+            );
+        }
+        // Nothing is opaque: the screen shows through every pixel of the mark.
+        for (x, y) in changed {
+            let i = (y * 1280 + x) * 4;
+            assert!(after.rgba[i] > 20, "({x}, {y}) hides the screen");
+        }
     }
 
     #[test]
@@ -2094,22 +2005,127 @@ mod tests {
         assert!(red_rows(115..125) > 0 && red_rows(145..155) > 0);
         assert_eq!(red_rows(175..185), 0, "another keyframe's mark");
 
-        // agentContext numbers the shared marks with dark, white-ringed discs up and left of
-        // where each began.
-        let mut numbered = result.clone();
-        let shown: Vec<&Mark> = marks[..2].iter().collect();
-        draw_mark_numbers(&mut numbered, &shown, &strokes, 1.0);
-        let changed = |x0: usize, y0: usize| {
-            (y0..y0 + 14).any(|y| {
-                (x0..x0 + 14).any(|x| {
-                    let i = (y * 320 + x) * 4;
-                    numbered.rgba[i..i + 4] != result.rgba[i..i + 4]
-                })
+        // No numbered badges beside the marks (the text numbers them): below the corner badge,
+        // every pixel is the backdrop or red ink.
+        let foreign = result.rgba[60 * 320 * 4..]
+            .chunks_exact(4)
+            .filter(|p| p[..3] != [20, 20, 20] && !(p[0] > p[1] && p[0] > p[2]))
+            .count();
+        assert_eq!(foreign, 0, "pixels that are neither backdrop nor ink");
+        // Tests run with experiments off, so also check the images never depend on agentContext.
+        assert!(!include_str!("render.rs").contains(concat!("handoff::", "AGENT_CONTEXT")));
+    }
+
+    /// The box of pixels in `frame` that differ from `base`, as `[x0, y0, x1, y1]` inclusive.
+    fn changed_box(frame: &RgbaFrame, base: &RgbaFrame) -> Option<[usize; 4]> {
+        let w = frame.width as usize;
+        let mut found: Option<[usize; 4]> = None;
+        for (i, (a, b)) in frame
+            .rgba
+            .chunks_exact(4)
+            .zip(base.rgba.chunks_exact(4))
+            .enumerate()
+        {
+            if a != b {
+                let (x, y) = (i % w, i / w);
+                let r = found.get_or_insert([x, y, x, y]);
+                *r = [r[0].min(x), r[1].min(y), r[2].max(x), r[3].max(y)];
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_keyframe_is_labelled_by_its_number_alone_in_a_small_white_chip() {
+        let base = solid(1280, 800, [120, 130, 140, 255]);
+        let mut frame = base.clone();
+        stamp_keyframe_badge_in_place(&mut frame, &key(7));
+        let [x0, y0, x1, y1] = changed_box(&frame, &base).expect("no chip");
+        // k = 800 / 480: the chip sits 5k from the corner (its ring just outside) and is square
+        // for one digit: no `#`, no time beside it.
+        let k = 800.0 / 480.0;
+        assert!((x0 as f32 - 3.6 * k).abs() <= 1.5 && (y0 as f32 - 3.6 * k).abs() <= 1.5);
+        let (w, h) = ((x1 - x0 + 1) as f32, (y1 - y0 + 1) as f32);
+        assert!((h - 26.8 * k).abs() <= 2.0, "{w}x{h}");
+        assert!(
+            (w - h).abs() <= 1.0,
+            "a one-digit chip should be square, got {w}x{h}"
+        );
+        let at = |x: usize, y: usize| &frame.rgba[(y * 1280 + x) * 4..][..4];
+        // A white fill with dark digit strokes inside it, and a dark ring around it.
+        let inner: Vec<_> = (y0 + 4..y1 - 3)
+            .flat_map(|y| (x0 + 4..x1 - 3).map(move |x| (x, y)))
+            .map(|(x, y)| at(x, y)[0])
+            .collect();
+        assert!(inner.iter().filter(|&&v| v > 240).count() > inner.len() / 2);
+        assert!(inner.iter().filter(|&&v| v < 40).count() > 20, "no digit");
+        assert!(at(x0 + 1, (y0 + y1) / 2)[0] < 40, "no ring");
+
+        // Two digits widen it but keep it small.
+        let mut wide = base.clone();
+        stamp_keyframe_badge_in_place(&mut wide, &key(12));
+        let [a0, _, a1, _] = changed_box(&wide, &base).unwrap();
+        let w12 = (a1 - a0 + 1) as f32;
+        assert!(w12 > w && w12 < 2.0 * h, "{w12}");
+    }
+
+    #[test]
+    fn the_chip_moves_to_the_top_right_when_ink_or_the_cursor_is_top_left() {
+        let base = solid(1280, 800, [120, 130, 140, 255]);
+        let mut inked = base.clone();
+        inked.badge_top_right = true;
+        stamp_keyframe_badge_in_place(&mut inked, &key(3));
+        let mut pointed = base.clone();
+        let mut keyframe = key(3);
+        keyframe.cursor = Some([0.1, 0.05]);
+        stamp_keyframe_badge_in_place(&mut pointed, &keyframe);
+        for frame in [&inked, &pointed] {
+            let [x0, y0, x1, _] = changed_box(frame, &base).unwrap();
+            let k = 800.0 / 480.0;
+            assert!(x0 > 1200, "chip at x {x0}");
+            assert!((1279.0 - x1 as f32 - 3.6 * k).abs() <= 1.5);
+            assert!((y0 as f32 - 3.6 * k).abs() <= 1.5);
+        }
+    }
+
+    #[test]
+    fn contact_sheet_chips_are_one_readable_size_in_every_tile() {
+        // Twelve tiles of mixed shapes: every chip is about 24 px whatever the tile's size.
+        let dims = [(1280, 800), (736, 1600), (930, 975), (1054, 327)];
+        let frames: Vec<_> = (1..=12)
+            .map(|i| {
+                let (w, h) = dims[i % dims.len()];
+                let mut frame = solid(w, h, [120, 130, 140, 255]);
+                frame.badge_top_right = i % 3 == 0;
+                (key(i), frame)
             })
-        };
-        // Starts at (48, 120) and (48, 150); discs sit about 12 px up and left.
-        assert!(changed(30, 102) && changed(30, 132));
-        assert!(!changed(200, 20), "nothing else is touched");
+            .collect();
+        let sheet = render_contact_sheet_for_duration(8000, &frames);
+        // Chip pixels are the near-white fill; group them by tile through the gray around them.
+        let w = sheet.width as usize;
+        let white: Vec<(usize, usize)> = sheet
+            .rgba
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(_, p)| p[0] > 240 && p[1] > 240 && p[2] > 240)
+            .map(|(i, _)| (i % w, i / w))
+            .collect();
+        let mut chips: Vec<[usize; 4]> = Vec::new();
+        for (x, y) in white {
+            match chips
+                .iter_mut()
+                .find(|c| x + 4 >= c[0] && x <= c[2] + 4 && y + 4 >= c[1] && y <= c[3] + 4)
+            {
+                Some(c) => *c = [c[0].min(x), c[1].min(y), c[2].max(x), c[3].max(y)],
+                None => chips.push([x, y, x, y]),
+            }
+        }
+        assert_eq!(chips.len(), 12, "{chips:?}");
+        for c in chips {
+            // The white fill is the chip less its ring: 21.6 px, so about 24 px with the ring.
+            let h = c[3] - c[1] + 1;
+            assert!((20..=23).contains(&h), "chip fill {h} px tall: {c:?}");
+        }
     }
 
     #[test]
@@ -2124,7 +2140,7 @@ mod tests {
                         )
                     })
                     .collect();
-                let sheet = render_contact_sheet(&bundle(), &frames);
+                let sheet = render_contact_sheet_for_duration(8000, &frames);
                 assert!(
                     sheet.width <= SHEET_MAX_EDGE as u32 && sheet.height <= SHEET_MAX_EDGE as u32,
                     "Sheet {}x{} exceeded max edge for count={count} size={size:?}",
@@ -2187,7 +2203,7 @@ mod tests {
                 (key(i), solid(w, h, [50 + i as u8 * 15, 90, 130, 255]))
             })
             .collect();
-        let sheet = render_contact_sheet(&bundle(), &frames);
+        let sheet = render_contact_sheet_for_duration(8000, &frames);
         let w = sheet.width as usize;
         let h = sheet.height as usize;
         let pad = SHEET_PAD as usize;
@@ -2279,7 +2295,7 @@ mod tests {
         );
         assert!(lines.len() > 2);
         assert!(lines.iter().all(|s| text_width(s, 16.0, false) <= 81.0));
-        let sheet = render_contact_sheet(&bundle(), &[]);
+        let sheet = render_contact_sheet_for_duration(8000, &[]);
         assert!(sheet.width > 0 && sheet.height > 0);
     }
 }

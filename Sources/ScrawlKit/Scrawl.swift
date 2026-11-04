@@ -306,11 +306,18 @@
     /// The window the touches are measured in, for the timeline's `screen`.
     @ObservationIgnored weak var touchWindow: UIWindow?
     @ObservationIgnored private var overlay: OverlayWindow?
+    @ObservationIgnored private var prewarmExpiry: Task<Void, Never>?
+    private(set) var preparedAt: Date?
     @ObservationIgnored private var failedRecording: Recording?
     /// The current recording's recorder.
     @ObservationIgnored private var recorder: (any ScrawlRecorder)?
     /// The recorder is starting (or asking permission) and the overlay is already up.
-    @ObservationIgnored private var isStarting = false
+    public private(set) var isStarting = false
+    @ObservationIgnored private var pendingFinish: Bool?
+    @ObservationIgnored private let makeRecorder: @MainActor (ScrawlCaptureMethod, Bool) -> any ScrawlRecorder
+    /// Optional startup measurements, called on the stage's own queue. Keep the callback cheap.
+    @ObservationIgnored public var startupObserver: (@Sendable (ScrawlStartupEvent) -> Void)?
+    @ObservationIgnored var startupTrace: StartupTrace?
     @ObservationIgnored private var discardID = 0
     @ObservationIgnored private var discarded: FinishedRecording?
     /// Undo was tapped before the recorder finished writing this discard's movie.
@@ -383,8 +390,12 @@
       !serverURLs.isEmpty && !(token?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
-    private init() {
-      if let initial = ScrawlConfig.resolved() {
+    init(
+      config: ScrawlConfig? = ScrawlConfig.resolved(),
+      makeRecorder: @escaping @MainActor (ScrawlCaptureMethod, Bool) -> any ScrawlRecorder = { $0.makeRecorder(hosted: $1) }
+    ) {
+      self.makeRecorder = makeRecorder
+      if let initial = config {
         serverURLs = initial.urls
         token = initial.token
         sessionID = initial.sessionID
@@ -421,16 +432,37 @@
       return true
     }
 
+    @ObservationIgnored private var teamEndpoint: (url: URL, token: String)?
+    /// Optional async supplement merged into `timeline.json` before a recording is written.
+    @ObservationIgnored public var timelineSupplement: (@MainActor @Sendable ([String: Any]) async -> [String: Any])?
+    /// Called on the main actor when a finished recording is handed to delivery. Returning `true`
+    /// marks the recording as handled in-process without queuing an outbox upload.
+    @ObservationIgnored public var onRecordingSubmitted: (@MainActor @Sendable (URL, URL) async -> Bool)?
+
+    /// Configures or clears a team-feedback endpoint in memory without altering the device's
+    /// saved personal Scrawl Keychain configuration. Passing `nil` restores the saved config.
+    public func setTeamEndpoint(url: URL?, token: String?) {
+      if let url, let token = token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+        teamEndpoint = (url, token)
+        applyConfig(ScrawlConfig(urls: [url], token: token, sessionID: nil))
+      } else {
+        teamEndpoint = nil
+        applyConfig(ScrawlConfig.resolved())
+      }
+    }
+
     private func applyConfig(_ config: ScrawlConfig?) {
-      serverURLs = config?.urls ?? []
-      token = config?.token
-      sessionID = config?.sessionID
+      let effective = teamEndpoint.map { ScrawlConfig(urls: [$0.url], token: $0.token, sessionID: nil) } ?? config
+      serverURLs = effective?.urls ?? []
+      token = effective?.token
+      sessionID = effective?.sessionID
       if !isConfigured {
         if isRecording || isStarting {
           isRecording = false
           isStarting = false
           isDrawing = false
           startedAt = nil
+          pendingFinish = nil
           recorder?.cancel()
           recorder = nil
         }
@@ -667,20 +699,34 @@
     /// Starts recording, or sends the current recording.
     public func toggle() {
       guard isConfigured else { return }
-      isRecording ? stop() : start()
+      isRecording || isStarting ? stop() : start()
     }
 
     public func toggleDrawing() {
-      guard isRecording else { return }
+      guard isRecording || isStarting else { return }
       isDrawing.toggle()
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     public func start() {
       guard isConfigured, !isRecording, !isStarting else { return }
+      start(trace: startupObserver.map { StartupTrace(receive: $0) })
+    }
+
+    /// Starts the measurement at recognition, before the trigger's feedback work.
+    func triggerRecognized() {
+      guard isConfigured else { return }
+      let trace = !isRecording && !isStarting ? startupObserver.map { StartupTrace(receive: $0) } : nil
+      UINotificationFeedbackGenerator().notificationOccurred(.success)
+      if isRecording || isStarting { stop() } else { start(trace: trace) }
+    }
+
+    private func start(trace: StartupTrace?) {
+      guard isConfigured, !isRecording, !isStarting else { return }
+      prewarmExpiry?.cancel()
+      prewarmExpiry = nil
+      startupTrace = trace
       let hosted = hostedURL != nil
-      let recorder = captureMethod.makeRecorder(hosted: hosted)
-      guard recorder.isAvailable else { return }
       if isDiscardPending { finalizeDiscard() }
       markers = []
       events = []
@@ -709,32 +755,65 @@
       stallCheck = nil
       statusID += 1
       isStarting = true
+      pendingFinish = nil
+      startedAt = Date()
       showOverlay()
-      if hosted {
-        syncOutbox()
-        // Known revoked from an earlier check: say so, but record anyway.
-        if pairingRevoked { showNotice(.linkExpired, for: .seconds(5)) }
+      preparedAt = nil
+      // Rendering has no dependency on permission, engine construction, disk, or the encoder.
+      let recorder = makeRecorder(captureMethod, hosted)
+      recorder.startupTrace = startupTrace
+      startupTrace?.mark("recorderCreated")
+      guard recorder.isAvailable else {
+        isStarting = false
+        startedAt = nil
+        hideOverlay()
+        return
       }
-      // Reaching the Mac now raises iOS's local network prompt at the start, not at stop time.
-      Task { await self.findMac() }
+      let trace = startupTrace
       self.recorder = recorder
       recorder.onInterruption = { [weak self] in self?.stop() }
-      recorder.start(microphone: narration) { [weak self, weak recorder] result in
+      let begin: @MainActor () -> Void = { [weak self, weak recorder] in
         guard let self, let recorder, self.recorder === recorder, self.isStarting else { return }
-        self.isStarting = false
-        switch result {
-        case let .success(startedAt):
-          self.startedAt = startedAt
-          KeyboardTracker.shared.recordingWillBegin()
-          ScrawlAppContext.shared.begin(at: startedAt)
-          self.isRecording = true
-          if hosted { self.startLimit(for: recorder.method, startedAt: startedAt) }
-        case let .failure(error):
-          print("Scrawl: could not start recording: \(error.localizedDescription)")
-          self.recorder = nil
-          self.hideOverlay()
+        Task {
+          if hosted {
+            trace?.mark("outboxBegin")
+            self.syncOutbox()
+            trace?.mark("outboxEnd")
+            if self.pairingRevoked { self.showNotice(.linkExpired, for: .seconds(5)) }
+          }
+        }
+        // Raise local-network consent at start, but only after the prepared UI is presented.
+        Task { await self.findMac() }
+        recorder.start(microphone: self.narration) { [weak self, weak recorder] result in
+          guard let self, let recorder, self.recorder === recorder, self.isStarting else { return }
+          self.isStarting = false
+          switch result {
+          case let .success(startedAt):
+            self.startupTrace?.mark("ready")
+            // Touches and drawing are accepted while the hardware starts. Keep their timestamps
+            // on the movie's clock (the app-frame recorder begins its clock at start invocation).
+            let shift = self.startedAt?.timeIntervalSince(startedAt) ?? 0
+            self.rebaseEarlyInput(by: shift)
+            self.startedAt = startedAt
+            KeyboardTracker.shared.recordingWillBegin()
+            ScrawlAppContext.shared.begin(at: startedAt)
+            self.isRecording = true
+            if hosted { self.startLimit(for: recorder.method, startedAt: startedAt) }
+            if let discarding = self.pendingFinish {
+              self.pendingFinish = nil
+              self.finish(discarding: discarding)
+            }
+          case let .failure(error):
+            print("Scrawl: could not start recording: \(error.localizedDescription)")
+            self.recorder = nil
+            self.startedAt = nil
+            self.pendingFinish = nil
+            self.isDrawing = false
+            self.hideOverlay()
+          }
         }
       }
+      if let overlay { overlay.afterFirstPresentation(begin) } else { begin() }
     }
 
     /// Stops recording and sends it to your Mac (the strip's Send).
@@ -745,7 +824,7 @@
     /// Stops recording without sending it. The strip offers Undo (which sends it) for a few
     /// seconds; after that the recording's files are deleted.
     public func discard() {
-      guard isRecording else { return }
+      guard isRecording || isStarting else { return }
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
       finish(discarding: true)
     }
@@ -765,6 +844,10 @@
     }
 
     private func finish(discarding: Bool) {
+      if isStarting {
+        pendingFinish = discarding
+        return
+      }
       guard isRecording, let startedAt, let recorder else { return }
       self.recorder = nil
       isRecording = false
@@ -825,6 +908,11 @@
           }
           var info = info
           info["audio"] = recorder.recordsAudio
+          if let supplement = self.timelineSupplement {
+            for (key, value) in await supplement(info) {
+              info[key] = value
+            }
+          }
           let timelineData = (try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys])) ?? Data()
           try? timelineData.write(to: timeline)
           let finished = FinishedRecording(
@@ -883,6 +971,12 @@
     }
 
     private func deliver(_ finished: FinishedRecording) async {
+      if let onRecordingSubmitted, await onRecordingSubmitted(finished.recording.timeline, finished.recording.movie) {
+        uploadStatus = .idle
+        Self.delete(finished)
+        await hideOverlayAfterExit()
+        return
+      }
       if hostedURL != nil {
         await deliverHosted(finished)
         return
@@ -972,6 +1066,42 @@
     }
 
     // MARK: - Internals
+
+    /// Cheap preparation when a configured host sees a potential trigger. No audio, capture,
+    /// permission request or disk work; the hidden view is released if the press is abandoned.
+    public func prepareToStart() {
+      guard isConfigured, !isRecording, !isStarting, overlay == nil,
+            let scene = Self.activeScene else { return }
+      let start = CACurrentMediaTime()
+      preparedAt = Date()
+      overlay = OverlayWindow(windowScene: scene, scrawl: self)
+      overlay?.prepareLayout()
+      startupObserver?(.init(stage: "prewarm", milliseconds: (CACurrentMediaTime() - start) * 1000, onMainThread: true))
+      prewarmExpiry = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(2))
+        guard !Task.isCancelled, let self, !self.isStarting, !self.isRecording else { return }
+        self.hideOverlay()
+      }
+    }
+
+    private func rebaseEarlyInput(by shift: TimeInterval) {
+      guard shift != 0 else { return }
+      markers = markers.map { Self.round(max(0, $0 + shift)) }
+      for index in events.indices {
+        if let t = events[index]["t"] as? Double { events[index]["t"] = Self.round(max(0, t + shift)) }
+      }
+      for index in touchLog.indices {
+        if let t = touchLog[index]["t"] as? Double { touchLog[index]["t"] = Self.round(max(0, t + shift)) }
+      }
+      for index in strokeLog.indices {
+        for key in ["t0", "t1", "fadeAt"] {
+          if let t = strokeLog[index][key] as? Double { strokeLog[index][key] = Self.round(max(0, t + shift)) }
+        }
+        if let points = strokeLog[index]["points"] as? [[Double]] {
+          strokeLog[index]["points"] = points.map { [$0[0], $0[1], Self.round(max(0, $0[2] + shift))] }
+        }
+      }
+    }
 
     func record(event label: String) {
       guard let startedAt else { return }
@@ -1419,12 +1549,19 @@
     }
 
     private func showOverlay() {
-      guard overlay == nil, let scene = Self.activeScene else { return }
-      overlay = OverlayWindow(windowScene: scene, scrawl: self)
+      guard let scene = Self.activeScene else { return }
+      startupTrace?.mark("sceneFound")
+      if overlay == nil {
+        overlay = OverlayWindow(windowScene: scene, scrawl: self)
+        startupTrace?.mark("overlayCreated")
+      }
+      overlay?.present(trace: startupTrace)
+      startupTrace?.mark("overlayShown")
     }
 
     private func hideOverlay() {
-      overlay?.isHidden = true
+      preparedAt = nil
+      overlay?.dismiss()
       overlay = nil
     }
 

@@ -256,7 +256,10 @@ mod tests {
         assert_eq!(trusted.trust, Some(Trust::Selected), "{trusted:?}");
 
         let ready = State::of(&screen(&fixture("ready")));
-        assert!(ready.prompt && !ready.busy() && ready.trust.is_none(), "{ready:?}");
+        assert!(
+            ready.prompt && !ready.busy() && ready.trust.is_none(),
+            "{ready:?}"
+        );
 
         let silent = State::of(&screen(&fixture("no-speech")));
         assert!(!silent.busy(), "{silent:?}");
@@ -304,11 +307,10 @@ mod tests {
 
     #[test]
     fn spoken_status_words_in_the_prompt_are_not_the_status() {
-        let spoken = "Ich sage listening… und keep holding, dann Voice: processing und No speech detected";
-        let bytes = super::super::fixtures::with_prompt(
-            &super::super::fixtures::get("processing"),
-            spoken,
-        );
+        let spoken =
+            "Ich sage listening… und keep holding, dann Voice: processing und No speech detected";
+        let bytes =
+            super::super::fixtures::with_prompt(&super::super::fixtures::get("processing"), spoken);
         let rows = screen(&bytes);
         let state = State::of(&rows);
         assert!(!state.busy(), "{state:?}");
@@ -333,8 +335,13 @@ mod tests {
         assert!(!State::of(&boxed).prompt);
         let trust = State::of(&screen(&super::super::fixtures::get("trust-selected")));
         assert!(!trust.prompt, "{trust:?}");
-        let ready = lines(&format!("{rule}\n❯ 1. ist eine Zahl\n{rule}\n  ? for shortcuts"));
-        assert!(!State::of(&ready).prompt, "a numbered prompt reads as a dialog: fail safe");
+        let ready = lines(&format!(
+            "{rule}\n❯ 1. ist eine Zahl\n{rule}\n  ? for shortcuts"
+        ));
+        assert!(
+            !State::of(&ready).prompt,
+            "a numbered prompt reads as a dialog: fail safe"
+        );
         let ready = lines(&format!("{rule}\n❯ Hallo\n{rule}\n  ? for shortcuts"));
         assert!(State::of(&ready).prompt);
     }
@@ -356,9 +363,14 @@ mod tests {
         assert!(!settle.observe(&changed, at(1_650)), "a change restarts it");
 
         let mut settle = Settle::new(start);
-        let failed = lines(&format!("{rule}\n❯\n{rule}\n  ? for shortcuts   No speech detected."));
+        let failed = lines(&format!(
+            "{rule}\n❯\n{rule}\n  ? for shortcuts   No speech detected."
+        ));
         assert!(!settle.observe(&busy, at(0)));
         assert!(!settle.observe(&failed, at(100)));
-        assert!(settle.observe(&failed, at(250)), "an error has no text to wait for");
+        assert!(
+            settle.observe(&failed, at(250)),
+            "an error has no text to wait for"
+        );
     }
 }

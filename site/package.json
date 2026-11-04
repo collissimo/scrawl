@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && vite build --ssr src/entry-server.tsx --outDir dist-ssr && bun scripts/prerender.ts",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "generate:og-video": "node scripts/og-video/capture.mjs"
   },
   "dependencies": {
     "knobs": "file:/Users/kit/code/open-source/knobs",
@@ -20,6 +21,7 @@
     "@types/react-dom": "^19.3.0",
     "@types/three": "^0.186.0",
     "@vitejs/plugin-react": "^6.1.2",
+    "matter-js": "0.20.0",
     "playwright-core": "1.63.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.4"

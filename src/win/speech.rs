@@ -1,11 +1,12 @@
 //! On-device transcription on Windows, with measured word timings: Parakeet through
 //! `transcribe.cpp`, the engine Hex uses. It loads a model Hex has already installed
-//! (`%APPDATA%\voice-control\models`), else Scrawl's own copy (`%LOCALAPPDATA%\Scrawl\models`),
-//! which `install` downloads once in the background and checks against its SHA-256. English
-//! (`handoff::transcription_language`) uses Hex's Parakeet Unified English; another language
-//! that Parakeet TDT 0.6b v3 speaks (25 European languages, `languages::PARAKEET_V3`) needs that
-//! multilingual model, and one it doesn't stays on the English model (`model_language`). Like
-//! the Hex client, it transcribes each speech island on its own; unlike it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
+//! (`%APPDATA%\hex\models`, else the older `%APPDATA%\voice-control\models`), else Scrawl's own
+//! copy (`%LOCALAPPDATA%\Scrawl\models`), which `install` downloads once in the background and
+//! checks against its SHA-256. English (`handoff::transcription_language`) uses Hex's Parakeet
+//! Unified English; another language that Parakeet TDT 0.6b v3 speaks (25 European languages,
+//! `languages::PARAKEET_V3`) needs that multilingual model, and one it doesn't stays on the
+//! English model (`model_language`). Like the Hex client, it transcribes each speech island on its
+//! own; unlike it, every word keeps the time the model heard it (`estimated: false`), so spoken cues ("look
 //! here") can cut keyframes.
 
 use std::path::{Path, PathBuf};
@@ -67,10 +68,6 @@ pub fn artifact_for(language: &str) -> &'static Artifact {
     }
 }
 
-fn models_dir() -> PathBuf {
-    crate::hex::support_dir().join("models")
-}
-
 /// Where Scrawl keeps the model it downloaded (`SCRAWL_MODELS_DIR` for tests).
 pub fn own_models_dir() -> PathBuf {
     std::env::var_os("SCRAWL_MODELS_DIR")
@@ -128,8 +125,17 @@ fn multilingual(path: &Path) -> bool {
     !english_only && (name.contains("v3") || name.contains("whisper"))
 }
 
+/// Each of Hex's folders in `hex::support_dirs` order (`hex`, then `voice-control`), each ranked
+/// by that folder's own `settings.json`.
 fn hex_models() -> Vec<PathBuf> {
-    let chosen = std::fs::read(crate::hex::support_dir().join("settings.json"))
+    crate::hex::support_dirs()
+        .iter()
+        .flat_map(|dir| models_in(dir))
+        .collect()
+}
+
+fn models_in(support: &Path) -> Vec<PathBuf> {
+    let chosen = std::fs::read(support.join("settings.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|settings| {
@@ -138,7 +144,7 @@ fn hex_models() -> Vec<PathBuf> {
                 .map(str::to_owned)
         })
         .map(|id| id.replace('_', "-"));
-    let mut models = verified_in(&models_dir());
+    let mut models = verified_in(&support.join("models"));
     let rank = |path: &PathBuf| {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let picked = chosen.as_deref().is_some_and(|id| name.starts_with(id));
@@ -197,8 +203,7 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
         return Ok(named(&candidates[0]));
     }
 
-    transcribe_cpp::disable_logging();
-    transcribe_cpp::init_backends_default().context("transcribe.cpp backends")?;
+    init_backends()?;
     let (path, model, hint) = load_for(&candidates, model_language(&language))?;
     crate::capture::scrawl_log(format!(
         "transcribing ({language}) with {} (hint {})",
@@ -270,6 +275,18 @@ pub fn transcribe(audio: &Path) -> Result<TranscriptData> {
     Ok(transcript)
 }
 
+/// Loads ggml's CPU backend DLL for this CPU (beside `transcribe.dll`), once per process: the
+/// registry it fills isn't safe to change while another thread loads a model.
+fn init_backends() -> Result<()> {
+    static INIT: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        transcribe_cpp::disable_logging();
+        transcribe_cpp::init_backends_default().map_err(|error| format!("{error:#}"))
+    })
+    .clone()
+    .map_err(|error| anyhow::anyhow!("transcribe.cpp backends: {error}"))
+}
+
 /// Loads the first candidate whose own language list (`general.languages`, when it has one)
 /// includes `language`, with the language as the hint. When every candidate lists others, the
 /// last one runs without a hint and detects the language itself.
@@ -303,6 +320,7 @@ pub fn install(mut line: impl FnMut(SpeechModelLine)) -> Result<()> {
         status: status.into(),
         engine: Some("Parakeet".into()),
         locale: Some(language.clone()),
+        locales: None,
         progress,
         error,
     };
@@ -532,18 +550,38 @@ mod tests {
         }
     }
 
-    /// Downloads the real English model (731 MB) and loads it. CI's release job runs it.
+    /// Downloads the real model (731 MB), loads it and runs it on two seconds of sound. CI's
+    /// release job runs it, then again under Intel SDE as a CPU without AVX-512 (#58), with
+    /// `SCRAWL_TEST_MODEL_DIR` keeping the download between the two.
     #[test]
     #[ignore]
-    fn downloads_and_loads_parakeet() {
-        let (dir, remove) = download_dir("parakeet");
+    fn downloads_and_runs_parakeet() {
+        let kept = std::env::var_os("SCRAWL_TEST_MODEL_DIR").map(PathBuf::from);
+        let dir = kept.clone().unwrap_or_else(|| temp_dir("parakeet"));
+        let fresh = !dir.join(PARAKEET.filename).is_file();
         let mut last = 0.0;
         let model = download(&PARAKEET, &dir, &mut |done| last = done).unwrap();
-        // A kept download that was already there reports no progress.
-        assert!(last == 1.0 || !remove);
-        transcribe_cpp::init_backends_default().unwrap();
-        Model::load(&model).unwrap();
-        if remove {
+        if fresh {
+            assert_eq!(last, 1.0);
+        }
+        if std::env::var_os("SCRAWL_TEST_NO_AVX512").is_some() {
+            // Under SDE: proves the emulated CPU is the one without AVX-512.
+            assert!(!std::arch::is_x86_feature_detected!("avx512f"));
+        }
+        init_backends().unwrap();
+        for device in transcribe_cpp::devices() {
+            eprintln!("device: {} ({})", device.name, device.description);
+        }
+        let model = Model::load(&model).unwrap();
+        let pcm: Vec<f32> = (0..32_000)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 16_000.0).sin() * 0.1)
+            .collect();
+        model
+            .session()
+            .unwrap()
+            .run(&pcm, &RunOptions::default())
+            .unwrap();
+        if kept.is_none() {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -559,7 +597,7 @@ mod tests {
         // A kept download that was already there reports no progress.
         assert!(last == 1.0 || !remove);
         assert_eq!(models_for(&[], &[path.clone()], "de"), vec![path.clone()]);
-        transcribe_cpp::init_backends_default().unwrap();
+        init_backends().unwrap();
         let (_, model, hint) = load_for(&[path], "de").unwrap();
         let caps = model.capabilities();
         eprintln!(

@@ -131,14 +131,14 @@
 
     @objc private func triggered(_ press: UILongPressGestureRecognizer) {
       guard press.state == .began, Scrawl.isConfigured else { return }
-      UINotificationFeedbackGenerator().notificationOccurred(.success)
-      Scrawl.shared.toggle()
+      Scrawl.shared.triggerRecognized()
     }
   }
 
   /// Sees every touch in the window without taking part: it never recognizes, never cancels or
   /// delays touches, and works alongside every other gesture.
   final class TouchObserver: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    private var fingers = Set<ObjectIdentifier>()
     override init(target: Any?, action: Selector?) {
       super.init(target: target, action: action)
       cancelsTouchesInView = false
@@ -157,11 +157,18 @@
     /// Called once every finger has lifted (or the system took the touches).
     override func reset() {
       super.reset()
+      fingers.removeAll()
       Scrawl.shared.touchesReset()
     }
 
     private func forward(_ touches: Set<UITouch>, _ phase: UITouch.Phase, _: UIEvent) {
       guard let window = view as? UIWindow else { return }
+      if phase == .began {
+        fingers.formUnion(touches.map(ObjectIdentifier.init))
+        if fingers.count == 3, Scrawl.shared.threeFingerTriggers > 0 { Scrawl.shared.prepareToStart() }
+      } else if phase == .ended || phase == .cancelled {
+        fingers.subtract(touches.map(ObjectIdentifier.init))
+      }
       for touch in touches {
         Scrawl.shared.record(touch: touch, in: window, phase: phase)
       }

@@ -128,6 +128,7 @@
 
     @GestureState private var dotPress = DotPress.idle
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.scrawlStartupTrace) private var startupTrace
 
     private enum DotPress {
       case idle, holding, dragging
@@ -163,6 +164,11 @@
       .onChange(of: dotPress) { _, press in
         actions.holdChanged(press == .holding)
         if press == .idle { actions.gripFinished() }
+      }
+      .background {
+        if let startupTrace {
+          StartupDrawProbe(trace: startupTrace, visible: geometry.alpha > 0.05 && !geometry.body.isEmpty)
+        }
       }
     }
 
@@ -764,7 +770,9 @@
       hideBubble(now: fresh)
       if fresh {
         set(.slide, 18)
-        set(.alpha, 0)
+        // The first frame already contains the droplet; hardware startup must never leave
+        // an empty window. Keep the existing stretch/fan transition from this visible seed.
+        set(.alpha, 0.15)
         set(.scale, 0.9)
         set(.top, -21)
         set(.bottom, 21)
@@ -1298,8 +1306,7 @@
   /// app), inside the safe area and above the keyboard. Dragging the dot moves it; a throw lands
   /// on the nearer edge, stretching along the way.
   ///
-  /// `mode` comes straight from `Scrawl`; the first value reaches the strip a run-loop turn after
-  /// the window first draws, so it always animates in.
+  /// `mode` comes straight from `Scrawl`; the first layout already seeds the entrance.
   struct StripPlacement: View {
     let mode: ScrawlStrip.Mode?
     let actions: ScrawlStrip.Actions
@@ -1337,10 +1344,8 @@
         liquid.reduceMotion = reduceMotion
         latest = mode
         liquid.setNotice(notice)
-        DispatchQueue.main.async {
-          isReady = true
-          liquid.apply(latest)
-        }
+        isReady = true
+        liquid.apply(latest)
       }
       .onChange(of: notice) { _, notice in liquid.setNotice(notice) }
       .onChange(of: mode) { _, next in

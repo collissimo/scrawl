@@ -47,16 +47,49 @@ jobs:
       - name: scrawl --help runs headless
         run: '& $env:EXE --help'
 
+      - name: No AVX-512 outside the CPU backends that need it
+        run: scripts\check-windows-cpu-tiers.ps1 target\x86_64-pc-windows-msvc\release
+
       # transcribe.cpp builds against the DLL C runtime, so the Visual C++ runtime DLLs scrawl.exe
-      # imports go beside it in the zip (app-local, as Microsoft allows): a fresh Windows has no
-      # Visual C++ redistributable.
+      # and transcribe.cpp's DLLs import go beside them in the zip (app-local, as Microsoft
+      # allows): a fresh Windows has no Visual C++ redistributable.
+      # A fresh runner has no Scrawl config, so the app opens the welcome window. Scrawl leaves its
+      # own windows out of screen captures unless SCRAWL_SHOW_OWN_WINDOWS is set.
+      - name: The welcome window opens on a fresh profile
+        shell: pwsh
+        env:
+          SCRAWL_SHOW_OWN_WINDOWS: "1"
+        run: |
+          $app = Start-Process -FilePath $env:EXE -ArgumentList "app" -PassThru
+          Start-Sleep -Seconds 12
+          if ($app.HasExited) { throw "Scrawl exited with code $($app.ExitCode)" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          [System.Drawing.Graphics]::FromImage($bitmap).CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bitmap.Save("dist\welcome.png")
+          Stop-Process -Id $app.Id -Force
+          $log = Join-Path $env:LOCALAPPDATA "Scrawl\Logs\scrawl.log"
+          if (Test-Path $log) { Get-Content $log -Tail 40 }
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "onboarding: could not decode state" -Quiet)) {
+            throw "the welcome window rejected the onboarding state"
+          }
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: welcome-window
+          path: dist/welcome.png
+          if-no-files-found: warn
+
       - name: Collect the Visual C++ runtime DLLs
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          $deps = & $dumpbin.FullName /nologo /dependents $env:EXE | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+          $files = @($env:EXE) + (Get-ChildItem target\x86_64-pc-windows-msvc\release\transcribe.dll, target\x86_64-pc-windows-msvc\release\ggml*.dll).FullName
+          $deps = $files | ForEach-Object { & $dumpbin.FullName /nologo /dependents $_ } | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() } | Sort-Object -Unique
           "imports:"; $deps
           $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory | Sort-Object FullName -Descending | Select-Object -First 1
           "runtime from $($crt.FullName)"
@@ -68,8 +101,29 @@ jobs:
           }
           Get-ChildItem runtime | Format-Table Name, Length
 
-      - name: Downloads and loads the speech model
+      - name: Downloads and runs the speech model
+        env:
+          SCRAWL_TEST_MODEL_DIR: ${{ runner.temp }}\speech-model
         run: cargo test ${{ env.BUILD }} win::speech -- --ignored --nocapture
+
+      # The runner has AVX-512; Intel SDE runs the model again as a Lunar Lake CPU (AVX2 and
+      # AVX-VNNI, no AVX-512), the one that crashed in #58. ggml then loads the alderlake backend.
+      - uses: petarpetrovt/setup-sde@v6.0
+      - name: Runs the speech model on a CPU without AVX-512
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          SCRAWL_TEST_MODEL_DIR: ${{ runner.temp }}\speech-model
+          SCRAWL_TEST_NO_AVX512: "1"
+        run: |
+          $test = cargo test ${{ env.BUILD }} --bin scrawl --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq "compiler-artifact" -and $_.target.name -eq "scrawl" -and $_.profile.test } |
+            Select-Object -ExpandProperty executable -First 1
+          "test binary: $test"
+          $sde = Get-ChildItem $env:SDE_PATH -Recurse -Filter sde.exe | Select-Object -First 1
+          & $sde.FullName -lnl -- $test win::speech::tests::downloads_and_runs_parakeet --exact --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "failed under SDE -lnl (exit $LASTEXITCODE)" }
 
       - name: Package
         id: package
@@ -80,12 +134,14 @@ jobs:
           $dir = "dist\Scrawl"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item $env:EXE "$dir\scrawl.exe"
+          Copy-Item target\x86_64-pc-windows-msvc\release\transcribe.dll, target\x86_64-pc-windows-msvc\release\ggml*.dll $dir
           Copy-Item runtime\*.dll $dir
           Copy-Item LICENSE "$dir\LICENSE.txt"
           @"
           Scrawl $version for Windows (preview)
 
-          Run scrawl.exe. Scrawl lives in the notification area; press Alt+Shift+S to record.
+          Run scrawl.exe, keeping the DLLs beside it. Scrawl lives in the notification area;
+          press Alt+Shift+S to record.
 
           This build isn't signed yet, so Windows may say "Windows protected your PC".
           Click More info, then Run anyway.
@@ -122,4 +178,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "Scrawl ${TAG#v}" --notes "Release notes to follow."
-          gh release upload "$TAG" "dist/${{ steps.package.outputs.name }}" --clobber
+          gh release upload "$TAG" "dist/${{ steps.package.outputs.name }}" "dist/${{ steps.package.outputs.name }}.sha256" --clobber

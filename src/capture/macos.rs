@@ -30,7 +30,8 @@ pub const MAX_CAPTURE_SCALE: f64 = 2.0;
 /// Where a session's clicks and keys come from, for the log.
 pub(super) const MOUSE_SOURCE: &str = "the mouse monitor";
 pub(super) const KEY_SOURCE: &str = "the key tap";
-pub(super) const NO_KEY_SOURCE: &str = "nowhere (Accessibility off; the record shortcut still works)";
+pub(super) const NO_KEY_SOURCE: &str =
+    "nowhere (Accessibility off; the record shortcut still works)";
 
 /// `~/Library/Logs/Scrawl`.
 pub fn log_dir() -> Option<PathBuf> {
@@ -44,6 +45,28 @@ pub fn main_display_id() -> u32 {
 /// CGWindowList's windows, front to back, in an autorelease pool.
 pub(super) fn raw_windows_now() -> Vec<crate::windows::RawWindow> {
     objc2::rc::autoreleasepool(|_| crate::windows::raw_windows())
+}
+
+/// Whether `pid` runs this Scrawl's `scrawl-helper` (the iPhone mirror, Settings, onboarding, the
+/// permission panel), going by its executable, so a helper started by another helper counts too.
+pub(super) fn is_helper_process(pid: i32) -> bool {
+    static HELPER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    HELPER
+        .get_or_init(|| {
+            let path = crate::helper::path().ok()?;
+            Some(std::fs::canonicalize(&path).unwrap_or(path))
+        })
+        .as_ref()
+        .is_some_and(|helper| process_path(pid).as_ref() == Some(helper))
+}
+
+fn process_path(pid: i32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len).ok().filter(|&len| len > 0)?;
+    buf.truncate(len);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
 }
 
 type CfTypeRef = *const c_void;
@@ -81,7 +104,6 @@ const K_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
 const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
 const HOTKEY_SIG: u32 = u32::from_be_bytes(*b"SCRW");
 const HOTKEY_ID_TOGGLE: u32 = 1;
-const HOTKEY_ID_ESCAPE: u32 = 2;
 const HOTKEY_ID_ALT1: u32 = 3;
 const HOTKEY_ID_PASTE_BASE: u32 = 100;
 
@@ -369,18 +391,10 @@ unsafe extern "C" fn carbon_hotkey_handler(
     ));
     if status == 0 && sig == HOTKEY_SIG {
         let telemetry = unsafe { &*user_data.cast::<SharedCaptureTelemetry>() };
-        match id {
-            HOTKEY_ID_ESCAPE => {
-                let _ = telemetry
-                    .ui_sender
-                    .try_send(LiveOverlayEvent::CancelCapture);
-            }
-            id if id >= HOTKEY_ID_PASTE_BASE => {
-                telemetry.emit_paste_shortcut();
-            }
-            _ => {
-                telemetry.emit_capture_shortcut();
-            }
+        if id >= HOTKEY_ID_PASTE_BASE {
+            telemetry.emit_paste_shortcut();
+        } else {
+            telemetry.emit_capture_shortcut();
         }
     }
     0
@@ -1339,7 +1353,6 @@ fn sck_lists_windows(ids: &[u32]) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-
 /// Keeps the key event tap in step with Accessibility, which macOS reports live: makes the tap
 /// once it's on (no relaunch), stops it if it's turned off (an active tap whose grant is gone can
 /// hold up input), and re-enables it if macOS turned it off. Returns whether it is delivering.
@@ -1385,9 +1398,9 @@ fn check_key_tap(telemetry: &Arc<SharedCaptureTelemetry>) -> bool {
 /// Starts watching input across every app, with no Input Monitoring:
 /// - clicks, drags and scrolls from an AppKit global mouse monitor, which needs no permission
 ///   (only key events need Accessibility, per `addGlobalMonitorForEvents`' documentation);
-/// - ⇧ (ink), the laser and the switcher's held modifiers from polled modifier flags, which need
+/// - ⇧ (ink), the laser and the shortcut's held modifiers from polled modifier flags, which need
 ///   no permission either (the HID poller);
-/// - key presses (the switcher's S, Esc, ⌘Z, ⌘-chords for the window log) from an active key
+/// - key presses (Esc, ⌘Z, ⌘-chords for the window log) from an active key
 ///   event tap, which Accessibility allows and which is made, without a relaunch, as soon as
 ///   Accessibility is on (`check_key_tap`).
 ///
@@ -1427,7 +1440,8 @@ const MOUSE_MONITOR_MASK: u64 = (1 << EVENT_LEFT_MOUSE_DOWN)
 
 /// `+[NSEvent addGlobalMonitorForEventsMatchingMask:handler:]` for mouse buttons and scrolls.
 /// AppKit sends it events bound for other apps only, so clicks on Scrawl's own windows (the stop
-/// control, the HUD) never arrive. The monitor lives as long as the app.
+/// control, the HUD) never arrive; those on `scrawl-helper`'s windows do, and `mouse_event` drops
+/// them. The monitor lives as long as the app.
 fn install_mouse_monitor(telemetry: Arc<SharedCaptureTelemetry>) -> bool {
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject};
@@ -1438,7 +1452,9 @@ fn install_mouse_monitor(telemetry: Arc<SharedCaptureTelemetry>) -> bool {
         let event: &AnyObject = unsafe { event.as_ref() };
         let cg: *mut OpaqueCgEvent = unsafe { msg_send![event, CGEvent] };
         if !cg.is_null() {
-            mouse_event(&telemetry, cg.cast());
+            mouse_event(&telemetry, cg.cast(), |x, y| {
+                telemetry.on_scrawl_window(x, y)
+            });
         }
     });
     let monitor: Option<objc2::rc::Retained<AnyObject>> = unsafe {
@@ -1447,20 +1463,26 @@ fn install_mouse_monitor(telemetry: Arc<SharedCaptureTelemetry>) -> bool {
     monitor.map(std::mem::forget).is_some()
 }
 
-/// A mouse button or scroll in another app, from the mouse monitor (main thread).
-fn mouse_event(telemetry: &SharedCaptureTelemetry, event: EventRef) {
+/// A mouse button or scroll in another app, from the mouse monitor (main thread). Presses and
+/// scrolls on Scrawl's helper windows (`on_scrawl`: Settings, onboarding) aren't part of what is
+/// being shown.
+fn mouse_event(
+    telemetry: &SharedCaptureTelemetry,
+    event: EventRef,
+    on_scrawl: impl Fn(f64, f64) -> bool,
+) {
     if !telemetry.active.load(Ordering::Acquire) {
         return;
     }
     let event_type = unsafe { CGEventGetType(event) };
     let flags = unsafe { CGEventGetFlags(event) };
-    let pure_shift = (flags & FLAG_SHIFT) != 0
-        && (flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE)) == 0;
+    let pure_shift =
+        (flags & FLAG_SHIFT) != 0 && (flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_ALTERNATE)) == 0;
     let t_ms = telemetry.elapsed_ms();
     let loc = unsafe { CGEventGetLocation(event) };
     match event_type {
         // A ⇧-press is never a click: a ⇧-click drops a pin, a ⇧-drag is ink (the poller's).
-        EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN => {
+        EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN if !on_scrawl(loc.x, loc.y) => {
             if !pure_shift {
                 telemetry.pointer_down(t_ms, loc.x, loc.y);
             } else if event_type == EVENT_LEFT_MOUSE_DOWN {
@@ -1479,7 +1501,7 @@ fn mouse_event(telemetry: &SharedCaptureTelemetry, event: EventRef) {
                 unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_1) } as f32;
             let dx =
                 unsafe { CGEventGetIntegerValueField(event, SCROLL_WHEEL_DELTA_AXIS_2) } as f32;
-            if dx.abs() > 0.0 || dy.abs() > 0.0 {
+            if (dx.abs() > 0.0 || dy.abs() > 0.0) && !on_scrawl(loc.x, loc.y) {
                 let (nx, ny, _, _) = telemetry.normalize_point(loc.x, loc.y);
                 telemetry
                     .events
@@ -1603,7 +1625,7 @@ unsafe extern "C" fn key_tap_callback(
     let shift = (flags & FLAG_SHIFT) != 0;
     let keycode = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) } as u16;
     if telemetry.matches_shortcut(keycode, cmd, ctrl, alt, shift) {
-        // Holding S repeats the key; only a fresh press switches modes.
+        // Holding S repeats the key; only a fresh press counts.
         if unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } == 0 {
             telemetry.emit_capture_shortcut();
         }
@@ -1896,7 +1918,10 @@ mod tests {
         let event = event.expect("an NSEvent");
         let back: *mut OpaqueCgEvent = unsafe { msg_send![&*event, CGEvent] };
         assert!(!back.is_null());
-        assert_eq!(unsafe { CGEventGetType(back.cast()) }, EVENT_LEFT_MOUSE_DOWN);
+        assert_eq!(
+            unsafe { CGEventGetType(back.cast()) },
+            EVENT_LEFT_MOUSE_DOWN
+        );
 
         let (sender, _receiver) = flume::unbounded();
         let telemetry = SharedCaptureTelemetry::new(sender);
@@ -1907,9 +1932,9 @@ mod tests {
             height: 1000.0,
             scale: 2.0,
         });
-        mouse_event(&telemetry, back.cast());
+        mouse_event(&telemetry, back.cast(), |_, _| false);
         let up = unsafe { CGEventCreateMouseEvent(ptr::null(), EVENT_LEFT_MOUSE_UP, point, 0) };
-        mouse_event(&telemetry, up);
+        mouse_event(&telemetry, up, |_, _| false);
         unsafe {
             CFRelease(up.cast());
             CFRelease(cg.cast());
@@ -1919,7 +1944,11 @@ mod tests {
             matches!(events[..], [InteractionEvent::Click { x, y, .. }] if (x - 0.1).abs() < 1e-3 && (y - 0.2).abs() < 1e-3),
             "{events:?}"
         );
-        assert_eq!(MOUSE_MONITOR_MASK & (1 << EVENT_KEY_DOWN), 0, "keys need Accessibility");
+        assert_eq!(
+            MOUSE_MONITOR_MASK & (1 << EVENT_KEY_DOWN),
+            0,
+            "keys need Accessibility"
+        );
     }
 
     /// A left click from the mouse monitor: down at `from` with `flags`, up at `to` with `up_flags`.
@@ -1931,11 +1960,10 @@ mod tests {
             let cg = unsafe { CGEventCreateMouseEvent(ptr::null(), kind, CGPoint { x, y }, 0) };
             assert!(!cg.is_null());
             unsafe { CGEventSetFlags(cg, flags) };
-            mouse_event(t, cg);
+            mouse_event(t, cg, |_, _| false);
             unsafe { CFRelease(cg.cast()) };
         }
     }
-
 
     fn session(width: f64, height: f64) -> Arc<SharedCaptureTelemetry> {
         let (sender, _receiver) = flume::unbounded();
@@ -1988,6 +2016,79 @@ mod tests {
         );
     }
 
+    /// The helper's windows (the SwiftUI capsule's Finish, Settings, onboarding) reach the mouse
+    /// monitor like another app's: 87 captures ended "clicked text “Finish”", with a keyframe and
+    /// a ripple for it. Presses, ⇧-presses and scrolls there are dropped; the app's are kept.
+    #[test]
+    fn presses_and_scrolls_on_scrawl_s_helper_windows_are_not_recorded() {
+        unsafe extern "C" {
+            fn CGEventSetType(event: EventRef, kind: u32);
+            fn CGEventSetLocation(event: EventRef, at: CGPoint);
+            fn CGEventSetIntegerValueField(event: EventRef, field: u32, value: i64);
+        }
+        let telemetry = session(1000.0, 1000.0);
+        // Settings covers the right half.
+        let on_scrawl = |x: f64, _: f64| x >= 500.0;
+        let send = |kind, (x, y), flags| {
+            let cg = unsafe { CGEventCreateMouseEvent(ptr::null(), kind, CGPoint { x, y }, 0) };
+            unsafe { CGEventSetFlags(cg, flags) };
+            mouse_event(&telemetry, cg, on_scrawl);
+            unsafe { CFRelease(cg.cast()) };
+        };
+        let scroll = |(x, y)| {
+            let cg = unsafe { CGEventCreate(ptr::null()) };
+            unsafe {
+                CGEventSetType(cg, EVENT_SCROLL_WHEEL);
+                CGEventSetLocation(cg, CGPoint { x, y });
+                CGEventSetIntegerValueField(cg, SCROLL_WHEEL_DELTA_AXIS_1, -3);
+            }
+            mouse_event(&telemetry, cg, on_scrawl);
+            unsafe { CFRelease(cg.cast()) };
+        };
+        for at in [(700.0, 100.0), (100.0, 100.0)] {
+            send(EVENT_LEFT_MOUSE_DOWN, at, 0);
+            send(EVENT_LEFT_MOUSE_UP, at, 0);
+            send(EVENT_LEFT_MOUSE_DOWN, at, FLAG_SHIFT);
+            send(EVENT_LEFT_MOUSE_UP, at, FLAG_SHIFT);
+            scroll(at);
+        }
+        // A drag from the app that ends over Settings is still the app's.
+        send(EVENT_LEFT_MOUSE_DOWN, (300.0, 500.0), 0);
+        send(EVENT_LEFT_MOUSE_UP, (800.0, 500.0), 0);
+
+        let (events, strokes) = telemetry.finish_session();
+        assert!(
+            matches!(
+                events[..],
+                [
+                    InteractionEvent::Click { x: cx, .. },
+                    InteractionEvent::Scroll { x: sx, .. },
+                    InteractionEvent::Drag { x0, .. },
+                ] if (cx - 0.1).abs() < 1e-3 && (sx - 0.1).abs() < 1e-3 && (x0 - 0.3).abs() < 1e-3
+            ),
+            "{events:?}"
+        );
+        let pins: Vec<_> = strokes.iter().map(|s| s.normalized_points()[0]).collect();
+        assert_eq!(pins, vec![[0.1, 0.1]]);
+    }
+
+    #[test]
+    fn helper_processes_are_known_by_their_executable() {
+        let own = std::process::id() as i32;
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(process_path(own), Some(exe));
+        assert!(!is_helper_process(own));
+        assert!(!is_helper_process(1), "launchd");
+        assert_eq!(process_path(-1), None);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let path = process_path(child.id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(path, Some(PathBuf::from("/bin/sleep")));
+    }
 
     #[test]
     fn the_mouse_monitor_installs_without_a_permission() {

@@ -1,7 +1,8 @@
 //! The ink overlay on Windows: a click-through GPUI window over the display being recorded
 //! that paints what `laser_overlay.metal` paints on macOS, from the same telemetry: the
 //! picker's dim and cutout, the target's inset border, the start glow, Shift ink with its fade,
-//! pins and the Shift tip dot. It is left out of the recording (`WDA_EXCLUDEFROMCAPTURE`).
+//! a ⇧-click pin's brief pulse and the Shift tip dot. It is left out of the recording
+//! (`WDA_EXCLUDEFROMCAPTURE`).
 //!
 //! Also the Win32 window helpers Scrawl's other popups use.
 
@@ -40,7 +41,7 @@ use windows::core::{PCSTR, w};
 use super::Monitor;
 use crate::capture::{SharedCaptureTelemetry, scrawl_log};
 use crate::model::RgbaFrame;
-use crate::sketch::{slice_laser_window, smooth_ink_points, smooth_laser_points};
+use crate::sketch::{pin_pulse, slice_laser_window, smooth_ink_points, smooth_laser_points};
 
 const TAIL_MS: u64 = 420;
 
@@ -752,7 +753,8 @@ struct Scene {
     glow: bool,
     ink: Vec<(Vec<[f32; 2]>, f32)>,
     laser: Vec<Vec<([f32; 2], f32)>>,
-    pins: Vec<[f32; 2]>,
+    /// Pin pulses: centre, ring radius and opacity.
+    pins: Vec<([f32; 2], f32, f32)>,
     tip: Option<[f32; 2]>,
     screen: [f32; 2],
 }
@@ -875,8 +877,10 @@ impl OverlayView {
         if active {
             for (stroke, live) in &strokes {
                 if stroke.pin.is_some() {
-                    if let Some([nx, ny]) = stroke.normalized_points().first().copied() {
-                        pins.push(to_screen(nx, ny));
+                    if let Some([nx, ny]) = stroke.normalized_points().first().copied()
+                        && let Some((radius, alpha)) = pin_pulse(now_ms.saturating_sub(stroke.t1))
+                    {
+                        pins.push((to_screen(nx, ny), radius, alpha));
                     }
                     continue;
                 }
@@ -1110,9 +1114,17 @@ fn paint_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window) {
         window.paint_quad(gpui::fill(bounds, rgba(0.0, 0.0, 0.0, 0.32 * intro_fade)));
     }
 
-    for pin in &scene.pins {
-        paint_dot(window, *pin, 11.5 + 1.4, rgba(1.0, 1.0, 1.0, 0.82), o);
-        paint_dot(window, *pin, 11.5, ink_color(1.0), o);
+    // A pin is a 1.5 pt ring centred on its radius, no fill, as `laser_overlay.metal` draws it.
+    for &(p, radius, alpha) in &scene.pins {
+        let outer = radius + 0.75;
+        window.paint_quad(gpui::quad(
+            rect_bounds([p[0] - outer, p[1] - outer, outer * 2.0, outer * 2.0], o),
+            Corners::all(px(outer)),
+            gpui::transparent_black(),
+            Edges::all(px(1.5)),
+            ink_color(alpha),
+            gpui::BorderStyle::Solid,
+        ));
     }
     for (points, alpha) in &scene.ink {
         paint_polyline(window, points, 4.5, ink_color(*alpha), o);
@@ -1339,7 +1351,10 @@ mod tests {
         let retry = watch.look(&look(2_700, 1_000));
         assert!(retry.redraw && retry.reassert && retry.logs.is_empty());
         let back = watch.look(&look(2_800, 2_790));
-        assert_eq!(back.logs, vec!["ink overlay draws again after 1790 ms".to_owned()]);
+        assert_eq!(
+            back.logs,
+            vec!["ink overlay draws again after 1790 ms".to_owned()]
+        );
         assert!(!back.redraw);
     }
 
@@ -1430,11 +1445,8 @@ mod tests {
         };
         unsafe { RegisterClassW(&wc) };
         let title: Vec<u16> = name.encode_utf16().chain([0]).collect();
-        let ex = WS_EX_TRANSPARENT
-            | WS_EX_LAYERED
-            | WS_EX_TOOLWINDOW
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOPMOST;
+        let ex =
+            WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
         let hwnd = unsafe {
             CreateWindowExW(
                 ex,

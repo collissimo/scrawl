@@ -33,8 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::{
     CARBON_CMD_KEY, CARBON_CONTROL_KEY, CARBON_OPTION_KEY, CARBON_SHIFT_KEY, LiveOverlayEvent,
     Sampler, SharedCaptureTelemetry, ShortcutConfig, ShortcutKind, clean_label, hotkey_combos,
-    layout_default_keycode, pick_display, poll_clicks, scrawl_log, shortcut_label, shortcut_matches,
-    track_shift_ink,
+    layout_default_keycode, pick_display, poll_clicks, scrawl_log, shortcut_label,
+    shortcut_matches, track_shift_ink,
 };
 use crate::model::{CaptureMode, InteractionEvent, TargetFrame, TargetInfo};
 use crate::win;
@@ -391,6 +391,11 @@ pub(super) fn raw_windows_now() -> Vec<crate::windows::RawWindow> {
     crate::windows::raw_windows()
 }
 
+/// Windows has no `scrawl-helper`: every Scrawl window is in its own process.
+pub(super) fn is_helper_process(_pid: i32) -> bool {
+    false
+}
+
 // MARK: Synthetic input
 
 fn keyboard_input(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -633,7 +638,8 @@ pub fn install_global_hotkeys(telemetry: &Arc<SharedCaptureTelemetry>) {
                         while let Ok(request) = request_rx.try_recv() {
                             match request {
                                 HotkeyRequest::Register(record, paste, reply) => {
-                                    let _ = reply.send(register_shortcuts(&mut ids, &record, &paste));
+                                    let _ =
+                                        reply.send(register_shortcuts(&mut ids, &record, &paste));
                                 }
                                 HotkeyRequest::Pause(reply) => {
                                     unregister_all(&mut ids);
@@ -660,9 +666,8 @@ pub fn set_shortcuts(
 ) -> Result<(), ShortcutKind> {
     let (old_record, old_paste) = telemetry.shortcuts();
     if !telemetry.shortcuts_paused.load(Ordering::Acquire)
-        && let Some(Err(kind)) = ask_hotkey_thread(|reply| {
-            HotkeyRequest::Register(record.clone(), paste.clone(), reply)
-        })
+        && let Some(Err(kind)) =
+            ask_hotkey_thread(|reply| HotkeyRequest::Register(record.clone(), paste.clone(), reply))
     {
         let _ = ask_hotkey_thread(|reply| HotkeyRequest::Register(old_record, old_paste, reply));
         return Err(kind);
@@ -811,7 +816,9 @@ fn handle_hook_event(telemetry: &SharedCaptureTelemetry, event: HookEvent) {
             let (record, paste) = telemetry.shortcuts();
             let hit = |kind: ShortcutKind, cfg: &ShortcutConfig| {
                 let layout = layout_default_keycode(kind);
-                shortcut_matches(kind, cfg, layout, vk, mods.win, mods.ctrl, mods.alt, mods.shift)
+                shortcut_matches(
+                    kind, cfg, layout, vk, mods.win, mods.ctrl, mods.alt, mods.shift,
+                )
             };
             if hit(ShortcutKind::Record, &record) {
                 if !repeat {
@@ -925,7 +932,11 @@ fn check_tap(telemetry: &SharedCaptureTelemetry) -> bool {
         scrawl_log(format!(
             "input hooks: keyboard {}, mouse {}",
             if keys { "live" } else { "off (polling keys)" },
-            if mouse { "live" } else { "off (polling the mouse buttons)" },
+            if mouse {
+                "live"
+            } else {
+                "off (polling the mouse buttons)"
+            },
         ));
     }
     keys && mouse
@@ -999,7 +1010,7 @@ fn run_key_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             await_shift_release = true;
         }
 
-        // Esc for the switcher, from key state while the keyboard hook is off.
+        // Esc for the picker, from key state while the keyboard hook is off.
         let escape_now = key_down(VK_ESCAPE.0);
         if escape_now && !prev_escape && !KEYBOARD_HOOK_LIVE.load(Ordering::Acquire) {
             telemetry.escape_pressed.store(true, Ordering::Release);

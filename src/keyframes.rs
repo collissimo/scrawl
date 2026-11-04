@@ -583,6 +583,17 @@ pub fn select_keyframes(
     } else {
         frames.iter().map(|frame| luma_thumbnail(frame)).collect()
     };
+    if crate::handoff::experiment(crate::narration::SENTENCE_NARRATION) {
+        return narrated_keyframes(
+            &frames,
+            &thumbnails,
+            strokes,
+            marks,
+            events,
+            transcript,
+            max_keyframes,
+        );
+    }
     let settled = settled_events(events);
     let actions: Vec<u64> = settled
         .iter()
@@ -865,6 +876,7 @@ pub fn select_keyframes(
                     said: None,
                     mark_id,
                     cursor: candidate.cursor,
+                    narration: None,
                 },
                 frame.clone(),
             )
@@ -872,6 +884,128 @@ pub fn select_keyframes(
         .collect();
     align_transcript(&mut out, &moments, transcript);
     out
+}
+
+/// `select_keyframes` under `sentenceNarration` (`crate::narration`): whole sentences own the
+/// keyframes, each taken where its last mark ended or its strongest action settled. A screen
+/// change is the fourth-worst-block difference of `scene_transition_diff` reaching `CUE_NOVELTY`
+/// between candidate frames; clicks it doesn't follow read as pointing.
+fn narrated_keyframes(
+    frames: &[&RgbaFrame],
+    thumbnails: &[[f32; THUMB_PIXELS]],
+    strokes: &[Stroke],
+    marks: &mut [Mark],
+    events: &[InteractionEvent],
+    transcript: &TranscriptData,
+    max_keyframes: usize,
+) -> Vec<(Keyframe, RgbaFrame)> {
+    use crate::narration::{Detail, Kind};
+    let duration_ms = frames.last().map_or(0, |frame| frame.t_ms);
+    let scene_changes: Vec<u64> = thumbnails
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| scene_transition_diff(&pair[0], &pair[1]) >= CUE_NOVELTY)
+        .map(|(i, _)| frames[i + 1].t_ms)
+        .collect();
+    let acts: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            InteractionEvent::Click { t, .. } | InteractionEvent::Drag { t, .. } => Some(*t),
+            _ => None,
+        })
+        .collect();
+    let groups = group_marks(frames, marks, &acts, max_keyframes);
+    let lines = crate::narration::build(
+        transcript,
+        events,
+        marks,
+        strokes,
+        duration_ms,
+        Some(&scene_changes),
+        &groups,
+        max_keyframes,
+    );
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let index = i + 1;
+            let file = format!("frames/frame-{index:02}.png");
+            let mut on_frame: Vec<usize> = line
+                .actions
+                .iter()
+                .filter_map(|a| match a.detail {
+                    Detail::Mark { mark, .. } => Some(mark),
+                    _ => None,
+                })
+                .collect();
+            on_frame.sort_by_key(|&m| (marks[m].t0, m));
+            for &m in &on_frame {
+                marks[m].frame = Some(file.clone());
+            }
+            let drawn = line.drawn(marks);
+            let mark_id = drawn
+                .first()
+                .or(on_frame.first())
+                .map(|&m| marks[m].id.clone());
+            let strongest = line
+                .actions
+                .iter()
+                .map(|a| a.kind)
+                .max_by_key(|kind| match kind {
+                    Kind::Mark => 6,
+                    Kind::Clicks => 5,
+                    Kind::Point => 4,
+                    Kind::Drag => 3,
+                    Kind::Scene => 2,
+                    Kind::Scroll => 1,
+                    Kind::Note => 0,
+                });
+            let reason = match strongest {
+                Some(Kind::Mark) => KeyframeReason::Mark,
+                Some(Kind::Clicks | Kind::Drag) => KeyframeReason::Click,
+                Some(Kind::Point) => KeyframeReason::Laser,
+                Some(Kind::Scene | Kind::Scroll) => KeyframeReason::SceneChange,
+                Some(Kind::Note) => KeyframeReason::Speech,
+                None if line.text.is_empty() => KeyframeReason::Initial,
+                None => KeyframeReason::Speech,
+            };
+            let cursor = line.actions.iter().rev().find_map(|a| match &a.detail {
+                Detail::Clicks { points, .. } => points.last().copied(),
+                _ => None,
+            });
+            let narrated = line.narrated(marks);
+            let event = if narrated.actions.is_empty() {
+                match reason {
+                    KeyframeReason::Mark => drawn
+                        .iter()
+                        .chain(&on_frame)
+                        .next()
+                        .map(|&m| describe_mark(&marks[m]))
+                        .unwrap_or_default(),
+                    KeyframeReason::Initial => "initial view".into(),
+                    _ => "said".into(),
+                }
+            } else {
+                narrated.actions.clone()
+            };
+            let frame = frames[nearest_frame(frames, line.frame_t)];
+            (
+                Keyframe {
+                    index,
+                    t: frame.t_ms,
+                    reason,
+                    file,
+                    event,
+                    said: (!line.text.is_empty()).then_some(line.text),
+                    mark_id,
+                    cursor,
+                    narration: Some(narrated),
+                },
+                frame.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Splits stretches a keyframe owns that hold more than `COVERAGE_WORDS` or `COVERAGE_MS`, with a
@@ -1049,6 +1183,74 @@ mod tests {
             role: None,
             button: None,
         }
+    }
+
+    /// `select_keyframes` under `sentenceNarration`, without turning the experiment on for every
+    /// test in the process.
+    fn narrated(
+        frames: &[RgbaFrame],
+        marks: &mut [Mark],
+        events: &[InteractionEvent],
+        transcript: &TranscriptData,
+    ) -> Vec<Keyframe> {
+        let frames: Vec<&RgbaFrame> = frames.iter().collect();
+        let thumbnails: Vec<_> = frames.iter().map(|f| luma_thumbnail(f)).collect();
+        narrated_keyframes(
+            &frames,
+            &thumbnails,
+            &[],
+            marks,
+            events,
+            transcript,
+            MAX_KEYFRAMES,
+        )
+        .into_iter()
+        .map(|(keyframe, _)| keyframe)
+        .collect()
+    }
+
+    #[test]
+    fn narrated_keyframes_keep_sentences_whole_and_tell_clicks_from_pointing() {
+        // The screen answers only the second click (at 4 s it turns white).
+        let frames: Vec<RgbaFrame> = (0..=16)
+            .map(|i| frame(i * 500, if i * 500 >= 4_500 { 255 } else { 0 }))
+            .collect();
+        let words: Vec<WordTiming> = "Bitte diese Box hier entfernen und dann hier speichern."
+            .split(' ')
+            .enumerate()
+            .map(|(i, w)| WordTiming {
+                t0: i as u64 * 400,
+                t1: (i as u64 + 1) * 400,
+                text: w.into(),
+            })
+            .collect();
+        let transcript = TranscriptData {
+            source: "test".into(),
+            text: words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            words,
+            ..Default::default()
+        };
+        let mut marks = vec![mark("m1", 1_000)];
+        let keyframes = narrated(
+            &frames,
+            &mut marks,
+            &[click(1_500), click(4_000)],
+            &transcript,
+        );
+        assert_eq!(keyframes.len(), 1);
+        let keyframe = &keyframes[0];
+        assert_eq!(keyframe.said.as_deref(), Some(transcript.text.as_str()));
+        assert_eq!(keyframe.reason, KeyframeReason::Mark);
+        assert_eq!(keyframe.mark_id.as_deref(), Some("m1"));
+        assert_eq!(marks[0].frame.as_deref(), Some("frames/frame-01.png"));
+        assert_eq!(
+            keyframe.narration.as_ref().unwrap().actions,
+            "tapped, clicked, pointed"
+        );
     }
 
     #[test]

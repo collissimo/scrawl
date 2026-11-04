@@ -2,11 +2,12 @@
 //!
 //! A bundle's prompt (`summary.md`, `scrawl.json`, `contact-sheet.png`, `frames/`) is small; its
 //! video, audio and full-size frames are nearly all of its size. After `mediaDays` the heavy
-//! media goes to the Trash and the prompt stays; after `bundleDays` the whole bundle goes. Both
-//! live under `"retention"` in `~/.config/scrawl/config.json` (`null` keeps forever). A bundle
+//! media (and the `zoom/` sheets made from it) goes to the Trash and the prompt stays; after
+//! `bundleDays` the whole bundle goes. Both live under `"retention"` in `~/.config/scrawl/config.json` (`null` keeps forever). A bundle
 //! younger than a day or changed within the last day, one whose media is still copying
-//! (`.media-pending`, `.media-sending`), one Scrawl is working on, a pinned one (`.pinned`), and
-//! one still waiting to reach OpenCode (`.deliver.json`) are never touched.
+//! (`.media-pending`, `.media-sending`), one Scrawl is working on, a pinned one (`.pinned`), one
+//! still waiting to reach OpenCode (`.deliver.json`), and one `scrawl recover` hasn't built yet
+//! are never touched.
 //!
 //! Cabled-iPhone videos are also re-encoded to HEVC at the size keyframes use (`shrink`), which
 //! makes them about ten times smaller.
@@ -48,9 +49,15 @@ const SHRINK_EDGE: u32 = crate::phone::PHONE_FRAME_EDGE;
 const SHRINK_ABOVE_BPS: u64 = 6_000_000;
 /// How long after a capture its video is shrunk, so pasting and sending go first.
 const SHRINK_DELAY: Duration = Duration::from_secs(60);
-/// A daily pass shrinks bundles left alone this long (a capture whose shrink was missed, or one
-/// copied from another Mac), and deletes their marked videos.
+/// The daily shrink sweep picks up bundles left alone this long (a capture whose shrink was
+/// missed, or one copied from another Mac), and deletes their marked videos.
 const SHRINK_SETTLE_MS: u64 = 10 * 60 * 1000;
+/// How often cleanup runs. Hourly, so media goes within an hour of `mediaDays`, not a day late.
+const PASS_EVERY: Duration = Duration::from_secs(3600);
+/// How often a pass also re-encodes missed iPhone videos (each try can take a while).
+const SHRINK_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// Made from the heavy media (`scrawl zoom` sheets and frame ranges), so it goes with it.
+const DERIVED_MEDIA: [&str; 1] = ["zoom"];
 /// How long after a capture its video is deleted (`keepVideo` off), so pasting, sending and a
 /// first look go first.
 const DROP_VIDEO_DELAY: Duration = Duration::from_secs(60);
@@ -308,6 +315,7 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
         if dir.join(PINNED).exists()
             || dir.join(crate::delivery::PENDING).exists()
             || is_claimed(&dir)
+            || crate::recover::owed(&dir)
             || live_marker(&dir, crate::handoff::MEDIA_PENDING, now)
             || live_marker(&dir, MEDIA_SENDING, now)
         {
@@ -350,6 +358,7 @@ pub fn plan(captures: &Path, policy: &Policy, now: SystemTime) -> Vec<Action> {
         if due(policy.media_days) {
             let items: Vec<PathBuf> = crate::handoff::HEAVY_MEDIA
                 .iter()
+                .chain(&DERIVED_MEDIA)
                 .map(|rel| dir.join(rel))
                 .filter(|p| p.exists())
                 .collect();
@@ -742,14 +751,19 @@ fn sweep_leftovers(captures: &Path, now: SystemTime) {
 }
 
 /// One cleanup pass over `captures`, planned as if `ahead` from now (for trying it out).
+/// Without `shrink` it only trashes, so a video that doesn't get smaller isn't re-encoded hourly.
 pub fn run_pass(
     captures: &Path,
     policy: &Policy,
     dry_run: bool,
     ahead: Duration,
+    shrink: bool,
 ) -> (Vec<Action>, Report) {
     let now = SystemTime::now();
-    let actions = plan(captures, policy, now + ahead);
+    let mut actions = plan(captures, policy, now + ahead);
+    if !shrink {
+        actions.retain(|a| !matches!(a, Action::Shrink { .. }));
+    }
     if dry_run {
         return (actions, Report::default());
     }
@@ -819,7 +833,7 @@ fn lower_priority() {
     crate::win::shell::background_thread();
 }
 
-/// Starts the app's cleanup: a pass shortly after launch, then daily, plus shrinking each
+/// Starts the app's cleanup: a pass shortly after launch, then hourly, plus shrinking each
 /// iPhone capture a minute after it's made.
 pub fn start() {
     if WORKER.get().is_some() {
@@ -871,6 +885,7 @@ fn worker(jobs: &flume::Receiver<Job>) {
     let captures = crate::handoff::default_captures_dir();
     let mut next_pass = Instant::now() + Duration::from_secs(90);
     let mut last_pass: Option<SystemTime> = None;
+    let mut last_shrink: Option<SystemTime> = None;
     // Shrinks and video deletions waiting: when, when to give up, the bundle, and whether it's
     // a deletion.
     let mut shrinks: Vec<(Instant, Instant, PathBuf, bool)> = Vec::new();
@@ -912,7 +927,7 @@ fn worker(jobs: &flume::Receiver<Job>) {
             };
             match done {
                 // Busy: a capture is running, the media is still copying or waiting to be
-                // delivered. Try again soon; a daily pass catches anything that gives up.
+                // delivered. Try again soon; a later pass catches anything that gives up.
                 Err(()) if now < give_up => {
                     later.push((now + Duration::from_secs(30), give_up, dir, delete))
                 }
@@ -920,29 +935,37 @@ fn worker(jobs: &flume::Receiver<Job>) {
             }
         }
         shrinks = later;
-        // The Mac sleeps through `Instant`s, so the daily pass also goes by the wall clock.
-        let day_passed = last_pass.is_none_or(|at| {
-            SystemTime::now().duration_since(at).unwrap_or_default()
-                >= Duration::from_secs(24 * 3600)
+        // The Mac sleeps through `Instant`s, so passes also go by the wall clock.
+        let pass_due = last_pass.is_none_or(|at| {
+            SystemTime::now().duration_since(at).unwrap_or_default() >= PASS_EVERY
         });
-        if Instant::now() >= next_pass || (last_pass.is_some() && day_passed) {
+        if Instant::now() >= next_pass || (last_pass.is_some() && pass_due) {
             if recording() {
                 next_pass = Instant::now() + Duration::from_secs(60);
                 continue;
             }
             let policy = Policy::load();
-            let (actions, report) = run_pass(&captures, &policy, false, Duration::ZERO);
-            scrawl_log(format!(
-                "retention: pass over {} ({} action(s), policy {:?}/{:?} days), {} now",
-                captures.display(),
-                actions.len(),
-                policy.media_days,
-                policy.bundle_days,
-                format_bytes(captures_size(&captures)),
-            ));
+            let shrink = last_shrink.is_none_or(|at| {
+                SystemTime::now().duration_since(at).unwrap_or_default() >= SHRINK_EVERY
+            });
+            let (actions, report) = run_pass(&captures, &policy, false, Duration::ZERO, shrink);
+            if shrink {
+                last_shrink = Some(SystemTime::now());
+            }
+            // Hourly passes that find nothing stay out of the log after the first.
+            if last_pass.is_none() || !actions.is_empty() {
+                scrawl_log(format!(
+                    "retention: pass over {} ({} action(s), policy {:?}/{:?} days), {} now",
+                    captures.display(),
+                    actions.len(),
+                    policy.media_days,
+                    policy.bundle_days,
+                    format_bytes(captures_size(&captures)),
+                ));
+            }
             let _ = report;
             last_pass = Some(SystemTime::now());
-            next_pass = Instant::now() + Duration::from_secs(24 * 3600);
+            next_pass = Instant::now() + PASS_EVERY;
         }
     }
 }
@@ -1101,6 +1124,7 @@ mod tests {
         bundle(&tmp.0, "scrawl-week", 3.0, false);
         let old = bundle(&tmp.0, "scrawl-old", 8.0, false);
         std::fs::create_dir_all(old.join("frames-full")).unwrap();
+        std::fs::create_dir_all(old.join("zoom")).unwrap();
         let ancient = bundle(&tmp.0, "scrawl-ancient", 31.0, false);
         assert_eq!(
             planned(&tmp.0, &Policy::default()),
@@ -1111,7 +1135,8 @@ mod tests {
                     items: vec![
                         old.join("recording.mp4"),
                         old.join("audio.wav"),
-                        old.join("frames-full")
+                        old.join("frames-full"),
+                        old.join("zoom")
                     ],
                 },
             ]
@@ -1283,11 +1308,22 @@ mod tests {
     fn keep_video_is_its_own_switch_beside_the_presets() {
         let tmp = TempDir::new("keep-video");
         let path = tmp.0.join("config.json");
-        assert!(Policy::load_from(&path).keep_video, "kept unless switched off");
-        std::fs::write(&path, r#"{"ingestToken":"abc","retention":{"keepVideo":false}}"#).unwrap();
+        assert!(
+            Policy::load_from(&path).keep_video,
+            "kept unless switched off"
+        );
+        std::fs::write(
+            &path,
+            r#"{"ingestToken":"abc","retention":{"keepVideo":false}}"#,
+        )
+        .unwrap();
         let loaded = Policy::load_from(&path);
         assert_eq!(loaded, without_video());
-        assert_eq!(loaded.preset(), Some(Preset::Week), "the days still read as Week");
+        assert_eq!(
+            loaded.preset(),
+            Some(Preset::Week),
+            "the days still read as Week"
+        );
         let month = loaded.with_preset(Preset::Month);
         assert_eq!(
             (month.media_days, month.bundle_days, month.keep_video),
@@ -1309,7 +1345,10 @@ mod tests {
         let tmp = TempDir::new("drop");
         let fresh = bundle(&tmp.0, "scrawl-fresh", 0.5, false);
         let unmarked = bundle(&tmp.0, "scrawl-unmarked", 0.5, false);
-        assert!(!mark_for_deletion(&fresh, &Policy::default()), "videos are kept");
+        assert!(
+            !mark_for_deletion(&fresh, &Policy::default()),
+            "videos are kept"
+        );
         assert!(!fresh.join(DROP_VIDEO).exists());
         assert!(mark_for_deletion(&fresh, &without_video()));
         // Only captures finished with the switch off; older videos follow the days.
@@ -1337,7 +1376,10 @@ mod tests {
         assert!(!tmp.0.join(".trash-staging").exists(), "not via the Trash");
         let reason = missing_media_reason(&fresh).unwrap();
         assert!(reason.contains("deleted after the capture"), "{reason}");
-        assert!(planned(&tmp.0, &without_video()).is_empty(), "nothing left to do");
+        assert!(
+            planned(&tmp.0, &without_video()).is_empty(),
+            "nothing left to do"
+        );
     }
 
     #[test]
@@ -1358,10 +1400,22 @@ mod tests {
         assert_eq!(delete_video_now(&undelivered, &off), Err(()));
         assert_eq!(delete_video_now(&sending, &off), Err(()));
         assert_eq!(delete_video_now(&busy, &off), Err(()));
-        assert_eq!(delete_video_now(&pinned, &off), Ok(()), "pinned: nothing to retry");
+        assert_eq!(
+            delete_video_now(&pinned, &off),
+            Ok(()),
+            "pinned: nothing to retry"
+        );
         for dir in [&undelivered, &sending, &busy, &pinned] {
-            assert!(dir.join("recording.mp4").is_file(), "{} kept", dir.display());
-            assert!(dir.join(DROP_VIDEO).exists(), "{} still marked", dir.display());
+            assert!(
+                dir.join("recording.mp4").is_file(),
+                "{} kept",
+                dir.display()
+            );
+            assert!(
+                dir.join(DROP_VIDEO).exists(),
+                "{} still marked",
+                dir.display()
+            );
         }
         // Only the copy's marker has gone stale by the time of the pass.
         assert_eq!(

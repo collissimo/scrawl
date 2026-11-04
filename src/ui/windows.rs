@@ -116,7 +116,8 @@ pub(super) fn window_origin(display: Option<&dyn gpui::PlatformDisplay>) -> Poin
 /// and the window would keep its old layout size and scale.
 pub(super) fn move_picker_window(frame: [f64; 4], cx: &mut App) {
     if let Some(id) = own_window(&PICKER_HWND) {
-        cx.spawn(async move |_| win::overlay::place(id, frame)).detach();
+        cx.spawn(async move |_| win::overlay::place(id, frame))
+            .detach();
     }
 }
 
@@ -142,6 +143,13 @@ pub(super) fn window_drag_region(region: Div) -> Div {
     region
         .occlude()
         .window_control_area(WindowControlArea::Drag)
+}
+
+/// A control inside a `window_drag_region`. Windows hit-tests a press before it is delivered:
+/// over a control that doesn't occlude, the region answers `HTCAPTION`, and the caption's move
+/// loop swallows the mouse-up, so the click never fires.
+pub(super) fn drag_region_control<E: InteractiveElement>(control: E) -> E {
+    control.occlude()
 }
 
 /// Minimize, maximize and close, drawn with Segoe Fluent Icons like every Windows 11 app.
@@ -380,9 +388,13 @@ fn pill_rect_at(point: [f64; 2]) -> Option<[f64; 4]> {
 
 /// Where the pill window opens on `display` (GPUI's global DIPs): below the work area's top.
 pub(super) fn hud_pill_origin(display: gpui::Bounds<Pixels>) -> Point<Pixels> {
-    let origin = [f64::from(f32::from(display.origin.x)), f64::from(f32::from(display.origin.y))];
+    let origin = [
+        f64::from(f32::from(display.origin.x)),
+        f64::from(f32::from(display.origin.y)),
+    ];
     let screen = crate::screens::displays().into_iter().find(|s| {
-        (origin[0] * s.scale - s.frame[0]).abs() < 2.0 && (origin[1] * s.scale - s.frame[1]).abs() < 2.0
+        (origin[0] * s.scale - s.frame[0]).abs() < 2.0
+            && (origin[1] * s.scale - s.frame[1]).abs() < 2.0
     });
     match screen {
         Some(s) => {
@@ -444,7 +456,8 @@ impl PillChrome {
                 f64::from(f32::from(centre.y)) * scale,
             ];
             if let Some(rect) = pill_rect_at(at) {
-                cx.spawn(async move |_| win::overlay::place(id, rect)).detach();
+                cx.spawn(async move |_| win::overlay::place(id, rect))
+                    .detach();
             }
         }
         Self { hwnd }
@@ -679,13 +692,8 @@ pub(super) fn install_status_bar() -> Option<flume::Receiver<MenuAction>> {
     let languages: Vec<(&'static str, CheckMenuItem)> = crate::win::languages::OFFERED
         .iter()
         .map(|&(code, name)| {
-            let item = CheckMenuItem::with_id(
-                format!("{LANGUAGE_PREFIX}{code}"),
-                name,
-                true,
-                false,
-                None,
-            );
+            let item =
+                CheckMenuItem::with_id(format!("{LANGUAGE_PREFIX}{code}"), name, true, false, None);
             let _ = language.append(&item);
             (code, item)
         })

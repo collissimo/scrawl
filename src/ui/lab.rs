@@ -32,8 +32,8 @@ pub enum Scene {
     TapThenWindow,
     /// Tap: recording + chips, then the Screen chip folds them back.
     TapThenScreen,
-    /// Held switcher on Screen, S steps through Window and iPhone, release records.
-    HoldSwitcher,
+    /// The menu's picker opens on Screen, a click on Area, then Screen, then Screen again records.
+    Picker,
     /// Tap, chips fold, finish: processing, then done, then dismissed.
     Finish,
     /// Tap: recording + chips, then cancel straight from the recording.
@@ -46,9 +46,8 @@ pub enum Scene {
 enum Step {
     Tap,
     Chip(SelectionMode),
-    HoldOpen,
-    HoldShow(SelectionMode),
-    HoldRelease,
+    Open,
+    Click(SelectionMode),
     Cancel,
     Finish,
     Dismiss,
@@ -60,7 +59,7 @@ impl Scene {
             Self::TapThenArea => "tap-then-area",
             Self::TapThenWindow => "tap-then-window",
             Self::TapThenScreen => "tap-then-screen",
-            Self::HoldSwitcher => "hold-switcher",
+            Self::Picker => "picker",
             Self::Finish => "finish",
             Self::Cancel => "cancel",
             Self::Dismiss => "dismiss",
@@ -69,7 +68,7 @@ impl Scene {
 
     /// Steps at animation seconds from the scene's start.
     fn steps(self) -> Vec<(f32, Step)> {
-        use SelectionMode::{Area, Iphone, Screen, Window};
+        use SelectionMode::{Area, Screen, Window};
         match self {
             Self::TapThenArea => vec![
                 (0.0, Step::Tap),
@@ -90,13 +89,12 @@ impl Scene {
                     (2.4, Step::Cancel),
                 ]
             }
-            Self::HoldSwitcher => vec![
-                (0.0, Step::HoldOpen),
-                (0.6, Step::HoldShow(Window)),
-                (1.2, Step::HoldShow(Iphone)),
-                (1.8, Step::HoldShow(Screen)),
-                (2.4, Step::HoldRelease),
-                (3.6, Step::Cancel),
+            Self::Picker => vec![
+                (0.0, Step::Open),
+                (0.9, Step::Click(Area)),
+                (1.8, Step::Click(Screen)),
+                (2.7, Step::Click(Screen)),
+                (3.9, Step::Cancel),
             ],
             Self::Finish => vec![
                 (0.0, Step::Tap),
@@ -105,7 +103,7 @@ impl Scene {
                 (2.0 + PROCESSING_S + 1.4, Step::Dismiss),
             ],
             Self::Cancel => vec![(0.0, Step::Tap), (1.2, Step::Cancel)],
-            Self::Dismiss => vec![(0.0, Step::HoldOpen), (1.2, Step::Dismiss)],
+            Self::Dismiss => vec![(0.0, Step::Open), (1.2, Step::Dismiss)],
         }
     }
 }
@@ -142,12 +140,8 @@ fn apply(step: Step, coord: &mut ScrawlCoordinator, cx: &mut gpui::Context<Scraw
     match step {
         Step::Tap => coord.record_screen_now(cx),
         Step::Chip(mode) => coord.switch_recording(mode, cx),
-        Step::HoldOpen => coord.open_picker(Some(SelectionMode::Screen), true, cx),
-        Step::HoldShow(mode) => coord.show_switcher_mode(mode, cx),
-        Step::HoldRelease => {
-            let mode = coord.selection_mode().unwrap_or(SelectionMode::Screen);
-            coord.commit_switcher(mode, cx);
-        }
+        Step::Open => coord.open_picker(Some(SelectionMode::Screen), cx),
+        Step::Click(mode) => coord.click_selection_mode(mode, cx),
         Step::Cancel => coord.cancel_recording(cx),
         Step::Finish => coord.finish_recording(cx),
         Step::Dismiss => coord.dismiss_island(cx),
@@ -258,12 +252,48 @@ impl Render for Backdrop {
                         .items_center()
                         .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(88.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x1e293b)))
-                        .child(div().w(px(64.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x2563eb)))
-                        .child(div().w(px(108.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x94a3b8)))
-                        .child(div().w(px(74.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x10b981)))
-                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
-                        .child(div().w(px(96.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x475569))),
+                        .child(
+                            div()
+                                .w(px(88.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x1e293b)),
+                        )
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x2563eb)),
+                        )
+                        .child(
+                            div()
+                                .w(px(108.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x94a3b8)),
+                        )
+                        .child(
+                            div()
+                                .w(px(74.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x10b981)),
+                        )
+                        .child(
+                            div()
+                                .w(px(84.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xf43f5e)),
+                        )
+                        .child(
+                            div()
+                                .w(px(96.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x475569)),
+                        ),
                 )
                 .child(
                     div()
@@ -271,11 +301,41 @@ impl Render for Backdrop {
                         .items_center()
                         .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(104.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x64748b)))
-                        .child(div().w(px(78.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf59e0b)))
-                        .child(div().w(px(124.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x0f172a)))
-                        .child(div().w(px(68.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x8b5cf6)))
-                        .child(div().w(px(116.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x3b82f6))),
+                        .child(
+                            div()
+                                .w(px(104.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x64748b)),
+                        )
+                        .child(
+                            div()
+                                .w(px(78.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xf59e0b)),
+                        )
+                        .child(
+                            div()
+                                .w(px(124.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x0f172a)),
+                        )
+                        .child(
+                            div()
+                                .w(px(68.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x8b5cf6)),
+                        )
+                        .child(
+                            div()
+                                .w(px(116.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x3b82f6)),
+                        ),
                 ),
             "dark" | "busy-dark" => div()
                 .size_full()
@@ -291,12 +351,48 @@ impl Render for Backdrop {
                         .items_center()
                         .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(84.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xf43f5e)))
-                        .child(div().w(px(104.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x38bdf8)))
-                        .child(div().w(px(72.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xfbbf24)))
-                        .child(div().w(px(112.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xe2e8f0)))
-                        .child(div().w(px(82.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0xa855f7)))
-                        .child(div().w(px(76.0)).h(px(12.0)).rounded(px(4.0)).bg(rgb(0x34d399))),
+                        .child(
+                            div()
+                                .w(px(84.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xf43f5e)),
+                        )
+                        .child(
+                            div()
+                                .w(px(104.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x38bdf8)),
+                        )
+                        .child(
+                            div()
+                                .w(px(72.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xfbbf24)),
+                        )
+                        .child(
+                            div()
+                                .w(px(112.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xe2e8f0)),
+                        )
+                        .child(
+                            div()
+                                .w(px(82.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xa855f7)),
+                        )
+                        .child(
+                            div()
+                                .w(px(76.0))
+                                .h(px(12.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x34d399)),
+                        ),
                 )
                 .child(
                     div()
@@ -304,11 +400,41 @@ impl Render for Backdrop {
                         .items_center()
                         .justify_center()
                         .gap(px(10.0))
-                        .child(div().w(px(96.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x34d399)))
-                        .child(div().w(px(84.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf97316)))
-                        .child(div().w(px(128.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0x60a5fa)))
-                        .child(div().w(px(72.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xf472b6)))
-                        .child(div().w(px(108.0)).h(px(11.0)).rounded(px(4.0)).bg(rgb(0xcbd5e1))),
+                        .child(
+                            div()
+                                .w(px(96.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x34d399)),
+                        )
+                        .child(
+                            div()
+                                .w(px(84.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xf97316)),
+                        )
+                        .child(
+                            div()
+                                .w(px(128.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0x60a5fa)),
+                        )
+                        .child(
+                            div()
+                                .w(px(72.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xf472b6)),
+                        )
+                        .child(
+                            div()
+                                .w(px(108.0))
+                                .h(px(11.0))
+                                .rounded(px(4.0))
+                                .bg(rgb(0xcbd5e1)),
+                        ),
                 ),
             _ => div().size_full().bg(rgb(0xd9d9de)),
         }

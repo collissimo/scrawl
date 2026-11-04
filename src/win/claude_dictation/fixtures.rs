@@ -25,7 +25,13 @@ pub fn with_error(template: &[u8], message: &str) -> Vec<u8> {
         .expect("a cursor move before the message");
     let row = std::str::from_utf8(&template[moved + CSI.len()..at])
         .ok()
-        .and_then(|cup| cup.strip_suffix('H')?.split(';').next()?.parse::<u16>().ok())
+        .and_then(|cup| {
+            cup.strip_suffix('H')?
+                .split(';')
+                .next()?
+                .parse::<u16>()
+                .ok()
+        })
         .expect("the move is CSI row;col H");
     let column = super::screen::COLS as usize - message.chars().count();
     let mut bytes = template[..moved].to_vec();
@@ -42,8 +48,8 @@ pub fn with_error(template: &[u8], message: &str) -> Vec<u8> {
 fn cut_fixtures() {
     use super::screen::{COLS, ROWS, State, Trust, rows};
     let trace = std::fs::read(std::env::var("SCRAWL_CLAUDE_TRACE_IN").unwrap()).unwrap();
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/win/claude_dictation/fixtures");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/win/claude_dictation/fixtures");
     std::fs::create_dir_all(&dir).unwrap();
     let mut parser = vt100::Parser::new(ROWS, COLS, 0);
     let mut seen = std::collections::BTreeSet::new();
@@ -85,4 +91,3 @@ pub fn with_prompt(template: &[u8], text: &str) -> Vec<u8> {
     bytes.extend_from_slice(format!("\x1b[10;3H\x1b[K{text}\x1b[12;100H\x1b[K").as_bytes());
     bytes
 }
-

@@ -96,7 +96,11 @@ mod tests {
         assert!(t.estimated);
         assert_eq!(t.model.as_deref(), Some("Claude Code dictation (de)"));
         assert_eq!(t.text, "eins zwei drei vier");
-        let times: Vec<_> = t.words.iter().map(|w| (w.text.as_str(), w.t0, w.t1)).collect();
+        let times: Vec<_> = t
+            .words
+            .iter()
+            .map(|w| (w.text.as_str(), w.t0, w.t1))
+            .collect();
         assert_eq!(times[0], ("eins", 1_000, 2_000));
         assert_eq!(times[1].0, "zwei");
         assert_eq!(times[1].2, 3_000);

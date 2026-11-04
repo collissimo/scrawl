@@ -311,10 +311,22 @@ mod tests {
 
     #[test]
     fn packed_frames_keep_the_decoders_macroblock_padding() {
-        assert_eq!(crate::win::media::packed_pitch(1000 * 562 * 4, 1000, 562), 4000);
-        assert_eq!(crate::win::media::packed_pitch(1008 * 576 * 4, 1000, 562), 4032);
-        assert_eq!(crate::win::media::packed_pitch(1920 * 1088 * 4, 1920, 1080), 7680);
-        assert_eq!(crate::win::media::packed_pitch(1920 * 1072 * 4, 1920, 1072), 7680);
+        assert_eq!(
+            crate::win::media::packed_pitch(1000 * 562 * 4, 1000, 562),
+            4000
+        );
+        assert_eq!(
+            crate::win::media::packed_pitch(1008 * 576 * 4, 1000, 562),
+            4032
+        );
+        assert_eq!(
+            crate::win::media::packed_pitch(1920 * 1088 * 4, 1920, 1080),
+            7680
+        );
+        assert_eq!(
+            crate::win::media::packed_pitch(1920 * 1072 * 4, 1920, 1072),
+            7680
+        );
     }
 
     #[test]
@@ -373,9 +385,12 @@ mod tests {
     #[test]
     #[ignore = "encodes and decodes through Media Foundation"]
     fn an_export_survives_the_hardware_encoder_failing_mid_movie() {
-        let source = std::env::var_os("SCRAWL_EXPORT_BUNDLE")
-            .map_or_else(|| std::path::PathBuf::from(r"C:\t\rec036.scrawl"), Into::into);
-        let dir = std::env::temp_dir().join(format!("scrawl-export-retry-{}.scrawl", std::process::id()));
+        let source = std::env::var_os("SCRAWL_EXPORT_BUNDLE").map_or_else(
+            || std::path::PathBuf::from(r"C:\t\rec036.scrawl"),
+            Into::into,
+        );
+        let dir =
+            std::env::temp_dir().join(format!("scrawl-export-retry-{}.scrawl", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for entry in std::fs::read_dir(&source).unwrap() {
@@ -397,7 +412,10 @@ mod tests {
         let exported = exported.unwrap();
         eprintln!("{}", crate::export::describe(&exported));
         let probe = crate::win::media::probe(&out).unwrap();
-        assert!(probe.duration_ms.abs_diff(bundle.duration_ms) < 400, "{probe:?}");
+        assert!(
+            probe.duration_ms.abs_diff(bundle.duration_ms) < 400,
+            "{probe:?}"
+        );
         assert!(reported.windows(2).all(|p| p[0] <= p[1]), "{reported:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

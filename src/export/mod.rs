@@ -487,7 +487,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn default_output_lands_in_videos_scrawl() {
         let path = default_output(Path::new("C:/x/scrawl-17-9.scrawl"));
-        assert!(path.ends_with("Scrawl/scrawl-17-9.mp4"), "{}", path.display());
+        assert!(
+            path.ends_with("Scrawl/scrawl-17-9.mp4"),
+            "{}",
+            path.display()
+        );
         assert!(path.parent().and_then(Path::parent) == dirs::video_dir().as_deref());
     }
 
@@ -496,12 +500,21 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn the_windows_renderer_reads_the_plan() {
         let mut b = bundle();
-        b.strokes.push(serde_json::from_value(serde_json::json!({
-            "t0": 5000, "t1": 5100, "fw": 2560, "fh": 1440, "pin": 2,
-            "pts": [1000, 500, 0]
-        }))
-        .unwrap());
-        let ink = ink::plan(&b, (2560, 1440), ink::Layers { ink: true, clicks: true });
+        b.strokes.push(
+            serde_json::from_value(serde_json::json!({
+                "t0": 5000, "t1": 5100, "fw": 2560, "fh": 1440, "pin": 2,
+                "pts": [1000, 500, 0]
+            }))
+            .unwrap(),
+        );
+        let ink = ink::plan(
+            &b,
+            (2560, 1440),
+            ink::Layers {
+                ink: true,
+                clicks: true,
+            },
+        );
         assert!(!ink.strokes.is_empty() && !ink.pins.is_empty() && !ink.ripples.is_empty());
         let crop = [0.1, 0.2, 0.9, 0.8];
         let camera = camera_rows(&b, crop, (2560, 1440), 15_000);
@@ -545,7 +558,10 @@ mod tests {
         assert_eq!(read.ink.ripples.len(), ink.ripples.len());
         assert!((read.ink.k - f64::from(ink.k)).abs() < 1e-6);
         let snap = &read.ink.strokes[0].snaps.last().unwrap();
-        assert_eq!(snap.poly.len(), ink.strokes[0].snaps.last().unwrap().poly.len());
+        assert_eq!(
+            snap.poly.len(),
+            ink.strokes[0].snaps.last().unwrap().poly.len()
+        );
         // The camera rectangle comes back interpolated between the rows, held at both ends.
         let rows = plan.camera.as_ref().unwrap();
         let first = [rows[0][1], rows[0][2], rows[0][3], rows[0][4]];
@@ -557,9 +573,15 @@ mod tests {
             assert!((rect[i] - want).abs() < 1e-9, "{rect:?}");
         }
         // Without a camera, the crop.
-        let still = Plan { camera: None, ..plan };
+        let still = Plan {
+            camera: None,
+            ..plan
+        };
         let read = crate::win::export::plan::Plan::parse(&serde_json::to_vec(&still).unwrap());
         let rect = read.unwrap().camera_rect(3_000.0);
-        assert!((0..4).all(|i| (rect[i] - f64::from(crop[i])).abs() < 1e-6), "{rect:?}");
+        assert!(
+            (0..4).all(|i| (rect[i] - f64::from(crop[i])).abs() < 1e-6),
+            "{rect:?}"
+        );
     }
 }

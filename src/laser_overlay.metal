@@ -33,10 +33,11 @@ struct PathSegment {
     float width;
 };
 
+// A pin's brief live pulse: a thin ring at `radius`, `alpha` opaque.
 struct PinMarker {
     float2 pos;
     float radius;
-    float _pad;
+    float alpha;
 };
 
 struct VertexOutput {
@@ -56,6 +57,13 @@ vertex VertexOutput laser_vertex(uint vertex_id [[vertex_id]]) {
     return out;
 }
 
+// Each frame picks a specialisation (`encode_overlay`), so it compiles only the work it needs:
+// an unused tile loop or early return still costs every pixel registers, and so occupancy.
+// `has_ink`: some segment is binned. `skip_clear`: no picker, constrained target or intro effect
+// shows (`LaserUniforms::has_backdrop`), so a pixel nothing reaches can return clear at once.
+constant bool has_ink [[function_constant(0)]];
+constant bool skip_clear [[function_constant(1)]];
+
 fragment float4 laser_fragment(
     VertexOutput in [[stage_in]],
     constant LaserUniforms &u [[buffer(0)]],
@@ -73,14 +81,18 @@ fragment float4 laser_fragment(
     float laser_core_cov = 0.0;
     float laser_body_cov = 0.0;
     float laser_glow_cov = 0.0;
-    float ink_halo_cov = 0.0;
     float ink_red_cov = 0.0;
 
     uint tile_count = u.tile_cols * u.tile_rows;
     uint2 cell = min(uint2(max(p, float2(0.0)) / u.tile_size), uint2(u.tile_cols, u.tile_rows) - 1u);
     uint tile = cell.y * u.tile_cols + cell.x;
-    uint first = u.segment_count > 0u && tile_count > 0u ? tiles[tile] : 0u;
-    uint last = u.segment_count > 0u && tile_count > 0u ? tiles[tile + 1u] : 0u;
+    uint first = has_ink && tile_count > 0u ? tiles[tile] : 0u;
+    uint last = has_ink && tile_count > 0u ? tiles[tile + 1u] : 0u;
+    // No segment, pin or Shift tip reaches this pixel and nothing is behind it: it stays clear.
+    if (skip_clear && first == last && u.pin_count == 0u
+        && (u.tip_active <= 0.01 || length(p - u.tip_pos) >= 5.0)) {
+        return float4(0.0);
+    }
     for (uint j = first; j < last; ++j) {
         PathSegment seg = segments[tiles[tile_count + 1u + j]];
         float2 ab = seg.b - seg.a;
@@ -115,16 +127,14 @@ fragment float4 laser_fragment(
         }
     }
 
-    // Pin markers
+    // Pin pulses: a 1.5 pt ring, no fill, so nothing under it is hidden.
     uint pcount = min(u.pin_count, 64u);
     for (uint i = 0; i < pcount; ++i) {
         PinMarker pin = pins[i];
-        float d = length(p - pin.pos);
-        if (d < pin.radius + 3.5) {
-            float halo = smoothstep(pin.radius + 2.0, pin.radius + 0.8, d);
-            float fill = smoothstep(pin.radius + 0.75, pin.radius - 0.75, d);
-            ink_halo_cov = max(ink_halo_cov, halo);
-            ink_red_cov = max(ink_red_cov, fill);
+        float off = abs(length(p - pin.pos) - pin.radius);
+        if (off < 2.0) {
+            float ring = smoothstep(1.25, 0.25, off) * pin.alpha;
+            ink_red_cov = max(ink_red_cov, ring);
         }
     }
 
@@ -211,12 +221,7 @@ fragment float4 laser_fragment(
         out.a = 0.32 * intro_fade;
     }
 
-    // 1. Composite persistent ink (white halo + red fill)
-    if (ink_halo_cov > 0.001) {
-        float a = ink_halo_cov * 0.82;
-        out.rgb = float3(1.0) * a + out.rgb * (1.0 - a);
-        out.a = a + out.a * (1.0 - a);
-    }
+    // 1. Composite ink (red fill)
     if (ink_red_cov > 0.001) {
         float3 ink_col = float3(1.0, 0.23, 0.19);
         float a = ink_red_cov;
