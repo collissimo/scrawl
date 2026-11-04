@@ -13,6 +13,8 @@ LABEL="dev.kitlangton.scrawl-install-$(date +%s)"
 
 ssh "${HOST}" bash -s -- "${STAGE}" "${LABEL}" <<'REMOTE'
 set -euo pipefail
+# pgrep/pkill fail under some locales (C.UTF-8), which left the old app running.
+export LC_ALL=C
 STAGE="$1"; LABEL="$2"
 JOB="/tmp/${LABEL}.sh"; PLIST="/tmp/${LABEL}.plist"; LOG="/tmp/${LABEL}.log"
 cd ~/code/open-source/scrawl
@@ -57,7 +59,17 @@ codesign --verify --deep --strict "${APP}"
 codesign -dvv "${APP}" 2>&1 | grep -E "^Authority=Developer ID Application" || echo "warning: not Developer ID signed" >&2
 ln -sf "${APP}/Contents/MacOS/scrawl" "${HOME}/bin/scrawl"
 pkill -f "Scrawl.app/Contents/MacOS/scrawl" 2>/dev/null || true
-sleep 1
+for _ in $(seq 1 40); do
+  status=0
+  pgrep -f "Scrawl.app/Contents/MacOS/scrawl" >/dev/null || status=$?
+  [[ "${status}" == 0 ]] || break
+  sleep 0.05
+done
+if [[ "${status}" != 1 ]]; then
+  pgrep -fl "Scrawl.app/Contents/MacOS/scrawl" >&2 || true
+  echo "the old Scrawl is still running (pgrep exit ${status}); quit it and run this again" >&2
+  exit 1
+fi
 open -a "${APP}"
 sleep 2
 pgrep -fl "Scrawl.app/Contents/MacOS/scrawl"

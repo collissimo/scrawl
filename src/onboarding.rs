@@ -5,7 +5,9 @@
 //!
 //! Screen Recording, Microphone and Accessibility are required and asked for together on the
 //! permissions screen, Screen Recording first. Camera (the cabled iPhone) is asked for the first
-//! time it's used, in the same window with just that row (`Flow::fix`). Until the required ones
+//! time it's used, in the same window with just that row (`Flow::fix`). On macOS 15, where
+//! transcripts come from SFSpeechRecognizer, Speech Recognition is an optional fourth row, so
+//! its prompt comes up here rather than after the first capture. Until the required ones
 //! are on, ⌥⇧S starts nothing: it brings this window forward once the keys are up (`Gate`).
 //!
 //! A Screen Recording grant may only reach a running copy of Scrawl after it relaunches, and
@@ -30,20 +32,38 @@ pub enum Permission {
     InputMonitoring,
     Accessibility,
     Camera,
+    /// SFSpeechRecognizer's own permission, for transcripts on macOS 15. Optional, and only on
+    /// the screen when the helper reports it (SpeechAnalyzer on macOS 26 needs none).
+    SpeechRecognition,
 }
 
 impl Permission {
     /// What a capture needs, in the order the checklist shows them. Screen Recording comes first
     /// because it's the one that may relaunch Scrawl. Accessibility drives the key event tap
-    /// (⌘Z, Esc, the switcher's presses) and ⌥⇧V's paste. Camera is asked for when first used.
+    /// (⌘Z, Esc) and ⌥⇧V's paste. Camera is asked for when first used.
     pub const REQUIRED: [Permission; 3] = [
         Permission::ScreenRecording,
         Permission::Microphone,
         Permission::Accessibility,
     ];
 
+    /// The tour's checklist: the required ones, then Speech Recognition where it's asked for.
+    pub const TOUR: [Permission; 4] = [
+        Permission::ScreenRecording,
+        Permission::Microphone,
+        Permission::Accessibility,
+        Permission::SpeechRecognition,
+    ];
+
     pub fn required(self) -> bool {
         Self::REQUIRED.contains(&self)
+    }
+
+    /// Whether this Mac asks for it at all: Speech Recognition only when the helper reports it
+    /// (macOS before 26).
+    pub fn asked(self, grants: Option<&Grants>) -> bool {
+        self != Permission::SpeechRecognition
+            || grants.is_some_and(|g| g.statuses.contains_key(&self))
     }
 
     /// Privacy lists the app can be dragged into: Grant flies the drag panel to System
@@ -278,7 +298,7 @@ impl Flow {
     /// it works, and a later step never shows before it's done. A tour resumed on the
     /// permissions screen (after a relaunch) stays there, so the window comes back where it was.
     pub fn tour(start: Step, grants: Option<Grants>) -> Self {
-        let mut flow = Self::new(Mode::Tour, start, Permission::REQUIRED.to_vec(), grants);
+        let mut flow = Self::new(Mode::Tour, start, Permission::TOUR.to_vec(), grants);
         flow.step = if start.position() > Step::Permissions.position()
             && flow.grants.is_some()
             && !flow.done()
@@ -415,9 +435,8 @@ impl Flow {
             index: shown.iter().position(|s| *s == self.step).unwrap_or(0),
             count: shown.len(),
             rows: self
-                .asks
-                .iter()
-                .map(|&permission| {
+                .shown()
+                .map(|permission| {
                     let stale = permission == Permission::ScreenRecording && self.screen_relaunch();
                     Row {
                         permission,
@@ -450,11 +469,17 @@ impl Flow {
         self.grants.as_ref().is_some_and(|g| g.usable(permission))
     }
 
-    /// What must be granted before Continue: a tour's required rows, every row of a fix.
-    fn needed(&self) -> impl Iterator<Item = Permission> + '_ {
+    /// The rows this Mac asks for.
+    fn shown(&self) -> impl Iterator<Item = Permission> + '_ {
         self.asks
             .iter()
             .copied()
+            .filter(|p| p.asked(self.grants.as_ref()))
+    }
+
+    /// What must be granted before Continue: a tour's required rows, every row of a fix.
+    fn needed(&self) -> impl Iterator<Item = Permission> + '_ {
+        self.shown()
             .filter(|p| self.mode == Mode::Fix || p.required())
     }
 
@@ -773,10 +798,12 @@ pub fn read_grants() -> Option<Grants> {
         .inspect_err(|error| crate::capture::scrawl_log(format!("permissions: {error:#}")))
         .ok()?;
     let screen = statuses.get(&Permission::ScreenRecording) == Some(&Status::Granted);
-    Some(Grants {
+    let grants = Grants {
         statuses,
         screen_needs_relaunch: screen && !crate::capture::screen_capture_usable(true),
-    })
+    };
+    crate::speech_model::note_grants(&grants);
+    Some(grants)
 }
 
 /// What draws the welcome window: the SwiftUI `scrawl-helper onboarding` process on macOS, an
@@ -1066,7 +1093,10 @@ pub fn relaunch() {
     };
     let _ = std::process::Command::new(exe)
         .args(std::env::args_os().skip(1))
-        .env(crate::win::shell::RELAUNCHED_BY, std::process::id().to_string())
+        .env(
+            crate::win::shell::RELAUNCHED_BY,
+            std::process::id().to_string(),
+        )
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1167,6 +1197,50 @@ mod tests {
     }
 
     #[test]
+    fn speech_recognition_is_an_optional_row_only_where_the_helper_reports_it() {
+        use Permission::SpeechRecognition;
+        // macOS 26: the helper doesn't report it, so it isn't on the screen or in Settings.
+        assert!(!SpeechRecognition.asked(Some(&grants(&[]))));
+        assert!(!SpeechRecognition.asked(None));
+        let flow = Flow::tour(Step::Permissions, Some(grants(&[])));
+        assert!(!rows(&flow).contains(&SpeechRecognition));
+
+        // macOS 15: a fourth row after the required ones, asked for with Apple's prompt.
+        let mut asking = grants(&[]);
+        asking
+            .statuses
+            .insert(SpeechRecognition, Status::NotDetermined);
+        let mut flow = Flow::tour(Step::Permissions, Some(asking));
+        assert_eq!(
+            rows(&flow),
+            [
+                ScreenRecording,
+                Microphone,
+                Accessibility,
+                SpeechRecognition
+            ]
+        );
+        let row = flow.view().rows[3].clone();
+        assert!(!row.required);
+        assert_eq!(
+            flow.on(Input::Grant(SpeechRecognition)),
+            Effect::Request(SpeechRecognition)
+        );
+        assert_eq!(
+            flow.on(Input::Grant(SpeechRecognition)),
+            Effect::OpenSettings(SpeechRecognition)
+        );
+
+        // It never holds up Continue.
+        let mut required = grants(&ALL);
+        required.statuses.insert(SpeechRecognition, Status::Denied);
+        tick(&mut flow, &required, 0);
+        assert!(flow.view().ready);
+        assert_eq!(flow.on(Input::Continue), Effect::None);
+        assert_eq!(flow.step(), Step::TryIt);
+    }
+
+    #[test]
     fn the_demo_can_be_skipped_and_adds_no_screen() {
         let mut flow = Flow::tour(Step::HowItWorks, Some(grants(&[])));
         assert_eq!(flow.view().count, 4);
@@ -1222,7 +1296,8 @@ mod tests {
         let fresh = serde_json::to_value(Flow::tour(Step::Welcome, None).view()).unwrap();
         assert!(fresh["tutorial"].is_null());
         // An older config without the key loads as nothing yet.
-        let old: Progress = serde_json::from_str(r#"{"seen":false,"resume":"how-it-works"}"#).unwrap();
+        let old: Progress =
+            serde_json::from_str(r#"{"seen":false,"resume":"how-it-works"}"#).unwrap();
         assert_eq!(old.tutorial, None);
     }
 
@@ -1363,7 +1438,10 @@ mod tests {
         let relaunch = Effect::Relaunch {
             resume: Some(Step::Permissions),
         };
-        assert_eq!(tick(&mut flow, &granted, 1_000 + RELAUNCH_AFTER_MS), relaunch);
+        assert_eq!(
+            tick(&mut flow, &granted, 1_000 + RELAUNCH_AFTER_MS),
+            relaunch
+        );
         // Never twice from one window.
         assert_eq!(tick(&mut flow, &granted, 9_000), Effect::None);
         assert_eq!(flow.on(Input::Grant(ScreenRecording)), Effect::None);
@@ -1375,7 +1453,10 @@ mod tests {
             Effect::ConfirmScreen
         );
         for t in [5_000, 60_000] {
-            assert_eq!(tick(&mut flow, &grants(&[ScreenRecording]), t), Effect::None);
+            assert_eq!(
+                tick(&mut flow, &grants(&[ScreenRecording]), t),
+                Effect::None
+            );
         }
         assert!(!flow.view().rows[0].reopening);
     }
@@ -1483,7 +1564,10 @@ mod tests {
         assert!(!view.rows[0].reopening && !view.rows[0].relaunch);
         // The next row to do is Microphone.
         assert_eq!(
-            view.rows.iter().find(|r| r.status != Status::Granted).map(|r| r.permission),
+            view.rows
+                .iter()
+                .find(|r| r.status != Status::Granted)
+                .map(|r| r.permission),
             Some(Microphone)
         );
         // macOS's Quit & Reopen: Scrawl never noted a relaunch, but the step it saved while

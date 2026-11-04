@@ -6,8 +6,9 @@ Press a shortcut (`⌥⇧S`) and Scrawl starts recording the screen. Talk, click
 
 ## Install
 
-Scrawl needs an Apple silicon Mac on macOS 26 or later. Download the DMG from
-[scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use Homebrew:
+Scrawl needs an Apple silicon Mac on macOS 15 or later (live transcription and Liquid Glass need
+macOS 26). Download the DMG from [scrawl.kitlangton.com](https://scrawl.kitlangton.com), or use
+Homebrew:
 
 ```sh
 brew install --cask kitlangton/tap/scrawl
@@ -36,14 +37,15 @@ current copy, so it updates with the app.
 
 With the skill, an agent that gets a Scrawl paste reads the contact sheet and transcript, opens the
 keyframes the narration points at, and uses the command to look closer: `scrawl zoom <bundle> --at
-0:12` (or `--at "a phrase you said"`) makes a dense sheet of frames around a moment, `scrawl
+0:12` (or `--at "a phrase you said"`, or `--mark 2` for the mark the text shows as ✎②; `scrawl
+inspect --marks` lists them) makes a dense sheet of frames around a moment, `scrawl
 frames` pulls a range, `scrawl send` queues a capture into an OpenCode session, and `scrawl export`
 makes a shareable `.mp4`. `scrawl skill` prints the skill without installing anything.
 
 ## Usage
 
 ```sh
-# Launch the GPUI menu-bar and review app (tap ⌥⇧S to record, hold it to choose what to record)
+# Launch the GPUI menu-bar and review app (press ⌥⇧S to record)
 cargo run -- app
 
 # Generate a realistic multi-frame demo bundle and print its agent summary
@@ -77,6 +79,9 @@ cargo run -- import ~/Downloads/20261013T164000.mp4 --timeline ~/Downloads/20261
 # Rebuild an existing bundle with the current transcriber and keyframe rules
 cargo run -- reprocess latest --out /tmp/again.scrawl
 
+# Build a capture whose build never ran (the app died first), in place; the app does this at launch
+cargo run -- recover ~/Library/Application\ Support/scrawl/captures/scrawl-….scrawl
+
 # Tune auto-crop on a Screen capture, live
 cargo run -- autocrop latest --serve --open
 
@@ -101,12 +106,12 @@ Continue unlocks once all three are on, and the screen is skipped when they alre
 |---|---|---|
 | Screen & System Audio Recording | Recording the screen (ScreenCaptureKit) | onboarding, required |
 | Microphone | Your narration | onboarding, required |
-| Accessibility ("Device Control and Data Access" on macOS 27) | The key event tap (⌘Z, Esc, S in the switcher, ⌘-shortcuts in the window log), and `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | onboarding, required |
+| Accessibility ("Device Control and Data Access" on macOS 27) | The key event tap (⌘Z, Esc, ⌘-shortcuts in the window log), and `⌥⇧V` and the Paste chip, which post ⌘V into the app in front | onboarding, required |
 | Camera | The cabled iPhone mirror (macOS treats it as a camera) | the first time you pick iPhone |
 
 Scrawl never asks for Input Monitoring. Clicks, drags and scrolls in other apps come from an AppKit
 global mouse monitor (`NSEvent.addGlobalMonitorForEvents`), which needs no permission; ⇧ for ink
-and the switcher's held ⌥⇧ come from polled modifier flags, which need none either; key presses
+and whether ⌥⇧ is still held after ⌥⇧S come from polled modifier flags, which need none either; key presses
 come from an active event tap, which Accessibility allows. macOS applies an Accessibility grant to
 a running app at once (System Settings shows no "Quit & Reopen" for it), and Scrawl makes the tap
 within half a second of it.
@@ -124,7 +129,7 @@ Camera is asked for in the same window, with just its row, when first needed. Sp
 isn't asked for: SpeechAnalyzer transcribes without it. The ⌥⇧S and ⌥⇧V hotkeys themselves need
 no permission (Carbon `RegisterEventHotKey`).
 
-Until the required permissions are on, ⌥⇧S starts nothing (no switcher, picker or overlay that
+Until the required permissions are on, ⌥⇧S starts nothing (no picker or overlay that
 could sit over a macOS prompt): once the keys are released it brings the permissions window
 forward.
 
@@ -162,11 +167,13 @@ granted and each on-demand sheet: `target/debug/scrawl-helper onboarding --rende
 **Settings…** in the menu bar (⌘, while the menu is open) opens a small window with six panes:
 
 - **General**: Launch at login, Send dev-site captures to OpenCode, and the two shortcuts, Record
-  (`⌥⇧S`) and Paste last capture (`⌥⇧V`).
-- **Recording**: the microphone, with its input level, the transcriber (Apple Speech, or Hex while
-  it runs, with its model) and, under Experimental, Video export.
+  (`⌥⇧S`) and Paste last capture (`⌥⇧V`, which can be turned off).
+- **Recording**: the microphone, with its input level, the transcriber (Apple Speech with its
+  language, Hex while it runs, with its model and language, or Command when it's configured) and,
+  under Experimental, Video export.
 - **Storage**: how long recordings are kept, whether each capture's video is deleted once it's
-  processed, how much space the captures take, and Show in Finder.
+  processed, where new captures go (Change…/Reset on macOS, `"capturesDir"` in
+  `~/.config/scrawl/config.json` everywhere; captures already made stay put, and an unusable folder falls back to the built-in one), how much space they take, and Show in Finder.
 - **Permissions**: the onboarding checklist, so a permission can be turned on later.
 - **Agents**: Install or Uninstall the `scrawl` command (see [Agents](#agents)), and the skill's
   install command with Copy. A `scrawl` that belongs to another program is left alone.
@@ -194,23 +201,20 @@ Preview every pane, dark and light, with the recorder listening and a combinatio
 
 ## Capture Controls
 
-- **Tap `⌥⇧S`** (release within 0.25 s): record the display under the pointer straight away,
-  auto-cropped (see below). Tap it again to finish; a tap within 0.4 s of the start is ignored, so a
-  double press doesn't leave an empty capture. `⌃⌥⇧S` also works (only while `⌥⇧S` is the
+- **Press `⌥⇧S`**: record the display under the pointer as soon as you let go, however long you
+  held it, auto-cropped (see below). Press it again to finish; a press within 0.4 s of the start is
+  ignored, so a double press doesn't leave an empty capture. `⌃⌥⇧S` also works (only while `⌥⇧S` is the
   shortcut; see [Settings](#settings) to change it). As it starts, the island opens onto the modes (Area · Window ·
   **Screen** · iPhone when one is cabled) for about 3.5 s, or until you click, scroll or draw;
   hovering keeps them. Click Window or Area to retarget (the first seconds are dropped and the
   picker takes over: click a window or drag an area), iPhone to record the phone instead, or just
   carry on.
-- **Hold `⌥⇧` after `S`**, like `⌘Tab`: after 0.25 s the switcher appears on **Screen**. Each
-  further `S` steps Screen → Window → iPhone → Screen; Window highlights the window under the
-  pointer. Dragging with the mouse selects an area instead. Release `⌥⇧` to record what's
-  selected; `Esc` cancels. With no iPhone cabled, iPhone says so and releasing records nothing.
-- **Choose What to Record…** in the menu bar: the full picker (Area, Window, Screen, iPhone).
+- **Choose What to Record…** in the menu bar: the picker (Area, Window, Screen, iPhone) opens on
+  the display under the pointer. Click a mode, click a window or drag an area; `Esc` cancels.
 - `⌥⇧V`: Paste both `contact-sheet.png` and `summary.md` into the active app or terminal (`⌃⌥⇧V` also works while it's the default)
 - **Normal pointer**: Clicks and scrolls pass straight through to the app underneath
 - **Hold `⇧` (Shift) + move**: Draw a persistent red marker stroke (`#ff3b30`) on screen that fades out after release
-- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink)
+- **`⇧`-click**: Drop a numbered pin where you click (a press that moves under 12 pt and lets go within 1 s; longer is ink). It shows as a brief red pulse, not a lasting dot, and lands on the keyframes. A click after you've drawn in the same `⇧` hold is part of the drawing and drops no pin
 - **`⌘Z`**: Undo the last stroke
 - **`Esc`**: Cancel the active selection or capture
 
@@ -317,7 +321,7 @@ most of the screen isn't worth it, and the keyframe stays whole.
 The bundle then has:
 
 - `frames/frame-XX.png` and `contact-sheet.png`: cropped from the full-resolution frames (Screen
-  keyframes are decoded from the 2560 px wide recording), with the ink and badges redrawn at the crop's scale;
+  keyframes are decoded from the 2560 px wide recording), with the ink and keyframe numbers redrawn at the crop's scale;
 - `frames-full/frame-XX.png` and `contact-sheet-full.png`: the uncropped versions;
 - one line in `summary.md`, e.g. `Cropped to: Ghostty + Safari (full frames in frames-full/)`;
 - `autocrop` in `scrawl.json`: each keyframe's crop in points, its kind and reason, and the
@@ -596,6 +600,7 @@ The bundle keeps them as `context`, `contextChanges`, and `screens` spans (`{t0,
 
 ```
 [scrawl 0:25 · iPhone · OpenCode 1.4 (354) · /…/20261014-101500.scrawl]
+Open contact-sheet.png and frames/ in that folder before changing anything: the marks and words only make sense on the images, which can show more than the text does.
 Screen: Sessions · server: studio · session: ses_3f…
 - #1 (0:01) “So here.”
 - #3 (0:08) ⟨Settings › Experimental⟩ [tapped “Back”] “Go back.”
@@ -654,12 +659,12 @@ scrawl export latest --crop 0.1,0.2,0.6,0.5       # x,y,w,h as fractions, or pix
 ## Keeping captures small
 
 Captures would otherwise pile up (mostly video). The app cleans up shortly after launch and then
-daily, at low priority, and logs what it did:
+hourly, at low priority, and logs what it did:
 
-- **Video, audio and full-size frames** (`recording.mp4`/`.mov`, `audio.wav`, `frames-full/`) go
-  to the Trash after 7 days, as one `<bundle> media` folder. The prompt (`summary.md`,
-  `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so pasting and reading still work;
-  `scrawl zoom` says the video was cleaned up.
+- **Video, audio and full-size frames** (`recording.mp4`/`.mov`, `audio.wav`, `frames-full/`),
+  plus the `zoom/` sheets made from them, go to the Trash after 7 days, as one `<bundle> media`
+  folder. The prompt (`summary.md`, `scrawl.json`, `contact-sheet.png`, `frames/`) stays, so
+  pasting and reading still work; `scrawl zoom` says the video was cleaned up.
 - **Whole bundles** go to the Trash after 30 days.
 - **Keep recordings** in Settings › Storage picks Video for 7 Days (bundles 30), Video for 30 Days
   (bundles 90), or Forever. It's stored as `"retention": {"mediaDays": 7, "bundleDays": 30}` in
@@ -677,15 +682,18 @@ daily, at low priority, and logs what it did:
 - **iPhone video** from the cable is ~18 Mbps at 1320×2868. A minute after the capture (after any
   copy to another Mac finishes, and never during a recording) `scrawl-helper shrink` re-encodes it
   to HEVC at a 1600 px long edge, audio copied as is and every frame at its original time, and
-  swaps it in place: a 4.5-minute capture goes from 750 MB to 72 MB in about 20 s. Daily passes
-  shrink any native iPhone video that was missed.
+  swaps it in place: a 4.5-minute capture goes from 750 MB to 72 MB in about 20 s. One pass a day
+  shrinks any native iPhone video that was missed.
 
 `scrawl clean --dry-run` prints what a pass would do now.
 
 ## Transcription
 
-Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), which reports when every
-word was spoken. The word timings drive two things:
+Narration is transcribed on device by Apple's SpeechAnalyzer (macOS 26), or on macOS 15 by the
+older on-device `SFSpeechRecognizer`. On macOS 15 onboarding asks for Speech Recognition, and
+Dictation's on-device model has to be on the Mac (System Settings › Keyboard › Dictation); Scrawl
+never falls back to Apple's servers. Both report when every word was spoken. The word timings
+drive two things:
 
 - **Text per keyframe.** Each keyframe's text runs from the start of the clause in progress when
   its moment began (the action, the transition, or the spoken cue) until the next keyframe, so the
@@ -699,19 +707,33 @@ word was spoken. The word timings drive two things:
 
 ### Apple or Hex
 
-Apple's SpeechAnalyzer is the default and needs nothing. If you use Hex
+Apple's SpeechAnalyzer is the default; Scrawl prepares its language model automatically. If you use Hex
 (2.2 or later, running), Scrawl can transcribe with it instead and with whichever model Hex has
 ready: Settings › Recording › **Transcription** → **Hex**, then pick a model under **Hex model**.
 Or in
 `~/.config/scrawl/config.json`:
 
 ```json
-{ "transcriber": "hex", "hexModel": "parakeet_v3" }
+{ "transcriber": "hex", "hexModel": "whisper_large_v3_turbo", "hexLanguage": "nl" }
 ```
 
-`"transcriber"` is `"apple"` (default), `"hex"` or, on Windows, `"claude"`; `hexModel` defaults to the first ready one of
-`parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`. Scrawl never
-downloads or prepares a model: install it in Hex first.
+`"transcriber"` is `"apple"` (default), `"hex"`, `"command"` (below) or, on Windows, `"claude"`; `hexModel` defaults to the
+first ready one of `parakeet_unified_en`, `parakeet_v3`, `parakeet_v2`, `whisper_large_v3_turbo`.
+Scrawl never downloads or prepares a Hex model: install it in Hex first.
+
+**Language** in Settings › Recording picks the language Apple Speech transcribes; **Automatic**
+(the default) follows the Mac's language. In config it's `"appleLocale"`, e.g. `"zh-TW"` for
+Traditional Chinese (Taiwan). Scrawl downloads that language's model in the background, and a
+language this Mac doesn't support falls back to Automatic (Settings names the one it uses).
+
+**Hex language** in Settings › Recording (or `"hexLanguage"` in config) sets the language
+code sent to Hex. It defaults to `en` to preserve existing behavior; use `nl` for Dutch or
+`auto` for automatic detection when the model supports it. Press Return or Apply to save;
+a blank field resets to `en`. Codes are not restricted to a list in Scrawl: Hex validates
+model/language support. If Hex rejects a language/model combination, Scrawl uses the existing
+Apple Speech fallback. This setting does not inherit Hex's dictation language. Whisper uses the selected
+language to guide recognition; models such as Parakeet v3 determine language from audio
+and ignore the hint.
 
 - Hex is optional. When it isn't running, **Hex** is greyed out as "Hex (not running)" and Scrawl
   uses Apple, whatever the saved preference. If Hex fails on a recording, that recording falls back
@@ -721,8 +743,64 @@ downloads or prepares a model: install it in Hex first.
   `"estimated": true`; because those times are approximate, spoken cues ("now", "here") don't cut
   keyframes from a Hex transcript. Marks, clicks, laser and scene changes still do.
 - `scrawl hex status` shows whether Hex is connected, its ready models and what the next recording
-  will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple` (also `scrawl import`) picks
-  an engine for one run.
+  will use. `scrawl reprocess <bundle> --out … --transcriber hex|apple|command` (also
+  `scrawl import`) picks an engine for one run.
+
+### Your own model (command)
+
+Any other local model (whisper.cpp, MLX Whisper, faster-whisper, Parakeet, a Core ML model…) can
+transcribe through a small wrapper program. Scrawl runs it on the recording's audio and reads a
+JSON transcript from its stdout; it knows nothing about the model, adds no network requests and
+doesn't sandbox the program. It runs on macOS only for now; on Windows recordings keep the local
+engine. In `~/.config/scrawl/config.json` (Settings shows **Command** once it is set; editing it
+stays in the file):
+
+```json
+{
+  "transcriber": "command",
+  "transcribeCommand": ["/Users/me/bin/whisper-scrawl", "--model", "large-v3-turbo", "{audio}"],
+  "transcribeTimeoutSeconds": 600
+}
+```
+
+- `transcribeCommand` is an argv array run directly: no shell, quoting, `~`, variables or globbing.
+  `argv[0]` must be an absolute path. Every `{audio}` in the other arguments becomes the audio path;
+  without one, the path is the last argument. Put your model's language in it too (`--language nl`):
+  Settings' **Language** is Apple Speech's alone. These keys are read on their own, so a mistake in
+  them never resets the rest of the config.
+- `transcribeTimeoutSeconds` is optional, a positive number of seconds: by default the limit is
+  `max(300, 60 + 10 × audio seconds)`, wall clock from the start, model loading included.
+- The program gets the whole recording as one 16 kHz mono 16-bit WAV, `SCRAWL_TRANSCRIBE_VERSION=1`
+  and `SCRAWL_AUDIO=<path>`, stdin `/dev/null`, and its own process group. Its stderr is discarded.
+  It must not change the audio, daemonize or leave processes behind, and must cope with two runs at
+  once. On timeout or more than 8 MiB of output Scrawl kills the group.
+- It exits 0 and prints exactly one JSON object:
+
+  ```json
+  {
+    "version": 1,
+    "model": "whisper-large-v3-turbo",
+    "text": "Click here.",
+    "segments": [{ "t0": 300, "t1": 980, "text": "Click here." }],
+    "words": [{ "t0": 300, "t1": 610, "text": "Click" }, { "t0": 640, "t1": 980, "text": "here." }],
+    "estimated": false
+  }
+  ```
+
+  `version` (the integer 1) and `text` (empty means no speech) are required; the rest may be
+  omitted or `null`, and unknown fields (or a `model` or `estimated` of another type) are ignored. Times are integer milliseconds from the first
+  sample. `segments` and `words`, when given, cover the whole text. `estimated` is `false` only if
+  the word times were measured (by the recognizer or an aligner); it defaults to `true`, and spoken
+  cues only cut keyframes from measured words. Without `words`, Scrawl spreads the text over the
+  segments (or the whole recording) and marks those times estimated, as it does for Hex.
+- Spans may overlap or be zero-length; Scrawl sorts them by `t0`. Ends up to 500 ms past the audio
+  are clamped. A negative, fractional or reversed span, or one further past the end, makes Scrawl
+  drop that array and keep the text, spreading it as above when `words` are dropped.
+- The transcript says `"source": "command:<file name of argv[0]>"`. Anything else going wrong (a
+  malformed `transcribeCommand` or timeout, the program missing, a non-zero exit, a timeout, invalid
+  JSON, another version) means Apple Speech transcribes that recording. Each problem is one line in
+  `~/Library/Logs/Scrawl` (a malformed config only once), never with the program's output,
+  arguments or what was said.
 
 ### Claude Code dictation (Windows)
 
@@ -821,10 +899,10 @@ system owns differ:
   (Windows uses those), and `Alt+Tab`, `Alt+F4` and `Alt+Space`.
 - **Transcription:** Parakeet runs on device with measured word timings, so spoken cues ("look
   here") cut keyframes as on macOS. If [Hex](https://github.com/anomalyco/hex) has installed a
-  model (`%APPDATA%\voice-control\models`), Scrawl uses it. Otherwise the first launch downloads
-  Hex's Parakeet Unified English (730 MB, checked against its SHA-256) into
-  `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording shows the progress, and
-  captures made before it finishes get their transcript once it lands. Recordings are English
+  model (`%APPDATA%\hex\models`, or `%APPDATA%\voice-control\models` from older Hex), Scrawl
+  uses it. Otherwise the first launch downloads Hex's Parakeet Unified English (730 MB, checked
+  against its SHA-256) into `%LOCALAPPDATA%\Scrawl\models` in the background; Settings › Recording
+  shows the progress, and captures made before it finishes get their transcript once it lands. Recordings are English
   unless Settings › Recording › **Language** says otherwise (never the Windows locale); another
   language downloads Parakeet TDT 0.6b v3 (740 MB; bg cs da de el en es et fi fr hr hu it lt lv mt
   nl pl pt ro ru sk sl sv uk) as soon as you pick it, and one v3 doesn't speak stays on the
@@ -865,7 +943,7 @@ On Windows, `cargo test`; then run `scrawl.exe app` and record with `Alt+Shift+S
 `SCRAWL_SHOW_OWN_WINDOWS=1` keeps Scrawl's own windows (capsule, overlay, picker) in screenshots,
 which normally leave them out.
 
-- **iPhone:** connect a phone, hold `⌥⇧` and press `S` three times, release, talk, draw over the mirror, press M,
+- **iPhone:** connect a phone, press `⌥⇧S`, click the iPhone chip, talk, draw over the mirror, press M,
   Finish. Inspect the bundle's `summary.md`, `scrawl.json` (`source`, `device`), contact sheet, and
   frames.
 - **ScrawlKit:** `scrawl import` on a recording and its timeline (or hand-write a timeline for any

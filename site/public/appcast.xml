@@ -3,42 +3,83 @@
     <channel>
         <title>Scrawl</title>
         <item>
-            <title>0.3.6</title>
-            <pubDate>Mon, 19 Oct 2026 16:41:06 -0700</pubDate>
-            <sparkle:version>9</sparkle:version>
-            <sparkle:shortVersionString>0.3.6</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <title>0.3.14</title>
+            <pubDate>Sat, 31 Oct 2026 20:42:37 -0700</pubDate>
+            <sparkle:version>17</sparkle:version>
+            <sparkle:shortVersionString>0.3.14</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.6-arm64.zip" length="10736716" type="application/octet-stream" sparkle:edSignature="o//15WljgpFoBttizEp9GkQvi73tJLQW9MovvYvPjao9N0DmyTfhoi41s0NoucEaxk8tyVscd/RYZ9F8SRBpAQ=="/>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.14-arm64.zip" length="11143767" type="application/octet-stream" sparkle:edSignature="eoqOLhnq7bEwtkDzNjIIUCC/bT7A96f0UCBRxSiTkxtjriTjdjeuK/3bSb8Z8EXr0UJD5MEPUG1SAn6+He0fAA=="/>
             <sparkle:deltas>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl9-8.delta" sparkle:deltaFrom="8" length="1456226" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="+SUijG0kdR4AggqTu+fC8Y0sXRbOYPkcAZt6Ek+9obZCh9/9VcVKAzPbfa1dD8Eo3GHAXSP6L5CugXZLB6T+Cg=="/>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl9-7.delta" sparkle:deltaFrom="7" length="1531346" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="ea4JrvrjmIVE4a5Mw8+AdbH3vfNT7DUiH9GMIyg1Q7URlA/ZI3r0kgM+oPf5mevR+9yn8hefep9eZL3N45f4DQ=="/>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl9-6.delta" sparkle:deltaFrom="6" length="1871498" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="ADLS2aqpvViQmedLjYnDmSYi/M5CrXKKxeRCALLLRp03JEgM8ENrU+5LJE6fj4X5i7Zpv2YVMbuyDS9gmfwwCw=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl17-16.delta" sparkle:deltaFrom="16" length="1358062" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="O6a98h7WV98S1R99CedhMrH1Oy1eSBrCt7jcQdJyE3nkpZAV3igLg6LmvvixAg4VrQJFDWtQ5I9S3hQcUogxAg=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl17-15.delta" sparkle:deltaFrom="15" length="1632690" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="MDUe4w+coJcT6vhYaAm0LQiHTIhl+I3nwJRHkvJV/mTetQGiL7hO6lYTjUx0mcqCcf7875cb5pa8ugrEqYrVAQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl17-14.delta" sparkle:deltaFrom="14" length="1750086" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="0jctF0mslKyPvQioO2uMRUYV+4EJ9ITW+4MIyZDFR+nPLURsxsZw7kkX+hVnMJ48NxSYQrHnPyHcqtW1/uk5BQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl17-13.delta" sparkle:deltaFrom="13" length="1749214" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="GtM3umLJ8CS/jv8bW6u99/5T38vpdmCX0ROL9e9GNs2xk+yMVsmS3Xbnr+UMAybRlYzq6JrtSG7iU4yuTk2CAA=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl17-12.delta" sparkle:deltaFrom="12" length="1747714" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="JEL4Q+0wxhbiGICAWTOV6lOGUjY26pywOGer5Vof0emU160e9BEPCjV7sFgOf7pr8NZsbwV82JEniPqdIwdbCA=="/>
             </sparkle:deltas>
         </item>
         <item>
-            <title>0.3.5</title>
-            <pubDate>Mon, 19 Oct 2026 14:07:31 -0700</pubDate>
-            <sparkle:version>8</sparkle:version>
-            <sparkle:shortVersionString>0.3.5</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <title>0.3.13</title>
+            <pubDate>Wed, 21 Oct 2026 17:33:07 -0700</pubDate>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>0.3.13</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.5-arm64.zip" length="9229934" type="application/octet-stream" sparkle:edSignature="NSU4SxRoFQHn4qfJm7Gk1imuBp/Eb5oeugWKTuYReEcd3rmSTrpWRfHSrQGD+uyAjAzZ31n9S1PaQnbnk4uaCg=="/>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.13-arm64.zip" length="11042096" type="application/octet-stream" sparkle:edSignature="mQDYKdGqvFhypJ5SgWGhCi/dzQy/dwkUVWK4J5UyXeOpyAjkGBOQFBGGBfxnXXW32s3E0wLuu7z3ofKsNpOuDg=="/>
             <sparkle:deltas>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl8-7.delta" sparkle:deltaFrom="7" length="1132018" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="/7sRKKW46Yowm30Qr17f4+cLMzT/qiIDdGckCFz+vUB/lhPoOujYyIzsP7mTmA06j+2yxQKU2HWpMvO+pBaTDQ=="/>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl8-6.delta" sparkle:deltaFrom="6" length="1554086" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="Pa5K4duicF/gFStTbhRsB1am36c05ORldsiQBQVHJ/rZeM8FXBn+OzUzIihpLM2B6tlSC+4YPpHI1BRjyT7tAQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl16-15.delta" sparkle:deltaFrom="15" length="1653118" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="eOM8zU3+383lV0QRLwmBdokcXl2c+3h2E6TsnZWNUquGNCcZOzJmG2OmJrej11lXN4V/xmTLfZkCUzcLWVMcAg=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl16-14.delta" sparkle:deltaFrom="14" length="1840046" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="uygANaBap8VZV1fnk+PZcpoeDcRgppZ3NLgHy2VNICtuoIyFu9ml22tkL7mKRlrcvOR7lJWpoJxO1b/PzFDGCQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl16-13.delta" sparkle:deltaFrom="13" length="1844834" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="FkoxIzVO6Dea/o7jdHbCMD9NivGZa7h2LMWHH4KJ7+Cn2Rr9i2/i5TTKUhWvFbhivdZEvnJ41ar7iZjU/YTnAg=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl16-12.delta" sparkle:deltaFrom="12" length="1849838" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="oLgXMSYwNuN+Rn3HdcMDGUMFpIuL+kQYf1CyUAwhJ7YWiiFN+1iw8V+r3Jsmk+0ZsicdvPvKpi5+57ERyIzyCg=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl16-11.delta" sparkle:deltaFrom="11" length="1852082" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="x+rCXz0eheXErUNTZn2bF/+RBG37elqCP83oRrIVWPWb4Ncal2DmvZGCCahy3wbbgf/rRwLppIfiPWW88KKMAw=="/>
             </sparkle:deltas>
         </item>
         <item>
-            <title>0.3.4</title>
-            <pubDate>Mon, 19 Oct 2026 13:26:04 -0700</pubDate>
-            <sparkle:version>7</sparkle:version>
-            <sparkle:shortVersionString>0.3.4</sparkle:shortVersionString>
+            <title>0.3.12</title>
+            <pubDate>Wed, 21 Oct 2026 00:27:02 -0700</pubDate>
+            <sparkle:version>15</sparkle:version>
+            <sparkle:shortVersionString>0.3.12</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.4-arm64.zip" length="9186250" type="application/octet-stream" sparkle:edSignature="gyaFGuxqFkW+ckY07+138GT8h96+PfuHup2gLaF/7nLDuf6JvN0TJYlcrGFlekcgMCskF7ea4MMkR33pLdWSDQ=="/>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.12-arm64.zip" length="10944116" type="application/octet-stream" sparkle:edSignature="fk4x4uQHVNsAsdFc3SRj2NEYiJsSy1JUOkwBMYEbctRHQ7jHBjvCfh6KKfhmTxS9W8lhyzxxzOC69d3fiHyvAQ=="/>
             <sparkle:deltas>
-                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl7-6.delta" sparkle:deltaFrom="6" length="1487150" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="78htpTEw1CpJQTObGsCHsyGZxcIqp+EvbAU36qBY70hRO/yFLlqUSx+RrJ5lDU8sC5WiMMbSLk1U0JMkGxpqBQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl15-14.delta" sparkle:deltaFrom="14" length="1331822" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="C+QamwEqPVsiwfrB1pm/z6MfdyaX4niLCXqXCn56+KkG8OLJxd+SHThpGOEJy+UDb//T3OFxlIrcOe52u8DrBw=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl15-13.delta" sparkle:deltaFrom="13" length="1480334" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="P5/k8IrBrOZ1od6ppqqlCrg00IKhLRzirATWbxfYauJCFb5Ocja+cGrWouhnELkpCik/G/85ORItKIWJIqnUCQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl15-12.delta" sparkle:deltaFrom="12" length="1487946" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="sau5KWYzYE3wT7RC57whQWPI1S1Pf/ZImOOsT2VE4zgwpVn2EMkFxNpReKxOknIeZiKhT5WLct74WY+dWvb0BQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl15-11.delta" sparkle:deltaFrom="11" length="1499770" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="GwyYJwLnuGM8Q25PEBNE9NhxVsxOYq7G/0A3+bFHNigcqnuhhDzXRdRFIpHPTCp/iiE1pnkVf88Uvz4DUx4VDQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl15-10.delta" sparkle:deltaFrom="10" length="1434890" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="hU70Tlax5bDmHf4y76RdnZ8LZYFynsOt2JtQVcvgHnEu5mB7gWJiHN1DgyORsfW8BydK0/AqUtsVLI+JWaueBQ=="/>
+            </sparkle:deltas>
+        </item>
+        <item>
+            <title>0.3.11</title>
+            <pubDate>Tue, 20 Oct 2026 19:51:43 -0700</pubDate>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>0.3.11</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.11-arm64.zip" length="10801905" type="application/octet-stream" sparkle:edSignature="q6ayE+LOI9BPP6fEztqpK2Iu1V/jTVl6AoRTnwm4X6V0ePNBRt5WiTkyAHNtMWwklyXftkuJcm1wVnFyFyoqBQ=="/>
+            <sparkle:deltas>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl14-13.delta" sparkle:deltaFrom="13" length="1176342" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="ebMXLVmHPEF0bOcws0/LQP/rI2YFJZx6/I0ctTE9pNeFmZ1+0aDNnMZ0g2CWR7qSLofShIMe9TfNnbJCqBnMAA=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl14-12.delta" sparkle:deltaFrom="12" length="1271610" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="/HjjNVvKQkDkgS6Mkj+2cPGNDFC/nfmzy3cJ4bXDacpXH926CdY6Q+tp33GZ7zH0hY4NvxSqd4UdLRP6gEl7AQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl14-11.delta" sparkle:deltaFrom="11" length="1273478" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="YglHBgNQRoFhWUkh1lgOTZvyDTRwczX/R0UHTMf/6VFG03gkAmw2WNDF7CF6p6Rub+YGBVmum3zIkHS54ZLjCA=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl14-10.delta" sparkle:deltaFrom="10" length="1227830" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="PLSmhRXfXxizJgpDBKiXXJUuU4vbf/EGqTnrvmIK4uciGpJb4zUJObD/DTH5AQjtKwGEJqdBv3/VpNUiGu4/DQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl14-9.delta" sparkle:deltaFrom="9" length="1355750" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="SzYg9+sEXeCplDKtZdyRAvklpx6p9SHD3vZUHW9yoee9yWkuDVjythd55MkdkktJ269d1Ipoz3HwVEgXHEbWBQ=="/>
+            </sparkle:deltas>
+        </item>
+        <item>
+            <title>0.3.10</title>
+            <pubDate>Tue, 20 Oct 2026 13:26:32 -0700</pubDate>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>0.3.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl-0.3.10-arm64.zip" length="10768916" type="application/octet-stream" sparkle:edSignature="3Az2TehcUs16x2+BPu0NKFFoEHq6NnM4QWlZxGt3r/SE9J6GpFvvO2GOcOxWt7m8B77+mJ+XnCeCOj2n7G+MDg=="/>
+            <sparkle:deltas>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl13-12.delta" sparkle:deltaFrom="12" length="391990" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="jXY2JFWcIWwvn+NkNynPtOoA/TDZSTtlaUl1okT57YUhWypqRAeeoBNR84abkgJMe5F+Wv2iUWkQyo9FEL5+DQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl13-11.delta" sparkle:deltaFrom="11" length="680074" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="Fn2hcZ5PfJ4Gm17UaiuJ43gk3qrQkN+eEOhxyhY8o0qPRulz8nsPx7uCkHAQsgNG+e7/tSQ/cSIYwsW3JsovBQ=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl13-10.delta" sparkle:deltaFrom="10" length="1021938" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="360A5U7zTVju0OK8xreTlM/vUOLaq9rS+vd1g92X0ncvUwTe7ZsAOkpGXBuQRiVFL73llLow3mtiz4tbPc8hCg=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl13-9.delta" sparkle:deltaFrom="9" length="1224294" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="dIYBiniAaFDOgmZw66jxqt8bLHQWDn5fGMSHAUViPJUaNDzMa3HNWSSG6JQ65l2D/mfPWam5A25aDMqaakG/BA=="/>
+                <enclosure url="https://scrawl.kitlangton.com/releases/Scrawl13-8.delta" sparkle:deltaFrom="8" length="1564450" type="application/octet-stream" sparkle:deltaFromSparkleExecutableSize="977808" sparkle:deltaFromSparkleLocales="de,he,ar,el,ja,fa,uk" sparkle:edSignature="jsONOh5tA8qSV3yqXVjNuMdN1ihREYKC853QFjZb+vI8sBfzwB8Y6n2he5TzQKp1ITiytUXUxDPP4AXTfSMHCQ=="/>
             </sparkle:deltas>
         </item>
     </channel>

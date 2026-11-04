@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# pgrep/pkill fail under some locales (C.UTF-8), which left the old app running.
+export LC_ALL=C
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # SCRAWL_APP_DIR builds the signed bundle somewhere else (staging for remote installs, see
@@ -57,7 +59,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>26.0</string>
+  <string>15.0</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSHighResolutionCapable</key>
@@ -110,12 +112,27 @@ fi
 
 ln -sf "${MACOS_DIR}/scrawl" "${HOME}/bin/scrawl"
 
+scrawl_running() {
+  local status=0
+  pgrep -f "Scrawl.app/Contents/MacOS/scrawl" >/dev/null || status=$?
+  case "${status}" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) echo "pgrep failed (exit ${status}); can't tell whether the old Scrawl stopped" >&2; exit 1 ;;
+  esac
+}
+
 pkill -f "Scrawl.app/Contents/MacOS/scrawl" 2>/dev/null || true
 pkill -f "target/debug/scrawl" 2>/dev/null || true
-for _ in {1..20}; do
-  pgrep -f "Scrawl.app/Contents/MacOS/scrawl" >/dev/null || break
+for _ in {1..40}; do
+  scrawl_running || break
   sleep 0.05
 done
+if scrawl_running; then
+  pgrep -fl "Scrawl.app/Contents/MacOS/scrawl" >&2 || true
+  echo "the old Scrawl is still running; quit it and run this again" >&2
+  exit 1
+fi
 open -a "${APP_DIR}" || (sleep 0.3 && open -n -a "${APP_DIR}")
 sleep 0.3
 pgrep -fl "Scrawl.app/Contents/MacOS/scrawl"

@@ -5,6 +5,7 @@ fn main() {
     #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources();
+        stage_transcribe_dlls();
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -22,6 +23,37 @@ fn main() {
                 developer_dir.trim()
             );
             println!("cargo:rustc-link-arg=-Wl,-rpath,{swift_runtime}");
+        }
+    }
+}
+
+/// transcribe.cpp's DLLs (`dynamic-backends`: `transcribe.dll`, `ggml*.dll`) beside `scrawl.exe`
+/// and the test binaries, which load them at start. Its own build script copies them there too,
+/// but only when it runs, and a build restored from CI's cache skips it.
+#[cfg(windows)]
+fn stage_transcribe_dlls() {
+    println!("cargo:rerun-if-env-changed=DEP_TRANSCRIBE_CPP_RUNTIME_DIR");
+    let Some(runtime) = std::env::var_os("DEP_TRANSCRIBE_CPP_RUNTIME_DIR") else {
+        return;
+    };
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    // OUT_DIR is <target>/<profile>/build/scrawl-<hash>/out.
+    let Some(profile) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    let dlls: Vec<PathBuf> = std::fs::read_dir(&runtime)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "dll"))
+        .collect();
+    for dir in [profile.to_path_buf(), profile.join("deps")] {
+        let _ = std::fs::create_dir_all(&dir);
+        for dll in &dlls {
+            if let Err(error) = std::fs::copy(dll, dir.join(dll.file_name().unwrap())) {
+                println!("cargo:warning=could not copy {}: {error}", dll.display());
+            }
         }
     }
 }
@@ -97,13 +129,22 @@ fn compile_metal_shader(src_rel: &str, name: &str) {
     println!("cargo:rerun-if-changed={}", source.display());
 
     let metal = Command::new("xcrun")
-        .args(["--sdk", "macosx", "metal", "-c", "-mmacosx-version-min=26.0"])
+        .args([
+            "--sdk",
+            "macosx",
+            "metal",
+            "-c",
+            "-mmacosx-version-min=15.0",
+        ])
         .arg(&source)
         .arg("-o")
         .arg(&air)
         .status()
         .expect("xcrun metal is required to build Metal shaders");
-    assert!(metal.success(), "Metal shader compilation failed for {src_rel}");
+    assert!(
+        metal.success(),
+        "Metal shader compilation failed for {src_rel}"
+    );
 
     let metallib = Command::new("xcrun")
         .args(["--sdk", "macosx", "metallib"])
@@ -112,7 +153,10 @@ fn compile_metal_shader(src_rel: &str, name: &str) {
         .arg(&library)
         .status()
         .expect("xcrun metallib is required to build Metal shaders");
-    assert!(metallib.success(), "Metal library creation failed for {src_rel}");
+    assert!(
+        metallib.success(),
+        "Metal library creation failed for {src_rel}"
+    );
 }
 
 /// Builds `scrawl-helper` (Swift: SpeechAnalyzer, iPhone capture, movie decoding) beside the
@@ -147,7 +191,7 @@ fn compile_helper() {
     let built = out_dir.join("scrawl-helper");
     let status = Command::new("xcrun")
         .args(["swiftc", "-O", "-swift-version", "5", "-target"])
-        .arg(format!("{arch}-apple-macos26.0"))
+        .arg(format!("{arch}-apple-macos15.0"))
         .args(&sources)
         .arg("-o")
         .arg(&built)
@@ -165,7 +209,7 @@ fn compile_helper() {
         .expect("xcrun swiftc is required to build scrawl-helper");
     assert!(
         status.success(),
-        "scrawl-helper failed to compile (needs the macOS 26 SDK)"
+        "scrawl-helper failed to compile (needs the macOS 26 SDK; the result runs on macOS 15)"
     );
     let dest = profile_dir.join("scrawl-helper");
     let _ = std::fs::remove_file(&dest);

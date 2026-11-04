@@ -1,12 +1,15 @@
 //! The `agentContext` experiment's text: each keyframe's speech broken up by what happened while
 //! it was said (marks, clicks, drags, shortcuts, windows opening and closing, app events), so the
 //! agent reads "this part" next to the mark drawn as it was said. Marks sharing a keyframe are
-//! numbered ①②③ in drawing order, matching the badges `render` draws at each mark's start.
+//! numbered ①②③ in drawing order (the images show only the ink; `scrawl zoom --mark` and
+//! `scrawl inspect --marks` look marks up by these numbers).
 //! Nothing here gives raw coordinates: the images show where, so a place is only written when
 //! something names it (an Accessibility label, the dev page's element).
 
 use crate::model::*;
-use crate::sketch::{describe_event, direction, marks_on, quote_label, settled_events};
+use crate::sketch::{
+    describe_event, direction, mark_on_keyframe, marks_on, quote_label, settled_events,
+};
 
 /// One keyframe's text: `head` follows `- #N (M:SS)` on the bullet line, `lines` go under it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -120,6 +123,104 @@ pub fn keyframe_texts(bundle: &ScrawlBundle) -> Vec<FrameText> {
             text
         })
         .collect()
+}
+
+/// A mark as the text names it: on keyframe `#keyframe`, the `number`th of its marks in drawing
+/// order (shown as ①②③ only when `numbered`, i.e. the keyframe draws two or more).
+#[derive(Clone, Debug)]
+pub struct MarkEntry<'a> {
+    pub mark: &'a Mark,
+    /// 1-based keyframe index, when a keyframe draws the mark.
+    pub keyframe: Option<usize>,
+    pub number: usize,
+    pub numbered: bool,
+}
+
+impl MarkEntry<'_> {
+    /// `#2 ✎② 0:09 marked (2 strokes) · m2`
+    pub fn line(&self) -> String {
+        let frame = self.keyframe.map_or("#-".to_owned(), |k| format!("#{k}"));
+        let num = self.numbered.then_some(self.number);
+        format!("{frame} {} · {}", mark_label(self.mark, num), self.mark.id)
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "keyframe": self.keyframe,
+            "number": self.number,
+            "numbered": self.numbered,
+            "id": self.mark.id,
+            "t0": self.mark.t0,
+            "t1": self.mark.t1,
+            "time": format_clock(self.mark.t0),
+            "shape": self.mark.shape,
+            "on": self.mark.on,
+            "strokes": self.mark.strokes.len(),
+            "text": mark_text(self.mark),
+            "frame": self.mark.frame,
+        })
+    }
+}
+
+/// Every mark, in time order, numbered the way the summary numbers them.
+pub fn mark_entries(bundle: &ScrawlBundle) -> Vec<MarkEntry<'_>> {
+    let mut entries: Vec<MarkEntry> = bundle
+        .marks
+        .iter()
+        .map(|mark| {
+            let frame = bundle.keyframes.iter().find(|k| mark_on_keyframe(mark, k));
+            let shown = frame
+                .map(|k| marks_on(k, &bundle.marks))
+                .unwrap_or_default();
+            let pos = shown.iter().position(|m| std::ptr::eq(*m, mark));
+            MarkEntry {
+                mark,
+                keyframe: frame.map(|k| k.index),
+                number: pos.map_or(1, |n| n + 1),
+                numbered: pos.is_some() && shown.len() >= 2,
+            }
+        })
+        .collect();
+    entries.sort_by_key(|e| e.mark.t0);
+    entries
+}
+
+/// The mark `query` names: its id (`m2`), or its number as the text shows it (`2` or `②`), on
+/// keyframe `keyframe` when given. A number on several keyframes needs the keyframe; numbers
+/// shown as ①②③ win over single, unnumbered marks.
+pub fn find_mark<'a>(
+    bundle: &'a ScrawlBundle,
+    query: &str,
+    keyframe: Option<usize>,
+) -> Result<MarkEntry<'a>, String> {
+    let entries = mark_entries(bundle);
+    let query = query.trim();
+    if let Some(entry) = entries.iter().find(|e| e.mark.id == query) {
+        return Ok(entry.clone());
+    }
+    let number = query
+        .parse::<usize>()
+        .ok()
+        .or_else(|| (1..=20).find(|&n| circled(n) == query))
+        .ok_or_else(|| format!("“{query}” is neither a mark number nor a mark id"))?;
+    let on_frame: Vec<&MarkEntry> = entries
+        .iter()
+        .filter(|e| e.number == number && keyframe.is_none_or(|k| e.keyframe == Some(k)))
+        .collect();
+    let shown: Vec<&MarkEntry> = on_frame.iter().copied().filter(|e| e.numbered).collect();
+    let candidates = if shown.is_empty() { on_frame } else { shown };
+    match candidates.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(match keyframe {
+            Some(k) => format!("Keyframe #{k} has no mark {}", circled(number)),
+            None => format!("No mark {} in this bundle", circled(number)),
+        }),
+        many => Err(format!(
+            "Mark {} is on several keyframes ({}); add --frame <N> or use the mark id",
+            circled(number),
+            many.iter().map(|e| e.line()).collect::<Vec<_>>().join("; ")
+        )),
+    }
 }
 
 fn normalized(text: &str) -> String {
@@ -542,14 +643,15 @@ fn quoted(text: &str) -> String {
     }
 }
 
+fn mark_label(mark: &Mark, number: Option<usize>) -> String {
+    let n = number.map(circled).unwrap_or_default();
+    format!("✎{n} {} {}", format_clock(mark.t0), mark_text(mark))
+}
+
 fn label(item: &Timed) -> String {
-    let clock = format_clock(item.t);
     match &item.item {
-        Item::Mark { mark, number } => {
-            let n = number.map(circled).unwrap_or_default();
-            format!("✎{n} {clock} {}", mark_text(mark))
-        }
-        Item::Event { text } => format!("· {clock} {text}"),
+        Item::Mark { mark, number } => mark_label(mark, *number),
+        Item::Event { text } => format!("· {} {text}", format_clock(item.t)),
     }
 }
 
@@ -841,6 +943,46 @@ mod tests {
     }
 
     #[test]
+    fn marks_are_found_by_their_number_in_the_text_or_their_id() {
+        let mut b = bundle(
+            Vec::new(),
+            vec![
+                keyframe(1, 3_000, KeyframeReason::Mark, ""),
+                keyframe(2, 9_000, KeyframeReason::Mark, ""),
+                keyframe(3, 15_000, KeyframeReason::Mark, ""),
+            ],
+        );
+        b.strokes = vec![
+            stroke(1_000, 0.1, 0.2),
+            stroke(3_000, 0.4, 0.5),
+            stroke(7_000, 0.6, 0.1),
+            stroke(9_000, 0.2, 0.8),
+            stroke(14_000, 0.5, 0.5),
+        ];
+        b.marks = crate::sketch::marks_of(&b.strokes);
+        assert_eq!(b.marks.len(), 5);
+        for (mark, frame) in b.marks.iter_mut().zip([1, 1, 2, 2, 3]) {
+            mark.frame = Some(format!("frames/frame-{frame:02}.png"));
+        }
+        for (k, first) in [(0, 0), (1, 2), (2, 4)] {
+            b.keyframes[k].mark_id = Some(b.marks[first].id.clone());
+        }
+        let found = |q: &str, k: Option<usize>| find_mark(&b, q, k).map(|e| e.mark.t0);
+        // ② is on #1 and #2: ambiguous without a keyframe.
+        assert!(found("2", None).unwrap_err().contains("--frame"));
+        assert_eq!(found("2", Some(2)), Ok(9_000));
+        assert_eq!(found("②", Some(1)), Ok(3_000));
+        // #3's single mark is unnumbered; --mark 1 --frame 3 still reaches it.
+        assert_eq!(found("1", Some(3)), Ok(14_000));
+        assert!(found("3", None).is_err());
+        let id = b.marks[3].id.clone();
+        assert_eq!(found(&id, None), Ok(9_000));
+        let entry = find_mark(&b, "2", Some(2)).unwrap();
+        assert!(entry.line().starts_with("#2 ✎② 0:09 "), "{}", entry.line());
+        assert_eq!(entry.json()["keyframe"], 2);
+    }
+
+    #[test]
     fn shortcuts_drags_and_windows_appear_inline_without_titles_or_jitter() {
         let said = "Okay, I hit command shift B. The whole window closes.";
         let mut b = bundle(
@@ -947,7 +1089,10 @@ mod tests {
         });
         let texts = keyframe_texts(&b);
         assert_eq!(texts[0].head, "[changed: the whole screen]");
-        assert_eq!(texts[1].head, "scene changed", "unnamed regions aren't listed");
+        assert_eq!(
+            texts[1].head, "scene changed",
+            "unnamed regions aren't listed"
+        );
         assert_eq!(
             texts[2].head, "scene changed",
             "clicks don't describe changes"

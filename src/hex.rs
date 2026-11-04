@@ -1,6 +1,6 @@
 //! Hex (the local dictation app) as an optional transcriber, through its desktop local API v2
-//! (`HEX_APPLICATION_SUPPORT_DIR` or `~/Library/Application Support/voice-control/local-api.json`
-//! holds the port and bearer token; `GET /health`, `GET /models`, `POST /transcriptions`).
+//! (`local-api.json` holds the port and bearer token, found through `support_dirs`: `hex` first,
+//! then the older `voice-control`; `GET /health`, `GET /models`, `POST /transcriptions`).
 //!
 //! Hex returns text and a duration but no word times, and Scrawl needs them to hand each
 //! keyframe its words. So the recording is cut into speech islands (`audio::speech_islands`),
@@ -32,7 +32,23 @@ pub const PREFERRED_MODELS: [&str; 4] = [
     "whisper_large_v3_turbo",
 ];
 
-const LANGUAGE: &str = "en";
+/// Keep the previous English default; Hex, not Scrawl, validates model/language support.
+pub const DEFAULT_LANGUAGE: &str = "en";
+
+/// Accept language-code syntax without maintaining another list of Hex's languages.
+/// Blank resets to English; disallow query delimiters before constructing the API URL.
+pub fn language_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(DEFAULT_LANGUAGE.into());
+    }
+    (value.len() <= 35
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && value.as_bytes()[0].is_ascii_alphabetic())
+    .then(|| value.to_ascii_lowercase())
+}
 const SAMPLE_RATE_KHZ: u64 = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const QUICK_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,21 +88,27 @@ struct Discovery {
     api_version: String,
 }
 
-/// Hex's support folder, as Hex's `app_paths::support_dir` resolves it: `~/Library/Application
-/// Support/voice-control` on macOS, `%APPDATA%\voice-control` on Windows.
-pub fn support_dir() -> PathBuf {
-    std::env::var_os("HEX_APPLICATION_SUPPORT_DIR")
+/// Where Hex may keep its data, in the order Scrawl tries them: `HEX_APPLICATION_SUPPORT_DIR`
+/// alone when set, else `hex` in the OS data folder (`~/Library/Application Support`,
+/// `%APPDATA%`, `$XDG_DATA_HOME` or `~/.local/share`), where Hex 3 keeps it on every OS, then
+/// `voice-control`, where older Hex kept it. Hex 3 leaves an old `voice-control` folder alone, so
+/// its stale files must never win over `hex`.
+pub fn support_dirs() -> Vec<PathBuf> {
+    if let Some(dir) = std::env::var_os("HEX_APPLICATION_SUPPORT_DIR")
         .map(PathBuf::from)
         .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("voice-control")
-        })
+    {
+        return vec![dir];
+    }
+    let data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    vec![data.join("hex"), data.join("voice-control")]
 }
 
-pub fn discovery_path() -> PathBuf {
-    support_dir().join("local-api.json")
+pub fn discovery_paths() -> Vec<PathBuf> {
+    support_dirs()
+        .into_iter()
+        .map(|dir| dir.join("local-api.json"))
+        .collect()
 }
 
 pub fn parse_discovery(bytes: &[u8]) -> Result<Endpoint> {
@@ -273,7 +295,23 @@ struct Transcription {
 impl Client {
     /// Connects to the running Hex, or says why it can't.
     pub fn connect() -> Result<Self> {
-        Self::connect_at(&discovery_path())
+        Ok(Self::connect_any(&discovery_paths())?.0)
+    }
+
+    /// The first discovery file whose Hex answers `/health`, and that file. A missing, unreadable
+    /// or stale file moves on to the next; when none answers, the first one's reason is returned.
+    pub fn connect_any(paths: &[PathBuf]) -> Result<(Self, PathBuf)> {
+        let mut first_error = None;
+        for path in paths {
+            match Self::connect_at(path) {
+                Ok(client) => return Ok((client, path.clone())),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error
+            .unwrap_or_else(|| anyhow::anyhow!("Hex is not running (no discovery file)")))
     }
 
     pub fn connect_at(path: &Path) -> Result<Self> {
@@ -331,11 +369,15 @@ impl Client {
     }
 
     /// One transcription request for a complete WAV.
-    pub fn transcribe(&self, wav: &[u8], model: &str) -> Result<String, Failure> {
+    pub fn transcribe(&self, wav: &[u8], model: &str, language: &str) -> Result<String, Failure> {
+        let language = language_code(language).ok_or_else(|| Failure::Rejected {
+            status: 400,
+            code: "invalid-language".into(),
+        })?;
         let response = request(
             &self.endpoint,
             "POST",
-            &format!("/transcriptions?model={model}&language={LANGUAGE}"),
+            &format!("/transcriptions?model={model}&language={language}"),
             wav,
             Timeouts {
                 read: TRANSCRIBE_READ_TIMEOUT,
@@ -358,10 +400,15 @@ impl Client {
         }
     }
 
-    fn transcribe_retrying(&self, wav: &[u8], model: &str) -> Result<String, Failure> {
+    fn transcribe_retrying(
+        &self,
+        wav: &[u8],
+        model: &str,
+        language: &str,
+    ) -> Result<String, Failure> {
         let mut delay = BUSY_BACKOFF;
         for _ in 0..BUSY_RETRIES {
-            match self.transcribe(wav, model) {
+            match self.transcribe(wav, model, language) {
                 Err(Failure::Busy) => {
                     std::thread::sleep(delay);
                     delay *= 2;
@@ -369,7 +416,7 @@ impl Client {
                 other => return other,
             }
         }
-        self.transcribe(wav, model)
+        self.transcribe(wav, model, language)
     }
 }
 
@@ -405,8 +452,8 @@ pub fn refresh_in_background() {
     }
 }
 
-/// Keeps `cached_status` fresh while the app runs. A missing discovery file makes each check a
-/// single failed file read.
+/// Keeps `cached_status` fresh while the app runs, so a Hex started after Scrawl is found. A
+/// missing discovery file makes each check a failed file read per folder.
 pub fn watch() {
     let _ = std::thread::Builder::new()
         .name("scrawl-hex-watch".into())
@@ -554,6 +601,7 @@ pub fn transcribe_clips(
 pub fn transcribe_audio(
     client: &Client,
     model: &str,
+    language: &str,
     audio: &RecordedAudio,
 ) -> Result<TranscriptData> {
     let samples = audio::decode_wav_16k(&audio.wav_bytes)?;
@@ -564,7 +612,7 @@ pub fn transcribe_audio(
         clips.push((0, duration_ms));
     }
     transcribe_clips(&samples, &clips, model, |wav| {
-        client.transcribe_retrying(wav, model)
+        client.transcribe_retrying(wav, model, language)
     })
 }
 
@@ -724,6 +772,69 @@ mod tests {
     }
 
     #[test]
+    fn hex_folder_wins_and_voice_control_is_the_fallback() {
+        let root = std::env::temp_dir().join(format!("scrawl-hex-dirs-{}", std::process::id()));
+        let (hex, legacy) = (root.join("hex"), root.join("voice-control"));
+        let paths = [hex.join("local-api.json"), legacy.join("local-api.json")];
+        let health = |version: &'static str| {
+            fake_hex(move |_, path, authorized| match (path, authorized) {
+                ("/health", true) => (
+                    200,
+                    format!(r#"{{"version":"{version}","apiVersion":"2"}}"#),
+                ),
+                _ => (401, String::new()),
+            })
+        };
+        let (new, old) = (health("3.0.0"), health("2.3.1"));
+        let stale = {
+            let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            closed.local_addr().unwrap().port()
+        };
+        let reset = || {
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&hex).unwrap();
+            std::fs::create_dir_all(&legacy).unwrap();
+        };
+        let write = |dir: &Path, port: u16| {
+            std::fs::write(
+                dir.join("local-api.json"),
+                format!(r#"{{"port":{port},"token":"secret-token","apiVersion":"2"}}"#),
+            )
+            .unwrap();
+        };
+        let connected = || {
+            let (client, path) = Client::connect_any(&paths).unwrap();
+            (client.health().unwrap(), path)
+        };
+
+        reset();
+        assert!(Client::connect_any(&paths).is_err());
+
+        write(&hex, new.port);
+        assert_eq!(connected(), ("3.0.0".into(), paths[0].clone()));
+
+        reset();
+        write(&legacy, old.port);
+        assert_eq!(connected(), ("2.3.1".into(), paths[1].clone()));
+
+        write(&hex, new.port);
+        assert_eq!(connected(), ("3.0.0".into(), paths[0].clone()));
+
+        write(&hex, stale);
+        assert_eq!(connected(), ("2.3.1".into(), paths[1].clone()));
+
+        std::fs::write(&paths[0], "not json").unwrap();
+        assert_eq!(connected(), ("2.3.1".into(), paths[1].clone()));
+
+        // Both stale: the hex folder's reason is reported, never the token.
+        write(&legacy, stale);
+        let error = format!("{:#}", Client::connect_any(&paths).unwrap_err());
+        assert!(error.contains("not valid"), "{error}");
+        assert!(!error.contains("secret-token"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn models_must_be_installed_and_verified_and_default_order_wins() {
         let models = vec![
             model("parakeet_v3", true, true),
@@ -749,6 +860,50 @@ mod tests {
     }
 
     #[test]
+    fn language_is_sent_to_hex_without_injecting_query_parameters() {
+        let fake = fake_hex(|_, _, _| (200, r#"{"transcript":"tekst"}"#.into()));
+        for language in ["nl", "auto", "en"] {
+            client(fake.port)
+                .transcribe(b"RIFF", "m", language)
+                .unwrap();
+        }
+        let paths: Vec<_> = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/transcriptions?model=m&language=nl",
+                "/transcriptions?model=m&language=auto",
+                "/transcriptions?model=m&language=en",
+            ]
+        );
+        assert!(
+            client(fake.port)
+                .transcribe(b"RIFF", "m", "nl&language=en")
+                .is_err()
+        );
+        assert_eq!(fake.requests.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn language_codes_allow_future_languages_but_not_url_syntax() {
+        assert_eq!(language_code("").as_deref(), Some("en"));
+        assert_eq!(language_code(" NL ").as_deref(), Some("nl"));
+        assert_eq!(
+            language_code("new-Language").as_deref(),
+            Some("new-language")
+        );
+        for invalid in ["nl&x=y", "nl?", "en\r\nInjected", "*", "1", "two words"] {
+            assert!(language_code(invalid).is_none(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn busy_is_retried_and_other_refusals_are_not() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
@@ -762,22 +917,31 @@ mod tests {
                 )
             }
         });
-        let text = client(fake.port).transcribe_retrying(b"RIFF", "m").unwrap();
+        let text = client(fake.port)
+            .transcribe_retrying(b"RIFF", "m", "nl")
+            .unwrap();
         assert_eq!(text, "hello there");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         let (method, path, length) = fake.requests.lock().unwrap()[0].clone();
         assert_eq!(method, "POST");
-        assert_eq!(path, "/transcriptions?model=m&language=en");
+        assert_eq!(path, "/transcriptions?model=m&language=nl");
         assert_eq!(length, 4);
+        assert!(
+            fake.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, path, _)| path == "/transcriptions?model=m&language=nl")
+        );
 
         let refused = fake_hex(|_, _, _| (409, r#"{"code":"model-not-ready"}"#.into()));
         assert!(matches!(
-            client(refused.port).transcribe(b"x", "m"),
+            client(refused.port).transcribe(b"x", "m", "en"),
             Err(Failure::Unavailable(_))
         ));
         let bad = fake_hex(|_, _, _| (400, r#"{"code":"invalid-audio"}"#.into()));
         assert!(matches!(
-            client(bad.port).transcribe(b"x", "m"),
+            client(bad.port).transcribe(b"x", "m", "en"),
             Err(Failure::Rejected { status: 400, .. })
         ));
     }
@@ -909,7 +1073,7 @@ mod tests {
             wav_bytes: audio::encode_wav_16k(&samples).unwrap(),
             live: Default::default(),
         };
-        let transcript = transcribe_audio(&client(fake.port), "parakeet_v3", &audio).unwrap();
+        let transcript = transcribe_audio(&client(fake.port), "parakeet_v3", "en", &audio).unwrap();
         assert_eq!(fake.requests.lock().unwrap().len(), 2);
         assert_eq!(transcript.words.len(), 6);
         assert!(

@@ -325,17 +325,20 @@ pub enum ElemId {
     Record = 6,
     DividerClose = 7,
     Close = 8,
-    Undo = 9,
-    Cancel = 10,
-    Finish = 11,
-    Processing = 12,
-    DoneLead = 13,
-    Paste = 14,
-    Inspect = 15,
+    Cancel = 9,
+    Finish = 10,
+    Processing = 11,
+    DoneLead = 12,
+    Paste = 13,
+    Inspect = 14,
+    /// The Completed island's sessions one click away (smart routing).
+    Route0 = 15,
+    Route1 = 16,
 }
 
 impl ElemId {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
+    pub const ROUTES: [ElemId; 2] = [Self::Route0, Self::Route1];
     pub const ALL: [ElemId; Self::COUNT] = [
         Self::Lead,
         Self::DividerLead,
@@ -346,13 +349,14 @@ impl ElemId {
         Self::Record,
         Self::DividerClose,
         Self::Close,
-        Self::Undo,
         Self::Cancel,
         Self::Finish,
         Self::Processing,
         Self::DoneLead,
         Self::Paste,
         Self::Inspect,
+        Self::Route0,
+        Self::Route1,
     ];
 
     pub const fn trace_key(self) -> &'static str {
@@ -366,13 +370,14 @@ impl ElemId {
             Self::Record => "record",
             Self::DividerClose => "divider.close",
             Self::Close => "close",
-            Self::Undo => "undo",
             Self::Cancel => "cancel",
             Self::Finish => "finish",
             Self::Processing => "processing",
             Self::DoneLead => "done.lead",
             Self::Paste => "paste",
             Self::Inspect => "inspect",
+            Self::Route0 => "route:0",
+            Self::Route1 => "route:1",
         }
     }
 
@@ -412,20 +417,12 @@ impl ElemId {
             Self::ChipIphone => "iPhone",
             Self::Record => "Record",
             Self::Close | Self::Cancel => "Cancel",
-            Self::Undo => "Undo",
             Self::Finish => "Finish",
             Self::Processing => "Processing",
             Self::DoneLead => "Completed",
             Self::Paste => "Paste",
             Self::Inspect => "Inspect",
-        }
-    }
-
-    /// Keyboard shortcut hint (`"Esc"` on the `✕` cancel chip and `"Cancel"` chip).
-    pub const fn shortcut_hint(self) -> Option<&'static str> {
-        match self {
-            Self::Close | Self::Cancel => Some("Esc"),
-            _ => None,
+            Self::Route0 | Self::Route1 => "Send to session",
         }
     }
 }
@@ -436,22 +433,22 @@ pub enum Pres {
     Recording {
         chips: bool,
         has_iphone: bool,
-        stroke_count: usize,
     },
     Selecting {
         mode: SelectionMode,
-        hold: bool,
         has_iphone: bool,
     },
     Processing,
+    /// `routes`: the labels of sessions offered one click away, beside Paste.
     Completed {
         label: String,
+        routes: Vec<String>,
     },
 }
 
 impl Pres {
     /// Whether two presentations share the same geometry/layout structure (ignoring minor state
-    /// like `stroke_count` or active mode highlight when `shows_record` doesn't change).
+    /// like the active mode highlight when `shows_record` doesn't change).
     pub fn same_layout(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Hidden, Self::Hidden) | (Self::Processing, Self::Processing) => true,
@@ -459,31 +456,32 @@ impl Pres {
                 Self::Recording {
                     chips: a,
                     has_iphone: ia,
-                    ..
                 },
                 Self::Recording {
                     chips: b,
                     has_iphone: ib,
-                    ..
                 },
             ) => a == b && (ia == ib || !*a),
             (
                 Self::Selecting {
                     mode: ma,
-                    hold: ha,
                     has_iphone: ia,
                 },
                 Self::Selecting {
                     mode: mb,
-                    hold: hb,
                     has_iphone: ib,
                 },
-            ) => {
-                ha == hb
-                    && (ia == ib || *ha)
-                    && ((*ma).shows_record() && !*ha) == ((*mb).shows_record() && !*hb)
-            }
-            (Self::Completed { label: a }, Self::Completed { label: b }) => a == b,
+            ) => ia == ib && ma.shows_record() == mb.shows_record(),
+            (
+                Self::Completed {
+                    label: a,
+                    routes: ra,
+                },
+                Self::Completed {
+                    label: b,
+                    routes: rb,
+                },
+            ) => a == b && ra == rb,
             _ => false,
         }
     }
@@ -497,7 +495,6 @@ pub struct Metrics {
     pub screen: f32,
     pub iphone: f32,
     pub record: f32,
-    pub undo: f32,
     pub cancel: f32,
     pub finish: f32,
     pub processing: f32,
@@ -515,7 +512,6 @@ impl Default for Metrics {
             screen: 44.0,
             iphone: 43.0,
             record: 46.0,
-            undo: 34.0,
             cancel: 44.0,
             finish: 38.0,
             processing: 78.0,
@@ -592,11 +588,27 @@ impl Layout {
     }
 }
 
+/// Widths of the Completed island's changing labels, measured as their sprites are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LabelWidths {
+    pub completed: f32,
+    pub routes: [f32; 2],
+}
+
+impl Default for LabelWidths {
+    fn default() -> Self {
+        Self {
+            completed: 46.0,
+            routes: [0.0; 2],
+        }
+    }
+}
+
 /// Computes the resting capsule bounds and item boxes for `pres`.
 pub fn layout_of(
     pres: &Pres,
     clock: &str,
-    completed_label_w: f32,
+    labels: LabelWidths,
     m: &Metrics,
 ) -> (Layout, Vec<LayoutItem>) {
     let y0 = TOP + ISLAND_INSET;
@@ -606,12 +618,8 @@ pub fn layout_of(
         Pres::Hidden => {
             return (Layout::centered(IDLE_W, IDLE_H), Vec::new());
         }
-        Pres::Selecting {
-            mode,
-            hold,
-            has_iphone,
-        } => {
-            for &seg in SelectionMode::available(*has_iphone || *hold) {
+        Pres::Selecting { mode, has_iphone } => {
+            for &seg in SelectionMode::available(*has_iphone) {
                 raw.push((
                     ElemId::from_mode(seg),
                     m.segment_width(seg),
@@ -620,7 +628,7 @@ pub fn layout_of(
                     true,
                 ));
             }
-            if mode.shows_record() && !*hold {
+            if mode.shows_record() {
                 raw.push((
                     ElemId::Record,
                     Metrics::chip_width(m.record),
@@ -632,11 +640,7 @@ pub fn layout_of(
             raw.push((ElemId::DividerClose, DIVIDER_W, 0.0, 0.0, false));
             raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
         }
-        Pres::Recording {
-            chips,
-            has_iphone,
-            stroke_count,
-        } => {
+        Pres::Recording { chips, has_iphone } => {
             let clock_w = m.clock_width(clock);
             let lead_w = CHIP_H + clock_w + LEAD_TRAIL;
             raw.push((ElemId::Lead, lead_w, CHIP_CORE_ROUND, 0.0, true));
@@ -654,13 +658,6 @@ pub fn layout_of(
                 raw.push((ElemId::DividerClose, DIVIDER_W, 0.0, 0.0, false));
                 raw.push((ElemId::Close, CHIP_H, CHIP_CORE_ROUND, 0.0, true));
             } else {
-                raw.push((
-                    ElemId::Undo,
-                    Metrics::chip_width(m.undo),
-                    CHIP_CORE_ROUND,
-                    0.0,
-                    *stroke_count > 0,
-                ));
                 raw.push((
                     ElemId::Cancel,
                     Metrics::chip_width(m.cancel),
@@ -681,8 +678,8 @@ pub fn layout_of(
             let w = CHIP_H + 6.0 + m.processing + CHIP_PX;
             raw.push((ElemId::Processing, w, CHIP_CORE_ROUND, 0.0, false));
         }
-        Pres::Completed { .. } => {
-            let lead_w = CHIP_H + 8.0 + completed_label_w + LEAD_TRAIL;
+        Pres::Completed { routes, .. } => {
+            let lead_w = CHIP_H + 8.0 + labels.completed + LEAD_TRAIL;
             raw.push((ElemId::DoneLead, lead_w, CHIP_CORE_ROUND, 0.0, true));
             raw.push((ElemId::DividerLead, DIVIDER_W, 0.0, 0.0, false));
             raw.push((
@@ -692,6 +689,15 @@ pub fn layout_of(
                 0.0,
                 true,
             ));
+            for (i, id) in ElemId::ROUTES.into_iter().enumerate().take(routes.len()) {
+                raw.push((
+                    id,
+                    Metrics::chip_width(labels.routes[i]),
+                    CHIP_CORE_ROUND,
+                    0.0,
+                    true,
+                ));
+            }
             raw.push((
                 ElemId::Inspect,
                 Metrics::chip_width(m.inspect),
@@ -703,8 +709,8 @@ pub fn layout_of(
         }
     }
 
-    let inner_w: f32 =
-        raw.iter().map(|(_, w, ..)| *w).sum::<f32>() + raw.len().saturating_sub(1) as f32 * CHIP_GAP;
+    let inner_w: f32 = raw.iter().map(|(_, w, ..)| *w).sum::<f32>()
+        + raw.len().saturating_sub(1) as f32 * CHIP_GAP;
     let outer_w = inner_w + 2.0 * ISLAND_INSET;
     let lay = Layout::centered(outer_w, ISLAND_H);
     let last = raw.len().saturating_sub(1);
@@ -832,7 +838,7 @@ pub struct PillModel {
     pub hovered: Option<ElemId>,
     pub pressed: Option<ElemId>,
     pub clock: String,
-    pub completed_label_w: f32,
+    pub labels: LabelWidths,
     pub metrics: Metrics,
 }
 
@@ -862,7 +868,7 @@ impl PillModel {
             hovered: None,
             pressed: None,
             clock: "0:00".to_owned(),
-            completed_label_w: 46.0,
+            labels: LabelWidths::default(),
             metrics,
         }
     }
@@ -876,9 +882,8 @@ impl PillModel {
         let was_visible = !matches!(self.pres, Pres::Hidden);
         let now_hidden = matches!(next, Pres::Hidden);
         let (prev_lay, prev_items) =
-            layout_of(&self.geo_pres, &self.clock, self.completed_label_w, &self.metrics);
-        let (next_lay, next_items) =
-            layout_of(&next, &self.clock, self.completed_label_w, &self.metrics);
+            layout_of(&self.geo_pres, &self.clock, self.labels, &self.metrics);
+        let (next_lay, next_items) = layout_of(&next, &self.clock, self.labels, &self.metrics);
 
         // Update element metadata for the new presentation immediately (e.g. highlight or enabled state).
         if !now_hidden {
@@ -925,10 +930,11 @@ impl PillModel {
         let next = self.pres.clone();
         let landing_idle = matches!(next, Pres::Hidden);
         let from_hidden = !landing_idle
-            && (self.shell_alpha.x < 0.02 || matches!(self.geo_pres, Pres::Hidden) && self.shell_alpha.x < 0.08);
+            && (self.shell_alpha.x < 0.02
+                || matches!(self.geo_pres, Pres::Hidden) && self.shell_alpha.x < 0.08);
         self.entering_from_hidden = from_hidden;
         self.geo_pres = next.clone();
-        let (lay, items) = layout_of(&next, &self.clock, self.completed_label_w, &self.metrics);
+        let (lay, items) = layout_of(&next, &self.clock, self.labels, &self.metrics);
 
         if from_hidden && !self.reduced {
             // Entry in place (no lozenge growth): snap width/height to the entering state's layout
@@ -1009,8 +1015,8 @@ impl PillModel {
                 // Visible state-to-state width-led morph (`≤ 350 ms` settled, velocity preserved).
                 let dw = (lay.l - before_l).abs().max((lay.r - before_r).abs());
                 let dh = (lay.b - before_b).abs();
-                let opening = lay.width() * lay.height()
-                    >= (before_r - before_l) * (before_b - TOP) - 1.0;
+                let opening =
+                    lay.width() * lay.height() >= (before_r - before_l) * (before_b - TOP) - 1.0;
                 let base = if opening { OPEN_SPRING } else { CLOSE_SPRING };
                 let f = (dw.hypot(dh) / REF_DIST).clamp(0.0, 1.0);
                 let dur = (base.duration * mix(DISTANCE_FLOOR, 1.0, f)).max(0.14);
@@ -1075,13 +1081,15 @@ impl PillModel {
         }
     }
 
-    pub fn set_completed_label(&mut self, label: String, label_w: f32) {
-        let width_changed = (self.completed_label_w - label_w).abs() > 0.5;
-        self.completed_label_w = label_w;
-        if let Pres::Completed { label: ref cur } = self.pres
-            && (*cur != label || width_changed)
-        {
-            self.pres = Pres::Completed { label };
+    /// Takes the Completed island's measured label widths; a change while it shows re-lays it
+    /// out smoothly.
+    /// `next` is the presentation about to be set: when it's already showing, only the widths
+    /// changed and the layout follows them now; otherwise `set_pres` lays it out.
+    pub fn set_label_widths(&mut self, labels: LabelWidths, next: &Pres) {
+        let changed = (self.labels.completed - labels.completed).abs() > 0.5
+            || (0..2).any(|i| (self.labels.routes[i] - labels.routes[i]).abs() > 0.5);
+        self.labels = labels;
+        if changed && self.pres == *next && matches!(next, Pres::Completed { .. }) {
             self.apply_geometry();
         }
     }
@@ -1114,7 +1122,7 @@ impl PillModel {
         if matches!(self.pres, Pres::Hidden) {
             return false;
         }
-        let (lay, _) = layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (lay, _) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
         let slop = 6.0;
         x >= lay.l - slop && x <= lay.r + slop && y >= lay.t - slop && y <= lay.b + slop
     }
@@ -1124,7 +1132,7 @@ impl PillModel {
         if matches!(self.pres, Pres::Hidden) {
             return None;
         }
-        let (_, items) = layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (_, items) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
         for item in &items {
             if !item.id.is_interactive() || !item.enabled {
                 continue;
@@ -1249,8 +1257,7 @@ impl PillModel {
             self.press.snap(0.0);
             self.squish.snap(0.0);
             self.shell_scale.snap(1.0);
-            self.shell_alpha
-                .step_critical(dt, REDUCED_FADE_S, 100.0);
+            self.shell_alpha.step_critical(dt, REDUCED_FADE_S, 100.0);
             self.shell_blur.snap(0.0);
             self.dis = (self.dis + dt / REDUCED_FADE_S).min(1.0);
             if self.dis >= 1.0 {
@@ -1286,10 +1293,8 @@ impl PillModel {
         };
         let settled_geo = self.geo_pres == self.pres;
         let grown = self.grown_enough();
-        let (_, geo_items) =
-            layout_of(&self.geo_pres, &self.clock, self.completed_label_w, &self.metrics);
-        let (_, active_items) =
-            layout_of(&self.pres, &self.clock, self.completed_label_w, &self.metrics);
+        let (_, geo_items) = layout_of(&self.geo_pres, &self.clock, self.labels, &self.metrics);
+        let (_, active_items) = layout_of(&self.pres, &self.clock, self.labels, &self.metrics);
 
         let inn = if reduced {
             SpringCfg::new(REDUCED_FADE_S, 0.0)
@@ -1302,6 +1307,15 @@ impl PillModel {
             CONTENT_OUT_SPRING
         };
 
+        // Boxes of shared items still travelling: a session chip inserted between them waits until
+        // they've cleared its spot, so it never fades in underneath one.
+        let movers: Vec<[f32; 4]> = ElemId::ALL
+            .iter()
+            .map(|id| &self.elems[*id as usize])
+            .filter(|st| st.travelling && st.a.x > 0.03)
+            .map(|st| [st.x.x, st.y.x, st.w, st.h])
+            .collect();
+
         for id in ElemId::ALL {
             let idx = id as usize;
             let in_active = active_items.iter().any(|item| item.id == id);
@@ -1313,10 +1327,8 @@ impl PillModel {
             let is_pressed = self.pressed == Some(id);
 
             let st = &mut self.elems[idx];
-            st.hover.to(
-                f32::from(u8::from(is_hovered)),
-                SpringCfg::new(0.14, 0.0),
-            );
+            st.hover
+                .to(f32::from(u8::from(is_hovered)), SpringCfg::new(0.14, 0.0));
             st.press.to(
                 f32::from(u8::from(is_pressed)),
                 SpringCfg::new(if is_pressed { 0.10 } else { 0.20 }, 0.0),
@@ -1380,10 +1392,14 @@ impl PillModel {
             let d = box_clearance(&now, box_rect, k, st.round, [CX, TOP], dy);
             let d_rest = box_clearance(&now, box_rect, k_shell, st.round, [CX, TOP], 0.0);
 
+            let covered = ElemId::ROUTES.contains(&id)
+                && movers
+                    .iter()
+                    .any(|m| m[0] < box_rect[0] + box_rect[2] && box_rect[0] < m[0] + m[2]);
             let gate = reduced
                 || st.travelling
                 || st.want
-                || (settled_geo && grown && d_rest >= CLEAR + EDGE_BAND - 0.8);
+                || (settled_geo && grown && !covered && d_rest >= CLEAR + EDGE_BAND - 0.8);
             let want = in_pres && gate;
             if st.want != want {
                 st.want = want;
@@ -1407,10 +1423,7 @@ impl PillModel {
                 CONTENT_STAGGER_S * from_cap as f32 * 0.5
             };
             if self.t - st.want_since >= turn - 1e-6 {
-                st.a.to(
-                    f32::from(u8::from(want)),
-                    if want { inn } else { out },
-                );
+                st.a.to(f32::from(u8::from(want)), if want { inn } else { out });
             }
             let on = st.a.target >= 0.5;
             st.a.step(dt);
@@ -1619,20 +1632,14 @@ mod tests {
     /// Independent rounded-rect inside distance check (from `island/model.test.js`), written
     /// without sharing `outline_sdf` or `box_clearance` with the implementation under test.
     fn independent_inside(sh: &Silhouette, x: f32, y: f32) -> f32 {
-        let r = sh
-            .radius
-            .min((sh.r - sh.l) * 0.5)
-            .min((sh.b - sh.t) * 0.5);
+        let r = sh.radius.min((sh.r - sh.l) * 0.5).min((sh.b - sh.t) * 0.5);
         let nx = x.clamp(sh.l + r, sh.r - r);
         let ny = y.clamp(sh.t + r, sh.b - r);
         let from_core = (x - nx).hypot(y - ny);
         if from_core > 0.0 {
             r - from_core
         } else {
-            (x - sh.l)
-                .min(sh.r - x)
-                .min(y - sh.t)
-                .min(sh.b - y)
+            (x - sh.l).min(sh.r - x).min(y - sh.t).min(sh.b - y)
         }
     }
 
@@ -1687,14 +1694,12 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
                     1.2,
                     Pres::Selecting {
                         mode: SelectionMode::Area,
-                        hold: false,
                         has_iphone: false,
                     },
                 ),
@@ -1707,14 +1712,12 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
                     1.2,
                     Pres::Selecting {
                         mode: SelectionMode::Window,
-                        hold: false,
                         has_iphone: false,
                     },
                 ),
@@ -1727,7 +1730,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -1735,54 +1737,41 @@ mod tests {
                     Pres::Recording {
                         chips: false,
                         has_iphone: false,
-                        stroke_count: 1,
                     },
                 ),
                 (2.4, Pres::Hidden),
             ],
-            // hold-switcher
+            // picker
             vec![
                 (
                     0.0,
                     Pres::Selecting {
                         mode: SelectionMode::Screen,
-                        hold: true,
-                        has_iphone: true,
+                        has_iphone: false,
                     },
                 ),
                 (
-                    0.6,
+                    0.9,
                     Pres::Selecting {
-                        mode: SelectionMode::Window,
-                        hold: true,
-                        has_iphone: true,
-                    },
-                ),
-                (
-                    1.2,
-                    Pres::Selecting {
-                        mode: SelectionMode::Iphone,
-                        hold: true,
-                        has_iphone: true,
+                        mode: SelectionMode::Area,
+                        has_iphone: false,
                     },
                 ),
                 (
                     1.8,
                     Pres::Selecting {
                         mode: SelectionMode::Screen,
-                        hold: true,
-                        has_iphone: true,
+                        has_iphone: false,
                     },
                 ),
                 (
-                    2.4,
+                    2.7,
                     Pres::Recording {
                         chips: false,
-                        has_iphone: true,
-                        stroke_count: 0,
+                        has_iphone: false,
                     },
                 ),
-                (3.6, Pres::Hidden),
+                (3.9, Pres::Hidden),
             ],
             // finish
             vec![
@@ -1791,7 +1780,6 @@ mod tests {
                     Pres::Recording {
                         chips: true,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (
@@ -1799,7 +1787,6 @@ mod tests {
                     Pres::Recording {
                         chips: false,
                         has_iphone: false,
-                        stroke_count: 0,
                     },
                 ),
                 (2.0, Pres::Processing),
@@ -1807,6 +1794,7 @@ mod tests {
                     2.8,
                     Pres::Completed {
                         label: "Copied".into(),
+                        routes: Vec::new(),
                     },
                 ),
                 (4.2, Pres::Hidden),
@@ -1842,18 +1830,20 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         for _ in 0..8 {
             m.advance(FRAME_DT);
         }
         let before = (m.l.x, m.l.v, m.r.x, m.r.v, m.b.x, m.b.v);
-        assert!(before.3 > 50.0, "expected active outward velocity, got {}", before.3);
+        assert!(
+            before.3 > 50.0,
+            "expected active outward velocity, got {}",
+            before.3
+        );
 
         // Retarget mid-expansion to Selecting(Area): position and velocity must carry over unchanged.
         m.set_pres(Pres::Selecting {
             mode: SelectionMode::Area,
-            hold: false,
             has_iphone: false,
         });
         assert_eq!((m.l.x, m.l.v, m.r.x, m.r.v, m.b.x, m.b.v), before);
@@ -1871,26 +1861,23 @@ mod tests {
             Pres::Recording {
                 chips: true,
                 has_iphone: false,
-                stroke_count: 0,
             },
             Pres::Recording {
                 chips: false,
                 has_iphone: false,
-                stroke_count: 2,
             },
             Pres::Selecting {
                 mode: SelectionMode::Area,
-                hold: false,
                 has_iphone: false,
             },
             Pres::Selecting {
                 mode: SelectionMode::Screen,
-                hold: false,
                 has_iphone: true,
             },
             Pres::Processing,
             Pres::Completed {
                 label: "Copied".into(),
+                routes: Vec::new(),
             },
         ];
 
@@ -1941,7 +1928,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let mut saw_sharp_before_opaque = false;
         for _ in 0..120 {
@@ -1961,7 +1947,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: false,
             has_iphone: false,
-            stroke_count: 0,
         });
         let mut peak_travel_blur = 0.0_f32;
         for _ in 0..120 {
@@ -1985,16 +1970,12 @@ mod tests {
     }
 
     #[test]
-    fn outline_width_bounces_on_open_and_close_chip_has_esc_hint() {
-        assert_eq!(ElemId::Close.shortcut_hint(), Some("Esc"));
-        assert_eq!(ElemId::Cancel.shortcut_hint(), Some("Esc"));
-
+    fn outline_width_bounces_on_open_and_close() {
         // 1. Entry from Hidden (`~0.94` scale + `~4 pt` blur -> sharp `1.0` in ≤ 260 ms, no lozenge).
         let mut m = PillModel::new(Metrics::default());
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let target_w = m.r.target - m.l.target;
         m.advance(FRAME_DT);
@@ -2004,7 +1985,10 @@ mod tests {
             "entry should start at ~0.94 scale of target width (not a narrow lozenge), got {}",
             f0.shape.width()
         );
-        assert!(f0.shape.blur > SHELL_BLUR_MAX * 0.6, "expected blurred shell on entry start");
+        assert!(
+            f0.shape.blur > SHELL_BLUR_MAX * 0.6,
+            "expected blurred shell on entry start"
+        );
 
         for _ in 0..60 {
             m.advance(FRAME_DT);
@@ -2018,6 +2002,7 @@ mod tests {
         }
         m.set_pres(Pres::Completed {
             label: "Copied".into(),
+            routes: Vec::new(),
         });
         let done_target_w = m.r.target - m.l.target;
         let mut max_w = 0.0_f32;
@@ -2070,7 +2055,6 @@ mod tests {
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         let target_w = m.r.target - m.l.target;
         let mut first: Vec<(ElemId, f32)> = Vec::new();
@@ -2100,13 +2084,33 @@ mod tests {
     }
 
     #[test]
+    fn recording_controls_are_cancel_and_finish() {
+        let pres = Pres::Recording {
+            chips: false,
+            has_iphone: false,
+        };
+        let (layout, items) = layout_of(&pres, "0:00", LabelWidths::default(), &Metrics::default());
+        let ids: Vec<ElemId> = items.iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ElemId::Lead,
+                ElemId::DividerLead,
+                ElemId::Cancel,
+                ElemId::Finish
+            ]
+        );
+        let last = items.last().unwrap().rect;
+        assert!((layout.r - (last[0] + last[2]) - ISLAND_INSET).abs() < 0.5);
+    }
+
+    #[test]
     fn reduce_motion_dissolves_without_travel() {
         let mut m = PillModel::new(Metrics::default());
         m.reduced = true;
         m.set_pres(Pres::Recording {
             chips: true,
             has_iphone: false,
-            stroke_count: 0,
         });
         for _ in 0..60 {
             m.advance(FRAME_DT);
@@ -2114,7 +2118,6 @@ mod tests {
         let w0 = m.frame().shape.width();
         m.set_pres(Pres::Selecting {
             mode: SelectionMode::Area,
-            hold: false,
             has_iphone: false,
         });
         m.advance(FRAME_DT);

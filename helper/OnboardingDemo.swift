@@ -5,7 +5,7 @@ import SwiftUI
 // The how-it-works screen's demo: a silent loop on a pretend checkout page with a button that
 // runs out of its window. ⌥⇧S opens the pill, words appear as if spoken, ⇧ draws a red mark
 // around the bug, a click points at the edge it should match, ⌥⇧S finishes, the frame lifts off
-// with its `#1 0:03` badge, ⌥⇧V drops it into an agent chat and the agent fixes the button.
+// with its `1` chip, ⌥⇧V drops it into an agent chat and the agent fixes the button.
 //
 // Everything on the stage is a function of one clock (`DemoScript`), so a frame at any time can
 // be rendered (`--render`) and the loop always looks the same. Holding ⇧ over the stage pauses
@@ -386,7 +386,7 @@ struct DemoScene {
   }
 
   /// The captured frame: it starts exactly over the page, then lifts off as a one-frame contact
-  /// sheet (dark margin, `#1 0:03` badge) and travels into the agent's chat.
+  /// sheet (dark margin, `1` chip) and travels into the agent's chat.
   func drawFrame(_ ctx: inout GraphicsContext, in rect: CGRect) {
     let s = DemoScript.self
     let lift = springStep(t, s.finish, 0.38)
@@ -409,17 +409,14 @@ struct DemoScene {
         ink.stroke(DemoGeo.markPath(upTo: 1).offsetBy(dx: -DemoGeo.app.minX, dy: -DemoGeo.app.minY),
                    with: .color(Palette.ink), style: StrokeStyle(lineWidth: 3.2, lineCap: .round, lineJoin: .round))
       }
-      // The badge: white #N keycap and dark clock in the top left corner.
+      // The keyframe's number in a small white chip with a thin dark ring, top left, like render.rs.
       let badge = ramp(t, s.finish + 0.1, s.finish + 0.3)
       if badge > 0 {
         layer.opacity = badge
-        let key = CGRect(x: 4, y: 3, width: 25, height: 17)
-        let clock = CGRect(x: key.midX, y: 3, width: 48, height: 17)
-        layer.fill(Path(roundedRect: clock, cornerRadius: 8.5, style: .continuous), with: .color(Color(white: 0.08)))
-        layer.fill(Path(roundedRect: key, cornerRadius: 4, style: .continuous), with: .color(.white))
-        layer.draw(Text("#1").font(.system(size: 10, weight: .bold, design: .rounded)).foregroundColor(.black), at: CGPoint(x: key.midX, y: key.midY))
-        let clockText = CGRect(x: key.maxX, y: 3, width: clock.maxX - key.maxX, height: 17)
-        layer.draw(Text("0:03").font(.system(size: 10, weight: .semibold).monospacedDigit()).foregroundColor(.white), at: CGPoint(x: clockText.midX, y: clockText.midY))
+        let chip = CGRect(x: 4, y: 4, width: 15, height: 15)
+        layer.fill(Path(roundedRect: chip.insetBy(dx: -1.2, dy: -1.2), cornerRadius: 4.2, style: .continuous), with: .color(Color(white: 0.07)))
+        layer.fill(Path(roundedRect: chip, cornerRadius: 3, style: .continuous), with: .color(Color(white: 0.98)))
+        layer.draw(Text("1").font(.system(size: 10, weight: .bold)).foregroundColor(Color(white: 0.07)), at: CGPoint(x: chip.midX, y: chip.midY))
       }
     }
   }

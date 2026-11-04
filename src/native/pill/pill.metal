@@ -182,8 +182,6 @@ struct PillUniforms {
     float4 shape_meta;     // radius, alpha, blur, is_glass (1.0 = glass, 0.0 = black)
     float4 ghost_rect;     // l, t, r, b in panel points
     float4 ghost_meta;     // radius, alpha, 0, 0
-    float4 hint_rect;      // x, y, w, h of optional "Esc" badge below capsule (w == 0 when off)
-    float4 hint_uv;        // u0, v0, u1, v1 of "Esc" label in atlas
 };
 
 struct ScreenVertexOut {
@@ -219,8 +217,7 @@ fragment float4 pill_composite_fragment(
     ScreenVertexOut in [[stage_in]],
     constant PillUniforms &u [[buffer(0)]],
     const device CompositeElem *elems [[buffer(1)]],
-    texture2d<float> offscreen_b [[texture(0)]],
-    texture2d<float> atlas [[texture(1)]]
+    texture2d<float> offscreen_b [[texture(0)]]
 ) {
     constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float2 p = in.uv * u.panel_size;
@@ -343,33 +340,6 @@ fragment float4 pill_composite_fragment(
             float border_max_a = (u.is_completed != 0u) ? 0.42 : 0.12;
             float ba = border_cov * border_max_a * shape_alpha;
             out = blend_over(out, float4(border_rgb * ba, ba));
-        }
-    }
-
-    // 6. Optional "Esc" shortcut hint pill below the hovered cancel chip (`✕` / `Cancel`).
-    if (u.hint_rect.z > 1.0) {
-        float4 hr = float4(u.hint_rect.xy, u.hint_rect.xy + u.hint_rect.zw);
-        float h_sdf = rrect_sdf(p, hr, u.hint_rect.w * 0.5);
-        float h_cov = clamp(0.5 - h_sdf * u.scale, 0.0, 1.0);
-        if (h_cov > 0.001) {
-            float ha = 0.92 * shape_alpha * h_cov;
-            out = blend_over(out, float4(float3(0.11, 0.11, 0.12) * ha, ha));
-            // Text inside the hint pill (padded by 6 pt horizontally, 3 pt vertically).
-            float2 t_min = u.hint_rect.xy + float2(6.0, 2.5);
-            float2 t_max = u.hint_rect.xy + u.hint_rect.zw - float2(6.0, 2.5);
-            if (p.x >= t_min.x && p.x <= t_max.x && p.y >= t_min.y && p.y <= t_max.y) {
-                float2 t_uv = (p - t_min) / max(t_max - t_min, float2(1.0));
-                float2 uv = mix(u.hint_uv.xy, u.hint_uv.zw, t_uv);
-                float txt_a = atlas.sample(s, uv).a * shape_alpha * h_cov;
-                float3 txt_rgb = float3(0.78, 0.78, 0.80);
-                out = blend_over(out, float4(txt_rgb * txt_a, txt_a));
-            }
-        }
-        float hb_cov = clamp(1.0 + 0.5 / u.scale + h_sdf, 0.0, 1.0)
-                     * clamp(0.5 / u.scale - h_sdf, 0.0, 1.0);
-        if (hb_cov > 0.001) {
-            float hba = hb_cov * 0.16 * shape_alpha;
-            out = blend_over(out, float4(float3(1.0) * hba, hba));
         }
     }
 

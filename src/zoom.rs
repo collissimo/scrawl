@@ -83,6 +83,27 @@ pub fn window(at_ms: u64, span_ms: u64, duration_ms: u64) -> (u64, u64) {
     (from, to)
 }
 
+/// The window centred on a mark drawn over `[t0, t1]`: at least `span_ms`, and the whole mark
+/// with half a second either side. Clamped to the recording.
+pub fn mark_window(t0: u64, t1: u64, span_ms: u64, duration_ms: u64) -> (u64, u64) {
+    let span = span_ms
+        .max(t1.saturating_sub(t0) + 1_000)
+        .clamp(200, duration_ms.max(200));
+    let mut from = ((t0 + t1) / 2).saturating_sub(span / 2);
+    let mut to = from + span;
+    if to > duration_ms {
+        to = duration_ms;
+        from = to.saturating_sub(span);
+    }
+    (from, to)
+}
+
+/// What to zoom into: a moment (`--at`) or one mark (`--mark`).
+pub enum Focus<'a> {
+    At(&'a str),
+    Mark(crate::agent_context::MarkEntry<'a>),
+}
+
 /// Evenly spaced times across `[from, to]`, both ends included.
 pub fn sample_times(from: u64, to: u64, count: usize) -> Vec<u64> {
     let count = count.clamp(1, 48);
@@ -170,21 +191,26 @@ fn said_between(bundle: &ScrawlBundle, from: u64, to: u64) -> String {
 
 /// The auto-crop of the keyframe nearest `t` (keyframe crops meet halfway between keyframes).
 fn crop_at(bundle: &ScrawlBundle, t: u64) -> Option<crate::autocrop::Rect> {
-    let info = bundle.autocrop.as_ref()?;
     let (k, _) = bundle
         .keyframes
         .iter()
         .enumerate()
         .min_by_key(|(_, kf)| kf.t.abs_diff(t))?;
-    let crop = info.crops.get(k)?;
+    crop_of(bundle, k)
+}
+
+/// The auto-crop of the `k`th keyframe (0-based).
+fn crop_of(bundle: &ScrawlBundle, k: usize) -> Option<crate::autocrop::Rect> {
+    let crop = bundle.autocrop.as_ref()?.crops.get(k)?;
     (crop.kind != crate::autocrop::CropKind::Full).then(|| crop.rect(&bundle.target.frame))
 }
 
-/// `cropped`: in an auto-cropped bundle, crop each cell like the nearest keyframe.
+/// `cropped`: in an auto-cropped bundle, crop each cell like the nearest keyframe (for a mark,
+/// like the mark's keyframe, whose crop holds its ink).
 pub fn zoom(
     dir: &Path,
     bundle: &ScrawlBundle,
-    at: &str,
+    focus: Focus,
     span_ms: u64,
     count: usize,
     cropped: bool,
@@ -209,18 +235,34 @@ pub fn zoom(
                     .unwrap_or_else(|| "The bundle has no video to zoom into".to_owned())
             }
         })?;
-    let at_ms = resolve_moment(bundle, at)?;
-    ensure!(
-        at_ms <= bundle.duration_ms,
-        "{} is past the end ({})",
-        clock(at_ms),
-        clock(bundle.duration_ms)
-    );
-    let (from_ms, to_ms) = window(at_ms, span_ms, bundle.duration_ms);
+    let ((from_ms, to_ms), mark) = match &focus {
+        Focus::At(at) => {
+            let at_ms = resolve_moment(bundle, at)?;
+            ensure!(
+                at_ms <= bundle.duration_ms,
+                "{} is past the end ({})",
+                clock(at_ms),
+                clock(bundle.duration_ms)
+            );
+            (window(at_ms, span_ms, bundle.duration_ms), None)
+        }
+        Focus::Mark(entry) => (
+            mark_window(entry.mark.t0, entry.mark.t1, span_ms, bundle.duration_ms),
+            Some(entry),
+        ),
+    };
+    let mark_crop = mark
+        .and_then(|e| e.keyframe)
+        .and_then(|index| bundle.keyframes.iter().position(|k| k.index == index))
+        .map(|k| crop_of(bundle, k));
     let times = sample_times(from_ms, to_ms, count);
     let crops: Vec<Option<crate::autocrop::Rect>> = times
         .iter()
-        .map(|&t| crop_at(bundle, t).filter(|_| cropped))
+        .map(|&t| {
+            mark_crop
+                .unwrap_or_else(|| crop_at(bundle, t))
+                .filter(|_| cropped)
+        })
         .collect();
     let mut frames = if crops.iter().any(Option::is_some) {
         // Decoded at full size a few at a time and cropped straight away, so a sheet of 2560 px
@@ -264,7 +306,8 @@ pub fn zoom(
             file: String::new(),
             event: String::new(),
             said: None,
-            mark_id: None,
+            // From the moment the mark starts, its whole ink stays drawn.
+            mark_id: mark.filter(|e| t >= e.mark.t0).map(|e| e.mark.id.clone()),
             cursor: None,
         };
         let view =
@@ -342,5 +385,13 @@ mod tests {
         assert_eq!(window(24_800, 2_000, 25_000), (23_000, 25_000));
         assert_eq!(sample_times(1_000, 2_000, 3), vec![1_000, 1_500, 2_000]);
         assert_eq!(clock(61_234), "1:01.234");
+    }
+
+    #[test]
+    fn a_mark_window_is_centred_on_the_mark_and_holds_all_of_it() {
+        assert_eq!(mark_window(9_322, 10_908, 2_000, 13_400), (8_822, 11_408));
+        assert_eq!(mark_window(6_661, 7_182, 2_000, 13_400), (5_921, 7_921));
+        assert_eq!(mark_window(200, 400, 2_000, 13_400), (0, 2_000));
+        assert_eq!(mark_window(13_000, 13_300, 2_000, 13_400), (11_400, 13_400));
     }
 }

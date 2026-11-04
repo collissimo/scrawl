@@ -8,6 +8,7 @@
 use serde::Serialize;
 
 use crate::model::{InteractionEvent, LASER_MS, ScrawlBundle, Stroke};
+use crate::render::{annotation_sizes as sizes, is_long_press};
 use crate::sketch::{FreehandOptions, freehand_outline, slice_laser_window, smooth_laser_points};
 
 /// Ink stays on screen this long after its mark's last stroke, then fades.
@@ -107,19 +108,6 @@ pub struct Layers {
     pub clicks: bool,
 }
 
-/// Sizes the keyframe renderer uses for a frame of `w × h` pixels.
-fn sizes(w: f32, h: f32) -> (f32, f32, f32) {
-    let k = (w.min(h) / 800.0).max(w.max(h) / 1280.0).clamp(1.0, 2.0);
-    let size = (w.min(h) * 0.0065).clamp(4.2, 6.0) * k;
-    (k, size, (w.max(h) / 1280.0).clamp(0.75, 2.5))
-}
-
-fn is_long_press(label: &Option<String>) -> bool {
-    label
-        .as_deref()
-        .is_some_and(|l| l == "long press" || l.starts_with("long press:"))
-}
-
 /// Builds the plan for `bundle` on a video of `video_px`, whose first frame is `offset_ms` into
 /// the bundle's clock. Anything that ended before the video began is left out.
 pub fn plan(bundle: &ScrawlBundle, video_px: (u32, u32), layers: Layers) -> InkPlan {
@@ -194,7 +182,7 @@ pub fn plan(bundle: &ScrawlBundle, video_px: (u32, u32), layers: Layers) -> InkP
                     y0,
                     label,
                     ..
-                } if is_long_press(label) && *t >= offset => {
+                } if is_long_press(label.as_deref()) && *t >= offset => {
                     plan.ripples.push(Ripple {
                         x: round(*x0),
                         y: round(*y0),
@@ -212,7 +200,7 @@ pub fn plan(bundle: &ScrawlBundle, video_px: (u32, u32), layers: Layers) -> InkP
                     button,
                     label,
                 } if button.as_deref() == Some("touch")
-                    && !is_long_press(label)
+                    && !is_long_press(label.as_deref())
                     && *t >= offset =>
                 {
                     let pts: Vec<[f32; 2]> = if path.len() >= 2 {

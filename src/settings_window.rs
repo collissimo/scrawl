@@ -11,12 +11,11 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, ClickEvent, Context, Div, FocusHandle, FontWeight, Hsla,
-    Image, ImageFormat,
-    InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
-    ParentElement, Pixels, Point, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement,
-    Styled, Window, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowKind, WindowOptions, div, img, linear_color_stop, linear_gradient, point, prelude::*,
-    px, rgb, rgba, size, svg,
+    Image, ImageFormat, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, ParentElement, Pixels, Point, Render, Rgba, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowKind, WindowOptions, div, img, linear_color_stop,
+    linear_gradient, point, prelude::*, px, rgb, rgba, size, svg,
 };
 use serde::Deserialize;
 
@@ -29,6 +28,12 @@ use crate::settings::{Action, Event, Pane, Pressed};
 const WIDTH: f32 = 620.0;
 const HEIGHT: f32 = 448.0;
 const SIDEBAR: f32 = 210.0;
+/// The content pane's width: what the 620-point window keeps after the sidebar and the
+/// hairline between them. Giving the pane an explicit width (rather than `flex_1`) makes the
+/// space it hands its children definite, which GPUI requires to wrap text: with an indefinite
+/// width a caption measures as one full line, inflates the column and pushes trailing controls
+/// (the permission rows' buttons) past the window's edge.
+const CONTENT: f32 = WIDTH - SIDEBAR - 1.0;
 const TITLEBAR: f32 = 52.0;
 const INSET: f32 = 20.0;
 const ROW: f32 = 42.0;
@@ -95,6 +100,8 @@ struct Shortcut {
     option: bool,
     command: bool,
     is_default: bool,
+    #[serde(default)]
+    clearable: bool,
     recording: bool,
     error: Option<String>,
 }
@@ -526,6 +533,7 @@ fn key_code(key: &str) -> Option<u32> {
         ("enter", 0x0D),
         ("tab", 0x09),
         ("backspace", 0x08),
+        ("delete", 0x2E),
         ("left", 0x25),
         ("up", 0x26),
         ("right", 0x27),
@@ -537,6 +545,7 @@ fn key_code(key: &str) -> Option<u32> {
         ("enter", 36),
         ("tab", 48),
         ("backspace", 51),
+        ("delete", 117),
         ("left", 123),
         ("right", 124),
         ("down", 125),
@@ -551,7 +560,11 @@ fn key_code(key: &str) -> Option<u32> {
         #[cfg(target_os = "windows")]
         return Some(0x6F + n);
         #[cfg(not(target_os = "windows"))]
-        return Some([122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106][n as usize - 1]);
+        return Some(
+            [
+                122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106,
+            ][n as usize - 1],
+        );
     }
     let mut chars = key.chars();
     let ch = chars.next()?;
@@ -704,14 +717,18 @@ fn switch(theme: Theme, id: &'static str, on: bool, enabled: bool) -> Stateful<D
         .when(on, |d| d.justify_end())
         .when(enabled, |d| d.cursor_pointer())
         .when(!enabled, |d| d.opacity(0.4))
-        .child(div().size(px(18.0)).rounded_full().bg(rgb(0xffffff)).shadow(vec![
-            BoxShadow {
-                color: gpui::hsla(0.0, 0.0, 0.0, 0.22),
-                offset: point(px(0.0), px(0.5)),
-                blur_radius: px(1.0),
-                spread_radius: px(0.0),
-            },
-        ]))
+        .child(
+            div()
+                .size(px(18.0))
+                .rounded_full()
+                .bg(rgb(0xffffff))
+                .shadow(vec![BoxShadow {
+                    color: gpui::hsla(0.0, 0.0, 0.0, 0.22),
+                    offset: point(px(0.0), px(0.5)),
+                    blur_radius: px(1.0),
+                    spread_radius: px(0.0),
+                }]),
+        )
 }
 
 fn popup(theme: Theme, id: &'static str, value: &str) -> Stateful<Div> {
@@ -759,7 +776,11 @@ fn keycap(theme: Theme, glyph: &str, name: Option<&str>, lit: bool, center: bool
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(if glyph.chars().count() > 2 { 14.0 } else { 20.0 }))
+            .text_size(px(if glyph.chars().count() > 2 {
+                14.0
+            } else {
+                20.0
+            }))
             .font_weight(FontWeight::MEDIUM)
             .child(glyph.to_owned());
     }
@@ -768,7 +789,9 @@ fn keycap(theme: Theme, glyph: &str, name: Option<&str>, lit: bool, center: bool
         .flex()
         .flex_col()
         .justify_between()
-        .when_some(name, |d, _| d.child(div().text_size(px(15.0)).child(glyph.to_owned())))
+        .when_some(name, |d, _| {
+            d.child(div().text_size(px(15.0)).child(glyph.to_owned()))
+        })
         .child(
             div()
                 .text_size(px(if name.is_some() { 13.0 } else { 15.0 }))
@@ -824,7 +847,10 @@ impl SettingsWindow {
         let (path, tint) = pane_icon(pane);
         let selected = self.pane == pane;
         div()
-            .id(SharedString::from(format!("settings-pane-{}", pane_title(pane))))
+            .id(SharedString::from(format!(
+                "settings-pane-{}",
+                pane_title(pane)
+            )))
             .h(px(36.0))
             .px(px(8.0))
             .flex()
@@ -863,7 +889,7 @@ impl SettingsWindow {
         };
         div()
             .id("settings-content")
-            .flex_1()
+            .w(px(CONTENT))
             .h_full()
             .bg(theme.window())
             .relative()
@@ -891,9 +917,14 @@ impl SettingsWindow {
                             .text_color(theme.text())
                             .child(pane_title(self.pane)),
                     )
-                    .child(drag_strip("settings-drag-title").absolute().top_0().left_0()),
+                    .child(
+                        drag_strip("settings-drag-title")
+                            .absolute()
+                            .top_0()
+                            .left_0(),
+                    ),
             )
-            .child(div().px(px(INSET)).flex().flex_col().child(body))
+            .child(div().w_full().px(px(INSET)).flex().flex_col().child(body))
     }
 
     fn general(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
@@ -920,9 +951,9 @@ impl SettingsWindow {
                     theme,
                     "Send dev-site captures to OpenCode",
                     true,
-                    switch(theme, "settings-auto-send", auto_send, true).on_click(cx.listener(
-                        move |view, _, _, _| view.set("autoSend", (!auto_send).into()),
-                    )),
+                    switch(theme, "settings-auto-send", auto_send, true).on_click(
+                        cx.listener(move |view, _, _, _| view.set("autoSend", (!auto_send).into())),
+                    ),
                 )
                 .into_any_element(),
             ],
@@ -956,14 +987,21 @@ impl SettingsWindow {
         let live = self.live;
         let lit = |on: bool, held: bool| if recording { held } else { on };
         let reset_hidden = shortcut.is_default || recording;
-        let caption_text = if recording {
+        let off = shortcut.label.is_empty();
+        let clear_shown = shortcut.clearable && !off && !recording;
+        let caption_text = if recording && shortcut.clearable {
+            format!(
+                "Press the new shortcut. Esc cancels, {} turns it off.",
+                if WINDOWS { "Backspace" } else { "Delete" }
+            )
+        } else if recording {
             "Press the new shortcut. Esc cancels.".to_owned()
         } else if let Some(error) = &shortcut.error {
             error.clone()
         } else if kind == ShortcutKind::Paste {
             "Pastes the last capture into the app in front.".to_owned()
         } else {
-            "Tap to record. Hold to choose what to record.".to_owned()
+            "Records the screen. Press again to finish.".to_owned()
         };
         let key = if recording {
             "…".to_owned()
@@ -971,23 +1009,80 @@ impl SettingsWindow {
             shortcut.key.clone()
         };
         // macOS draws ⇧ ⌃ ⌥ ⌘; Windows names its keys, in the order they sit on the keyboard.
-        let caps = if WINDOWS {
+        let caps = if off && !recording {
+            div()
+                .h(px(52.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.0))
+                .text_color(theme.secondary())
+                .child("Set shortcut")
+        } else if WINDOWS {
             div()
                 .flex()
                 .gap(px(6.0))
-                .child(keycap(theme, "Shift", None, lit(shortcut.shift, live.shift), false))
-                .child(keycap(theme, "Ctrl", None, lit(shortcut.control, live.control), false))
-                .child(keycap(theme, "Win", None, lit(shortcut.command, live.platform), false))
-                .child(keycap(theme, "Alt", None, lit(shortcut.option, live.alt), false))
+                .child(keycap(
+                    theme,
+                    "Shift",
+                    None,
+                    lit(shortcut.shift, live.shift),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "Ctrl",
+                    None,
+                    lit(shortcut.control, live.control),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "Win",
+                    None,
+                    lit(shortcut.command, live.platform),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "Alt",
+                    None,
+                    lit(shortcut.option, live.alt),
+                    false,
+                ))
                 .child(keycap(theme, &key, None, !recording, true))
         } else {
             div()
                 .flex()
                 .gap(px(6.0))
-                .child(keycap(theme, "⇧", None, lit(shortcut.shift, live.shift), false))
-                .child(keycap(theme, "⌃", Some("ctrl"), lit(shortcut.control, live.control), false))
-                .child(keycap(theme, "⌥", Some("opt"), lit(shortcut.option, live.alt), false))
-                .child(keycap(theme, "⌘", Some("cmd"), lit(shortcut.command, live.platform), false))
+                .child(keycap(
+                    theme,
+                    "⇧",
+                    None,
+                    lit(shortcut.shift, live.shift),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "⌃",
+                    Some("ctrl"),
+                    lit(shortcut.control, live.control),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "⌥",
+                    Some("opt"),
+                    lit(shortcut.option, live.alt),
+                    false,
+                ))
+                .child(keycap(
+                    theme,
+                    "⌘",
+                    Some("cmd"),
+                    lit(shortcut.command, live.platform),
+                    false,
+                ))
                 .child(keycap(theme, &key, None, !recording, true))
         };
         let id = |name: &str| SharedString::from(format!("settings-{name}-{kind:?}"));
@@ -997,19 +1092,43 @@ impl SettingsWindow {
             .child(
                 header(theme, &shortcut.title).child(
                     div()
-                        .id(id("reset"))
-                        .size(px(20.0))
-                        .rounded_full()
-                        .bg(theme.control())
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(crate::icons::RESET, 10.0, theme.secondary()))
-                        .when(reset_hidden, |d| d.opacity(0.0))
-                        .when(!reset_hidden, |d| {
-                            d.cursor_pointer().on_click(cx.listener(move |view, _, _, _| {
-                                view.act(Action::ResetShortcut { kind });
-                            }))
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id(id("reset"))
+                                .size(px(20.0))
+                                .rounded_full()
+                                .bg(theme.control())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(crate::icons::RESET, 10.0, theme.secondary()))
+                                .when(reset_hidden, |d| d.opacity(0.0))
+                                .when(!reset_hidden, |d| {
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        move |view, _, _, _| {
+                                            view.act(Action::ResetShortcut { kind });
+                                        },
+                                    ))
+                                }),
+                        )
+                        .when(clear_shown, |d| {
+                            d.child(
+                                div()
+                                    .id(id("clear"))
+                                    .size(px(20.0))
+                                    .rounded_full()
+                                    .bg(theme.control())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .child(icon(crate::icons::X, 10.0, theme.secondary()))
+                                    .on_click(cx.listener(move |view, _, _, _| {
+                                        view.act(Action::ClearShortcut { kind });
+                                    })),
+                            )
                         }),
                 ),
             )
@@ -1038,11 +1157,11 @@ impl SettingsWindow {
                         }
                     })),
             )
-            .child(
-                div()
-                    .h(px(26.0))
-                    .child(caption(theme, &caption_text, shortcut.error.is_some() && !recording)),
-            )
+            .child(div().h(px(26.0)).child(caption(
+                theme,
+                &caption_text,
+                shortcut.error.is_some() && !recording,
+            )))
     }
 
     fn recording_pane(&self, theme: Theme, state: &ViewState, cx: &mut Context<Self>) -> Div {
@@ -1073,7 +1192,12 @@ impl SettingsWindow {
                 cx.listener({
                     let selected = t.engine.clone();
                     move |view, event: &ClickEvent, _, cx| {
-                        view.open_menu("transcriber", engines.clone(), Some(selected.clone()), event);
+                        view.open_menu(
+                            "transcriber",
+                            engines.clone(),
+                            Some(selected.clone()),
+                            event,
+                        );
                         cx.notify();
                     }
                 }),
@@ -1197,11 +1321,11 @@ impl SettingsWindow {
                         theme,
                         "Video export",
                         true,
-                        switch(theme, "settings-video-export", video, true).on_click(
-                            cx.listener(move |view, _, _, _| {
+                        switch(theme, "settings-video-export", video, true).on_click(cx.listener(
+                            move |view, _, _, _| {
                                 view.set("videoExport", (!video).into());
-                            }),
-                        ),
+                            },
+                        )),
                     )
                     .into_any_element(),
                 ],
@@ -1244,7 +1368,12 @@ impl SettingsWindow {
                         true,
                         popup(theme, "settings-retention", current).on_click(cx.listener(
                             move |view, event: &ClickEvent, _, cx| {
-                                view.open_menu("retention", options.clone(), selected.clone(), event);
+                                view.open_menu(
+                                    "retention",
+                                    options.clone(),
+                                    selected.clone(),
+                                    event,
+                                );
                                 cx.notify();
                             },
                         )),
@@ -1293,9 +1422,11 @@ impl SettingsWindow {
                                             .unwrap_or_else(|| "Measuring…".to_owned()),
                                     ),
                             )
-                            .child(button(theme, "settings-show-captures", show, true).on_click(
-                                cx.listener(|view, _, _, _| view.act(Action::ShowCaptures)),
-                            )),
+                            .child(
+                                button(theme, "settings-show-captures", show, true).on_click(
+                                    cx.listener(|view, _, _, _| view.act(Action::ShowCaptures)),
+                                ),
+                            ),
                     )
                     .into_any_element(),
                 ],
@@ -1308,7 +1439,8 @@ impl SettingsWindow {
             .iter()
             .find(|s| s.kind == ShortcutKind::Paste)
             .map_or_else(crate::settings::paste_label, |s| s.label.clone());
-        let required: Vec<&PermissionRow> = state.permissions.iter().filter(|p| p.required).collect();
+        let required: Vec<&PermissionRow> =
+            state.permissions.iter().filter(|p| p.required).collect();
         let optional: Vec<&PermissionRow> =
             state.permissions.iter().filter(|p| !p.required).collect();
         let mut column = div().flex().flex_col();
@@ -1341,7 +1473,10 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         rows.iter()
-            .map(|row| self.permission_line(theme, row, paste, cx).into_any_element())
+            .map(|row| {
+                self.permission_line(theme, row, paste, cx)
+                    .into_any_element()
+            })
             .collect()
     }
 
@@ -1387,6 +1522,12 @@ impl SettingsWindow {
                 crate::icons::IPHONE,
                 GREEN,
             ),
+            Permission::SpeechRecognition => (
+                "Speech Recognition",
+                "To write down what you say".to_owned(),
+                crate::icons::MIC,
+                ORANGE,
+            ),
         };
         let granted = row.status == Status::Granted;
         let id = SharedString::from(format!("settings-grant-{permission:?}"));
@@ -1428,7 +1569,12 @@ impl SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap(px(1.0))
-                    .child(div().text_size(px(14.0)).text_color(theme.text()).child(name))
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(theme.text())
+                            .child(name),
+                    )
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -1529,9 +1675,7 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .gap(px(12.0))
-                    .child(
-                        img(Arc::clone(&self.icon)).size(px(40.0)).flex_none(),
-                    )
+                    .child(img(Arc::clone(&self.icon)).size(px(40.0)).flex_none())
                     .child(
                         div()
                             .flex_1()
@@ -1553,12 +1697,17 @@ impl SettingsWindow {
                             ),
                     )
                     .child(
-                        button(theme, "settings-updates", "Check for Updates…", state.updates)
-                            .when(state.updates, |d| {
-                                d.on_click(
-                                    cx.listener(|view, _, _, _| view.act(Action::CheckForUpdates)),
-                                )
-                            }),
+                        button(
+                            theme,
+                            "settings-updates",
+                            "Check for Updates…",
+                            state.updates,
+                        )
+                        .when(state.updates, |d| {
+                            d.on_click(
+                                cx.listener(|view, _, _, _| view.act(Action::CheckForUpdates)),
+                            )
+                        }),
                     )
                     .into_any_element(),
             ],
@@ -1570,35 +1719,33 @@ impl SettingsWindow {
                 false,
             ));
         }
-        column
-            .child(header(theme, "Links"))
-            .child(group(
-                theme,
-                vec![
-                    link(
-                        "settings-website",
-                        "Website",
-                        "scrawl.kitlangton.com",
-                        "https://scrawl.kitlangton.com",
-                    )
-                    .into_any_element(),
-                    link(
-                        "settings-source",
-                        "Source",
-                        "github.com/kitlangton/scrawl",
-                        "https://github.com/kitlangton/scrawl",
-                    )
-                    .into_any_element(),
-                    row(
-                        theme,
-                        "Welcome tour",
-                        true,
-                        button(theme, "settings-tour", "Show", true)
-                            .on_click(cx.listener(|view, _, _, _| view.act(Action::Tour))),
-                    )
-                    .into_any_element(),
-                ],
-            ))
+        column.child(header(theme, "Links")).child(group(
+            theme,
+            vec![
+                link(
+                    "settings-website",
+                    "Website",
+                    "scrawl.kitlangton.com",
+                    "https://scrawl.kitlangton.com",
+                )
+                .into_any_element(),
+                link(
+                    "settings-source",
+                    "Source",
+                    "github.com/kitlangton/scrawl",
+                    "https://github.com/kitlangton/scrawl",
+                )
+                .into_any_element(),
+                row(
+                    theme,
+                    "Welcome tour",
+                    true,
+                    button(theme, "settings-tour", "Show", true)
+                        .on_click(cx.listener(|view, _, _, _| view.act(Action::Tour))),
+                )
+                .into_any_element(),
+            ],
+        ))
     }
 
     fn open_menu(
@@ -1683,12 +1830,9 @@ impl SettingsWindow {
                                 cx.notify();
                             }))
                     })
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .flex_none()
-                            .when(chosen, |d| d.child(icon(crate::icons::CHECK, 12.0, theme.text()))),
-                    )
+                    .child(div().w(px(14.0)).flex_none().when(chosen, |d| {
+                        d.child(icon(crate::icons::CHECK, 12.0, theme.text()))
+                    }))
                     .child(title.clone()),
             );
         }
@@ -1729,8 +1873,7 @@ fn drag_strip(id: &'static str) -> Stateful<Div> {
         .h(px(TITLEBAR))
         .flex_none()
         .when(WINDOWS, |d| {
-            d.occlude()
-                .window_control_area(WindowControlArea::Drag)
+            d.occlude().window_control_area(WindowControlArea::Drag)
         })
 }
 

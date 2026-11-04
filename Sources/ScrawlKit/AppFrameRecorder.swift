@@ -38,6 +38,7 @@
     private enum State { case idle, starting, recording, finished }
 
     var onInterruption: (@MainActor @Sendable () -> Void)?
+    var startupTrace: StartupTrace?
     private(set) var recordsAudio = false
     private(set) var pacer = FramePacer()
     static private(set) var lastMetrics: FramePacer.Metrics?
@@ -46,6 +47,11 @@
     var isAvailable: Bool { true }
 
     private var state = State.idle
+    private var startCompletion: (@MainActor @Sendable (Result<Date, any Error>) -> Void)?
+    private var audioReady = false
+    private var capturedFirstFrame = false
+    private var startedAt = Date()
+    private var firstFrameTime = CMTime.invalid
     private var writer: MovieWriter?
     private var microphone: MicrophoneCapture?
     private var displayLink: CADisplayLink?
@@ -74,84 +80,121 @@
     func start(microphone wantsMicrophone: Bool, completion: @escaping @MainActor @Sendable (Result<Date, any Error>) -> Void) {
       guard state == .idle else { return }
       state = .starting
+      startedAt = Date()
+      let start = MovieWriter.now()
+      firstFrameTime = start
+      startCompletion = completion
+      // The writer/pixel pool and microphone have independent startup paths. UIKit capture
+      // stays on main; all encoder and audio setup runs off it.
+      begin(audio: wantsMicrophone, at: start)
+      guard state == .starting else { return }
+      observeBackgrounding()
+      startupTrace?.mark("permissionBegin")
       guard wantsMicrophone else {
-        begin(microphone: nil, completion: completion)
+        startupTrace?.mark("permissionEnd")
+        audioReady = true
+        completeStartIfReady()
         return
       }
       switch AVAudioApplication.shared.recordPermission {
       case .granted:
-        startMicrophone(completion: completion)
+        startupTrace?.mark("permissionEnd")
+        startMicrophone()
       case .undetermined:
         AVAudioApplication.requestRecordPermission { granted in
           Task { @MainActor in
+            self.startupTrace?.mark("permissionEnd")
             if granted {
-              self.startMicrophone(completion: completion)
+              self.startMicrophone()
             } else {
-              self.begin(microphone: nil, completion: completion)
+              self.audioReady = true
+              self.completeStartIfReady()
             }
           }
         }
       default:
-        begin(microphone: nil, completion: completion)
+        startupTrace?.mark("permissionEnd")
+        audioReady = true
+        completeStartIfReady()
       }
     }
 
-    /// The microphone runs before the movie starts so the first words aren't lost to its startup.
-    private func startMicrophone(completion: @escaping @MainActor @Sendable (Result<Date, any Error>) -> Void) {
-      guard state == .starting else { return }
+    private func startMicrophone() {
+      guard state == .starting || state == .recording else { return }
       let microphone = MicrophoneCapture()
+      microphone.startupTrace = startupTrace
+      self.microphone = microphone
+      if let writer { microphone.attach(writer) }
       microphone.start { running in
         Task { @MainActor in
-          guard running, self.state == .starting else {
+          guard self.state == .starting || self.state == .recording else { return }
+          if !running {
+            self.startupTrace?.mark("microphoneUnavailable")
             microphone.stop()
-            self.begin(microphone: nil, completion: completion)
-            return
+            self.microphone = nil
           }
-          self.begin(microphone: microphone, completion: completion)
+          self.audioReady = true
+          self.completeStartIfReady()
         }
       }
     }
 
-    private func begin(microphone: MicrophoneCapture?, completion: @escaping @MainActor @Sendable (Result<Date, any Error>) -> Void) {
-      guard state == .starting else {
-        microphone?.stop()
-        return
-      }
+    private func begin(audio: Bool, at start: CMTime) {
       guard let scene = Scrawl.activeScene else {
-        microphone?.stop()
-        state = .idle
-        completion(.failure(RecorderError.noScene))
+        failStart(RecorderError.noScene)
         return
       }
       let points = scene.coordinateSpace.bounds.size
       canvas = Self.canvasSize(for: points)
       pacer = FramePacer()
-      do {
-        try? FileManager.default.removeItem(at: temporaryMovie)
-        let writer = try MovieWriter(url: temporaryMovie, size: canvas, audio: microphone != nil, videoBitRate: videoBitRate)
-        let start = MovieWriter.now()
-        let startedAt = Date()
-        try writer.begin(at: start)
-        self.writer = writer
-        self.microphone = microphone
-        microphone?.attach(writer)
-        state = .recording
-        let now = CACurrentMediaTime()
-        if let drawDuration = renderFrame(at: start, interacting: false) {
-          pacer.recordCapture(at: now, drawDuration: drawDuration, turnElapsed: 0, isInteracting: false)
+      let url = temporaryMovie
+      let canvas = canvas
+      let bitRate = videoBitRate
+      let trace = startupTrace
+      Task {
+        do {
+          let writer = try await Task.detached(priority: .userInitiated) {
+            trace?.mark("writerBegin")
+            do {
+              let writer = try MovieWriter(url: url, size: canvas, audio: audio, videoBitRate: bitRate)
+              try writer.begin(at: start)
+              trace?.mark("writerEnd")
+              return writer
+            } catch {
+              try? FileManager.default.removeItem(at: url)
+              throw error
+            }
+          }.value
+          guard state == .starting else {
+            writer.cancel(removing: url)
+            return
+          }
+          self.writer = writer
+          microphone?.attach(writer)
+          state = .recording
+          let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+          link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: Self.framesPerSecond, preferred: Self.framesPerSecond)
+          link.add(to: .main, forMode: .common)
+          displayLink = link
+          // Capture on the next display turn, after the overlay's initial layout can commit.
+          completeStartIfReady()
+        } catch {
+          guard state == .starting else { return }
+          failStart(error)
         }
-        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: Self.framesPerSecond, preferred: Self.framesPerSecond)
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-        observeBackgrounding()
-        completion(.success(startedAt))
-      } catch {
-        microphone?.stop()
-        try? FileManager.default.removeItem(at: temporaryMovie)
-        state = .idle
-        completion(.failure(error))
       }
+    }
+
+    private func completeStartIfReady() {
+      guard state == .recording, audioReady, capturedFirstFrame, let completion = startCompletion else { return }
+      startCompletion = nil
+      completion(.success(startedAt))
+    }
+
+    private func failStart(_ error: any Error) {
+      let completion = startCompletion
+      cancel()
+      completion?(.failure(error))
     }
 
     func stop(writingTo movie: URL, completion: @escaping @MainActor @Sendable ((any Error)?) -> Void) {
@@ -194,13 +237,12 @@
     }
 
     func cancel() {
-      let wasRecording = state == .recording
       state = .finished
+      startCompletion = nil
       Self.lastMetrics = pacer.metrics
       tearDown()
-      if wasRecording { writer?.cancel() }
+      writer?.cancel(removing: temporaryMovie)
       writer = nil
-      try? FileManager.default.removeItem(at: temporaryMovie)
     }
 
     private func tearDown() {
@@ -229,8 +271,12 @@
         forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
       ) { [weak self] _ in
         MainActor.assumeIsolated {
-          guard let self, self.state == .recording else { return }
-          self.onInterruption?()
+          guard let self, self.state == .starting || self.state == .recording else { return }
+          if self.startCompletion != nil {
+            self.failStart(RecorderError.notRecording)
+          } else {
+            self.onInterruption?()
+          }
         }
       })
     }
@@ -238,7 +284,7 @@
     @objc private func tick(_ link: CADisplayLink) {
       guard state == .recording, let writer else { return }
       let now = CACurrentMediaTime()
-      let time = MovieWriter.now()
+      let time = capturedFirstFrame ? MovieWriter.now() : firstFrameTime
       if let moveTime = Scrawl.shared.lastTouchMoveMediaTime {
         pacer.noteInteractionMovement(at: moveTime)
       }
@@ -265,6 +311,8 @@
           turnElapsed: turnElapsed,
           isInteracting: interacting
         )
+        capturedFirstFrame = true
+        completeStartIfReady()
       }
     }
 
@@ -294,6 +342,7 @@
         return nil
       }
       writer.enqueueVideo(pixelBuffer, at: time)
+      if !capturedFirstFrame { startupTrace?.mark("firstCapture") }
       return drawDuration
     }
 
@@ -666,10 +715,9 @@
       let interval = AppFrameRecorder.signposter.beginInterval("VideoAppend", id: signpostID)
       defer { AppFrameRecorder.signposter.endInterval("VideoAppend", interval) }
 
-      stateLock.lock()
-      let isFinishing = state.isFinishing
-      stateLock.unlock()
-      if !isFinishing, writer.status == .writing, video.isReadyForMoreMediaData,
+      // These frames were accepted before finish/cancel and precede it on this serial queue.
+      // Dropping them just because finish was requested loses a quick tap's only frame.
+      if writer.status == .writing, video.isReadyForMoreMediaData,
          lastVideoTime.isValid ? time > lastVideoTime : true
       {
         if adaptor.append(pixelBuffer, withPresentationTime: time) {
@@ -753,7 +801,7 @@
       }
     }
 
-    func cancel() {
+    func cancel(removing url: URL? = nil) {
       stateLock.lock()
       let alreadyFinishing = state.isFinishing
       state.isFinishing = true
@@ -763,6 +811,7 @@
       queue.async { [self] in
         self.lastPixelBuffer = nil
         if writer.status == .writing { writer.cancelWriting() }
+        if let url { try? FileManager.default.removeItem(at: url) }
       }
     }
   }
@@ -788,13 +837,19 @@
   /// restarting run on `queue`. When the engine's configuration changes (a route or sample-rate
   /// change) or an interruption ends, the tap is reinstalled and the engine started again.
   final class MicrophoneCapture: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "dev.kitlangton.scrawl.microphone")
+    var startupTrace: StartupTrace?
+    // Audio-session ownership is process-wide: an old capture must finish restoring before
+    // the next capture snapshots it. Separate per-capture queues raced on rapid restarts.
+    private static let audioQueue = DispatchQueue(label: "dev.kitlangton.scrawl.microphone", qos: .userInitiated)
+    private var queue: DispatchQueue { Self.audioQueue }
     private let lock = NSLock()
     private var writer: MovieWriter?
+    private var pendingSamples: [CMSampleBuffer] = []
+    private var stopped = false
     /// Guarded by `lock`, like `writer`.
     private let stream = MicrophoneStream()
     /// The rest is touched only on `queue`.
-    private var engine = AVAudioEngine()
+    private lazy var engine = AVAudioEngine()
     private var audioSession: AudioSessionSnapshot?
     private var observers: [any NSObjectProtocol] = []
     private var isRunning = false
@@ -810,14 +865,20 @@
     /// Sends samples to `writer` from now on.
     func attach(_ writer: MovieWriter) {
       lock.lock()
+      defer { lock.unlock() }
+      guard !stopped else { return }
       self.writer = writer
-      lock.unlock()
+      for sample in pendingSamples { writer.appendAudio(sample) }
+      pendingSamples.removeAll()
     }
 
     /// Stops the engine and puts the app's audio session back the way it was.
     func stop() {
       lock.lock()
+      guard !stopped else { lock.unlock(); return }
+      stopped = true
       writer = nil
+      pendingSamples.removeAll()
       lock.unlock()
       queue.async { [self] in
         for observer in observers {
@@ -835,6 +896,11 @@
     }
 
     private func configureAndRun() -> Bool {
+      lock.lock()
+      let cancelled = stopped
+      lock.unlock()
+      guard !cancelled else { return false }
+      startupTrace?.mark("audioSessionBegin")
       let shared = AVAudioSession.sharedInstance()
       let snapshot = AudioSessionSnapshot(shared)
       do {
@@ -842,7 +908,9 @@
         // speaker or Bluetooth headphones instead of the receiver.
         try shared.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothA2DP])
         try shared.setActive(true)
+        startupTrace?.mark("audioSessionEnd")
         try installTapAndStart()
+        startupTrace?.mark("microphoneReady")
       } catch {
         print("Scrawl: microphone unavailable: \(error.localizedDescription)")
         engine.inputNode.removeTap(onBus: 0)
@@ -858,6 +926,7 @@
 
     /// Taps the input node in its current hardware format and starts the engine.
     private func installTapAndStart() throws {
+      startupTrace?.mark("engineBegin")
       let input = engine.inputNode
       let format = input.outputFormat(forBus: 0)
       guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -868,6 +937,7 @@
       }
       engine.prepare()
       try engine.start()
+      startupTrace?.mark("engineEnd")
     }
 
     /// Runs again after the engine stopped itself (configuration change, interruption, or a
@@ -922,8 +992,14 @@
         : CMTimeSubtract(MovieWriter.now(), CMTime(value: CMTimeValue(buffer.frameLength), timescale: CMTimeScale(buffer.format.sampleRate)))
       lock.lock()
       defer { lock.unlock() }
-      guard let writer, let sampleBuffer = stream.sampleBuffer(for: buffer, at: time) else { return }
-      writer.appendAudio(sampleBuffer)
+      guard !stopped, let sampleBuffer = stream.sampleBuffer(for: buffer, at: time) else { return }
+      if let writer {
+        writer.appendAudio(sampleBuffer)
+      } else {
+        // At most roughly half a second of 48 kHz mono audio while the writer gets ready.
+        pendingSamples.append(sampleBuffer)
+        while pendingSamples.count > 6 { pendingSamples.removeFirst() }
+      }
     }
   }
 

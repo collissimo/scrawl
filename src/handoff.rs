@@ -7,22 +7,75 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::ScrawlBundle;
 
+/// Where captures go: `SCRAWL_CAPTURES_DIR`, else `"capturesDir"` in `config.json` (Settings ›
+/// Storage), else `builtin_captures_dir`. Tests never see the config file.
+pub fn default_captures_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SCRAWL_CAPTURES_DIR") {
+        return PathBuf::from(dir);
+    }
+    let configured = if cfg!(test) {
+        None
+    } else {
+        config().captures_dir
+    };
+    configured
+        .as_deref()
+        .and_then(configured_captures_dir)
+        .filter(|dir| usable_captures_dir(dir))
+        .unwrap_or_else(builtin_captures_dir)
+}
+
+/// A chosen folder that exists (or can be made) and takes writes; otherwise it's logged once and the
+/// built-in folder is used, so a capture is never lost to a missing or unplugged drive.
+fn usable_captures_dir(dir: &Path) -> bool {
+    let usable = fs::create_dir_all(dir).is_ok()
+        && fs::metadata(dir).is_ok_and(|meta| meta.is_dir() && !meta.permissions().readonly());
+    if !usable {
+        log_config_once(format!(
+            "config.json: \"capturesDir\" {} can't be used (missing or not writable); captures go to {}",
+            dir.display(),
+            builtin_captures_dir().display()
+        ));
+    }
+    usable
+}
+
+/// A `"capturesDir"` value as a folder: `~` is the home folder, and only an absolute path counts
+/// (anything else is logged and skipped, so captures never land relative to the app's cwd).
+pub fn configured_captures_dir(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = match value.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            dirs::home_dir()?.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(value),
+    };
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        log_config_once(format!(
+            "config.json: ignoring \"capturesDir\": {value} is not an absolute path"
+        ));
+        None
+    }
+}
+
 /// `~/Library/Application Support/scrawl/captures` on macOS, `%LOCALAPPDATA%\scrawl\captures`
 /// on Windows (local, not roaming: the movies are large).
-pub fn default_captures_dir() -> PathBuf {
-    std::env::var_os("SCRAWL_CAPTURES_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("scrawl").join("captures")
-            } else {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("Library/Application Support/scrawl/captures")
-            }
-        })
+pub fn builtin_captures_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("scrawl")
+            .join("captures")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/Application Support/scrawl/captures")
+    }
 }
 
 /// Opens a file, folder or URL with its default app (Finder, Explorer, the browser).
@@ -196,6 +249,13 @@ pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> Result<()> {
 pub fn copy_bundle_to_clipboard(bundle_dir: &Path) -> Result<()> {
     let (directory, bundle) = load_bundle(bundle_dir)?;
     let summary = crate::sketch::summary_markdown(&bundle, &directory);
+    #[cfg(target_os = "windows")]
+    if experiment("clipboardImage")
+        && let Ok(image) = fs::read(directory.join(&bundle.contact_sheet))
+        && crate::win::clipboard::set_png_and_text(&image, Some(&summary)).is_ok()
+    {
+        return Ok(());
+    }
     copy_string_to_clipboard(&summary)
 }
 
@@ -305,6 +365,8 @@ pub struct OpenCodeSessionLocation {
 pub struct OpenCodeSessionTime {
     #[serde(default)]
     pub updated: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed: Option<u64>,
     #[serde(default)]
     pub archived: Option<u64>,
 }
@@ -386,9 +448,16 @@ pub struct Config {
     /// Feature flag: shows **Export Last Capture as Video…** in the menu (default off).
     #[serde(default)]
     pub video_export: Option<bool>,
-    /// `"apple"` (default) or `"hex"`: which engine transcribes recordings (`transcribe`).
+    /// `"apple"` (default), `"hex"` or `"command"`: which engine transcribes recordings
+    /// (`transcribe`). The command's own keys are read by `transcribe_command`, not here, so a
+    /// malformed one can't reset this struct.
     #[serde(default)]
     pub transcriber: Option<String>,
+    /// Lower the output volume while recording (`playback`) to `playbackLevel` percent of it.
+    #[serde(default)]
+    pub lower_playback: Option<bool>,
+    #[serde(default)]
+    pub playback_level: Option<u8>,
     /// The Hex model to use when `transcriber` is `"hex"` (default: the first ready one of
     /// `hex::PREFERRED_MODELS`).
     #[serde(default)]
@@ -397,6 +466,12 @@ pub struct Config {
     /// (`transcription_language`); absent is English.
     #[serde(default)]
     pub language: Option<String>,
+    /// Hex language code (`"en"` by default, `"auto"` for model language detection).
+    #[serde(default)]
+    pub hex_language: Option<String>,
+    /// Apple Speech locale (BCP-47, e.g. "zh-TW"); missing means the Mac's own language.
+    #[serde(default)]
+    pub apple_locale: Option<String>,
     /// Whether to use the native Metal recording pill instead of GPUI's `HudPillWindow` (default `true`).
     #[serde(default)]
     pub native_pill: Option<bool>,
@@ -410,6 +485,33 @@ pub struct Config {
     /// The microphone Mac captures record from (`mic`); absent follows the macOS default.
     #[serde(default)]
     pub microphone: Option<crate::mic::Choice>,
+    /// Smart routing's settings (`routing::look`).
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+    /// Where new captures go (`default_captures_dir`); absent keeps the built-in folder.
+    #[serde(default)]
+    pub captures_dir: Option<String>,
+}
+
+impl Config {
+    /// The output volume while recording when `lowerPlayback` is on, in percent of what it was.
+    pub fn recording_volume(&self) -> u8 {
+        self.playback_level.unwrap_or(20).min(100)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingConfig {
+    /// The checkout each app is built from, by bundle ID or a prefix of one
+    /// (`{"ai.opencode.desktop": "~/code/opencode"}`), for apps whose checkout isn't named like
+    /// them.
+    #[serde(default)]
+    pub apps: std::collections::BTreeMap<String, String>,
+    /// The folder a URL prefix serves, for file servers whose pages aren't their own project's
+    /// (`{"https://studio.example.ts.net:8444/raw/": "~/code/home/artifacts"}`).
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, String>,
 }
 
 /// `true`/`false`, `"yes"`/`"on"`/`"1"` and their opposites, or a number (non-zero is on). Other
@@ -425,7 +527,9 @@ where
     let mut out = std::collections::BTreeMap::new();
     let Value::Object(map) = value else {
         if !value.is_null() {
-            log_config_once(format!("config.json: ignoring \"experiments\": {value} (expected an object)"));
+            log_config_once(format!(
+                "config.json: ignoring \"experiments\": {value} (expected an object)"
+            ));
         }
         return Ok(out);
     };
@@ -455,15 +559,17 @@ where
 /// Config problems are logged once per process, not on every read.
 fn log_config_once(message: String) {
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !seen.contains(&message) {
         crate::capture::scrawl_log(&message);
         seen.push(message);
     }
 }
 
-/// More of what Scrawl already knows in the summary and on the frames: marks, shortcuts, drags
-/// and windows inline at their time, numbered marks on shared frames, where a screen changed.
+/// More of what Scrawl already knows in the summary: marks, shortcuts, drags and windows inline
+/// at their time, numbered marks on shared frames, where a screen changed.
 pub const AGENT_CONTEXT: &str = "agentContext";
 
 /// Transcribe Mac recordings while they record, so finishing only waits for the last words
@@ -525,7 +631,8 @@ fn config_from_value(value: serde_json::Value) -> Config {
     let mut kept = serde_json::Map::new();
     for (key, value) in map {
         kept.insert(key.clone(), value.clone());
-        if let Err(error) = serde_json::from_value::<Config>(serde_json::Value::Object(kept.clone()))
+        if let Err(error) =
+            serde_json::from_value::<Config>(serde_json::Value::Object(kept.clone()))
         {
             kept.remove(&key);
             log_config_once(format!("config.json: ignoring \"{key}\": {error}"));
@@ -627,6 +734,38 @@ pub fn ensure_ingest_token() -> Result<String> {
     ensure_ingest_token_in(&default_config_path())
 }
 
+/// `routing.apps` from config.json, `~` expanded. Tests see none.
+pub fn routing_apps() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.apps)
+}
+
+/// `routing.servers` in config.json: URL prefixes and the folders they serve, `~` expanded.
+pub fn routing_servers() -> Vec<(String, PathBuf)> {
+    routing_paths(|routing| routing.servers)
+}
+
+fn routing_paths(
+    pick: fn(RoutingConfig) -> std::collections::BTreeMap<String, String>,
+) -> Vec<(String, PathBuf)> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let home = dirs::home_dir().unwrap_or_default();
+    config()
+        .routing
+        .map(pick)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, path)| {
+            let path = match path.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(path),
+            };
+            (id, path)
+        })
+        .collect()
+}
+
 /// Whether Mac captures of a dev site go straight to its session (`autoSend`, default on).
 pub fn auto_send() -> bool {
     config().auto_send.unwrap_or(true)
@@ -672,6 +811,38 @@ pub fn language_of(config: &Config) -> String {
 pub fn language_code(raw: &str) -> Option<String> {
     let code = raw.trim().split(['-', '_', '.']).next()?.to_ascii_lowercase();
     (matches!(code.len(), 2 | 3) && code.bytes().all(|b| b.is_ascii_lowercase())).then_some(code)
+}
+
+/// The configured Hex language, defaulting to the previous English behavior.
+pub fn hex_language() -> String {
+    hex_language_from(&config())
+}
+
+pub fn hex_language_from(config: &Config) -> String {
+    config
+        .hex_language
+        .as_deref()
+        .and_then(crate::hex::language_code)
+        .unwrap_or_else(|| crate::hex::DEFAULT_LANGUAGE.into())
+}
+
+/// The configured Apple Speech locale, or the Mac's own language when unset.
+pub fn apple_locale() -> Option<String> {
+    apple_locale_from(&config())
+}
+
+pub fn apple_locale_from(config: &Config) -> Option<String> {
+    config
+        .apple_locale
+        .as_deref()
+        .and_then(crate::speech_model::locale_id)
+}
+
+/// The command transcriber's program (`transcribeCommand`, `transcribeTimeoutSeconds`), read
+/// on its own from the config file.
+pub fn transcribe_command()
+-> Result<crate::command_transcriber::Program, crate::command_transcriber::Unusable> {
+    crate::command_transcriber::Program::load_from(&default_config_path())
 }
 
 /// Whether the native AppKit + Metal recording pill is enabled (`SCRAWL_NATIVE_PILL` or
@@ -841,7 +1012,9 @@ pub fn sync_bundle_to(host: &str, bundle_dir: &Path) -> Result<()> {
         format!(" && touch {bundle_q}/{MEDIA_PENDING}")
     };
     let output = ssh(host)
-        .arg(format!("mkdir -p {parent_q} && tar -C {parent_q} -xf -{mark_pending}"))
+        .arg(format!(
+            "mkdir -p {parent_q} && tar -C {parent_q} -xf -{mark_pending}"
+        ))
         .stdin(tar.stdout.take().context("No tar output")?)
         .output()
         .context("Could not start ssh")?;
@@ -957,11 +1130,205 @@ pub(crate) fn query_escape(value: &str) -> String {
 pub type ApiGet<'a> = dyn FnMut(&str) -> Result<Vec<u8>> + 'a;
 
 pub fn api_get(path: &str) -> Result<Vec<u8>> {
+    if agent_host().is_none()
+        && let Ok(body) = api_get_within(path, std::time::Duration::from_secs(5))
+    {
+        return Ok(body);
+    }
     opencode_api("get", path, None)
 }
 
+/// How long a TCP connect to the local OpenCode server may take before giving up.
+pub const SERVER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+const SERVER_RESPONSE_LIMIT: u64 = 16 * 1024 * 1024;
+const DEFAULT_SERVER_PORT: u16 = 0xc0de;
+
+/// Only the connection fields of OpenCode's `service.json` (never its `env` block).
+#[derive(Default, Deserialize)]
+struct ServiceFile {
+    url: Option<String>,
+    hostname: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
+}
+
+impl ServiceFile {
+    fn load(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    fn address(&self) -> Option<std::net::SocketAddr> {
+        self.url.as_deref().and_then(server_address).or_else(|| {
+            let host = self.hostname.as_deref().unwrap_or("127.0.0.1");
+            server_address(&format!("http://{host}:{}", self.port?))
+        })
+    }
+
+    fn password(&self) -> Option<String> {
+        non_empty(self.password.as_deref())
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// The socket address in `http://127.0.0.1:4096…` when its host is an IP or `localhost` (no
+/// lookups).
+fn server_address(url: &str) -> Option<std::net::SocketAddr> {
+    let parsed = crate::routing::parse_url(url.split_whitespace().next()?)?;
+    let ip = if parsed.host == "localhost" {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    } else {
+        parsed.host.parse().ok()?
+    };
+    Some(std::net::SocketAddr::new(ip, parsed.port))
+}
+
+fn resolve_server(
+    files: &[ServiceFile],
+    env_password: Option<&str>,
+) -> (std::net::SocketAddr, Option<String>) {
+    let (address, matched_password) = files
+        .iter()
+        .find_map(|f| Some((f.address()?, f.password())))
+        .unwrap_or_else(|| {
+            (
+                std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_SERVER_PORT)),
+                None,
+            )
+        });
+    let password = matched_password
+        .or_else(|| non_empty(env_password))
+        .or_else(|| files.iter().find_map(ServiceFile::password));
+    (address, password)
+}
+
+/// Finds the local OpenCode V2 server from its state registration (`$XDG_STATE_HOME/opencode/service.json`
+/// or `~/.local/state/opencode/service.json`), service config (`$OPENCODE_CONFIG_DIR/service.json`
+/// or `~/.config/opencode/service.json`), and `OPENCODE_PASSWORD`.
+fn local_server() -> (std::net::SocketAddr, Option<String>) {
+    let env_dir = |name: &str| {
+        std::env::var_os(name)
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+    };
+    let home = dirs::home_dir();
+    let files: Vec<ServiceFile> = [
+        env_dir("XDG_STATE_HOME").map(|d| d.join("opencode/service.json")),
+        home.as_ref()
+            .map(|h| h.join(".local/state/opencode/service.json")),
+        env_dir("OPENCODE_CONFIG_DIR").map(|d| d.join("service.json")),
+        env_dir("XDG_CONFIG_HOME").map(|d| d.join("opencode/service.json")),
+        home.as_ref()
+            .map(|h| h.join(".config/opencode/service.json")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|p| ServiceFile::load(&p))
+    .collect();
+    let env_password = std::env::var("OPENCODE_PASSWORD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("OPENCODE_SERVER_PASSWORD").ok());
+    resolve_server(&files, env_password.as_deref())
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = u32::from_be_bytes([0, c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)]);
+        let ch = |shift: u32| char::from(TABLE[((n >> shift) & 63) as usize]);
+        out.extend([
+            ch(18),
+            ch(12),
+            if c.len() > 1 { ch(6) } else { '=' },
+            if c.len() > 2 { ch(0) } else { '=' },
+        ]);
+    }
+    out
+}
+
+fn http_get(
+    address: std::net::SocketAddr,
+    password: Option<&str>,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let connect = SERVER_CONNECT_TIMEOUT
+        .min(timeout)
+        .max(std::time::Duration::from_millis(1));
+    let timeout = timeout.max(std::time::Duration::from_millis(1));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, connect)
+        .with_context(|| format!("Could not reach server at http://{address}"))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))?;
+    let auth = match password {
+        Some(password) if !password.contains(['\r', '\n']) => format!(
+            "Authorization: Basic {}\r\n",
+            base64(format!("opencode:{password}").as_bytes())
+        ),
+        _ => String::new(),
+    };
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{auth}Connection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .with_context(|| format!("Could not write to server at http://{address}"))?;
+    let mut bytes = Vec::new();
+    stream
+        .take(SERVER_RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("OpenCode at http://{address} didn't answer in time"))?;
+    ensure!(
+        bytes.len() as u64 <= SERVER_RESPONSE_LIMIT,
+        "OpenCode response too large"
+    );
+    let split = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("Invalid OpenCode HTTP response")?;
+    let header = std::str::from_utf8(&bytes[..split]).context("Invalid OpenCode HTTP header")?;
+    let status: u16 = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("Missing OpenCode HTTP status")?
+        .parse()
+        .context("Invalid OpenCode HTTP status")?;
+    let body = bytes[split + 4..].to_vec();
+    if let Some(length) = header
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+    {
+        ensure!(body.len() == length, "Incomplete OpenCode HTTP response");
+    }
+    ensure!(
+        (200..300).contains(&status),
+        "OpenCode API failed: HTTP {status}"
+    );
+    Ok(body)
+}
+
+/// [`api_get`] for routing: talks HTTP directly to the local OpenCode server with a
+/// [`SERVER_CONNECT_TIMEOUT`] connect cap and `timeout` read deadline, instead of spawning
+/// `opencode2 api` per request.
+pub fn api_get_within(path: &str, timeout: std::time::Duration) -> Result<Vec<u8>> {
+    if agent_host().is_some() {
+        return opencode_api("get", path, None);
+    }
+    let (address, password) = local_server();
+    http_get(address, password.as_deref(), path, timeout)
+}
+
 /// How many pages of root sessions (100 each, newest first) a search reads before giving up.
-/// Each page is an `opencode2 api` process, plus an SSH connection with `agentHost`.
 pub const ROOT_SEARCH_PAGES: usize = 5;
 const ROOT_PAGE: usize = 100;
 
@@ -999,8 +1366,10 @@ pub fn find_root_session(
             .as_array()
             .or_else(|| response.get("data").and_then(|data| data.as_array()))
             .context("Missing OpenCode session list")?;
-        for session in data {
-            let session = serde_json::from_value::<OpenCodeSession>(session.clone())?;
+        for session in data
+            .iter()
+            .filter_map(|s| serde_json::from_value::<OpenCodeSession>(s.clone()).ok())
+        {
             // The API has no archived filter.
             if !session.is_open_root() {
                 continue;
@@ -1026,7 +1395,7 @@ pub fn find_root_session(
     Ok(None)
 }
 
-fn normalize_slug(text: &str) -> String {
+pub(crate) fn normalize_slug(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
@@ -1144,7 +1513,9 @@ pub fn resolve_opencode_session_with(
     let matched = matched
         .or_else(|| {
             let id = env_session.filter(|id| !id.trim().is_empty())?;
-            get_session(get, id).ok().filter(OpenCodeSession::is_open_root)
+            get_session(get, id)
+                .ok()
+                .filter(OpenCodeSession::is_open_root)
         })
         .or(newest)
         .context("No root OpenCode session found; pass a session ID")?;
@@ -1523,14 +1894,23 @@ mod tests {
         let addressed = recorded_destination(&dir);
         assert_eq!(addressed.as_deref(), Some("ses_ios"));
         let addressed = addressed.as_deref();
-        assert_eq!(choose_destination(None, addressed, false).unwrap(), Some("ses_ios"));
+        assert_eq!(
+            choose_destination(None, addressed, false).unwrap(),
+            Some("ses_ios")
+        );
         assert!(choose_destination(Some("ses_motion"), addressed, false).is_err());
         assert_eq!(
             choose_destination(Some("ses_motion"), addressed, true).unwrap(),
             Some("ses_motion")
         );
-        assert_eq!(choose_destination(Some("ses_ios"), addressed, false).unwrap(), Some("ses_ios"));
-        assert_eq!(choose_destination(Some("ses_x"), None, false).unwrap(), Some("ses_x"));
+        assert_eq!(
+            choose_destination(Some("ses_ios"), addressed, false).unwrap(),
+            Some("ses_ios")
+        );
+        assert_eq!(
+            choose_destination(Some("ses_x"), None, false).unwrap(),
+            Some("ses_x")
+        );
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(recorded_destination(&dir), None);
     }
@@ -1581,17 +1961,45 @@ mod tests {
     }
 
     #[test]
+    fn apple_locale_round_trips_and_keeps_other_keys() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(apple_locale_from(&config), None);
+        assert_eq!(config.auto_send, Some(false));
+
+        for (value, expected) in [
+            ("zh-TW".into(), Some("zh-TW")),
+            ("bad value".into(), None),
+            (5.into(), None),
+            (serde_json::Value::Null, None),
+        ] {
+            set_config_value_in(&path, "appleLocale", value).unwrap();
+            let config = load_config_from(&path);
+            assert_eq!(apple_locale_from(&config).as_deref(), expected);
+            assert_eq!(config.ingest_token.as_deref(), Some("abc"));
+            assert_eq!(config.auto_send, Some(false));
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(raw.get("appleLocale").is_none());
+    }
+
+    #[test]
     fn transcriber_preference_round_trips_and_keeps_other_keys() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
         fs::write(&path, br#"{"ingestToken":"abc","autoSend":false}"#).unwrap();
         let config = load_config_from(&path);
-        assert_eq!((config.transcriber, config.hex_model), (None, None));
+        assert_eq!((&config.transcriber, &config.hex_model), (&None, &None));
+        assert_eq!(hex_language_from(&config), "en");
         set_config_value_in(&path, "transcriber", "hex".into()).unwrap();
         set_config_value_in(&path, "hexModel", "parakeet_v3".into()).unwrap();
+        set_config_value_in(&path, "hexLanguage", "nl".into()).unwrap();
         let config = load_config_from(&path);
         assert_eq!(config.transcriber.as_deref(), Some("hex"));
         assert_eq!(config.hex_model.as_deref(), Some("parakeet_v3"));
+        assert_eq!(hex_language_from(&config), "nl");
         assert_eq!(config.ingest_token.as_deref(), Some("abc"));
         assert_eq!(config.auto_send, Some(false));
         #[cfg(unix)]
@@ -1603,10 +2011,28 @@ mod tests {
     }
 
     #[test]
+    fn malformed_command_keys_never_reset_the_rest_of_the_config() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("config.json");
+        fs::write(
+            &path,
+            br#"{"transcriber":"command","autoSend":false,"transcribeCommand":"whisper {audio}","transcribeTimeoutSeconds":"soon"}"#,
+        )
+        .unwrap();
+        let config = load_config_from(&path);
+        assert_eq!(config.transcriber.as_deref(), Some("command"));
+        assert_eq!(config.auto_send, Some(false));
+    }
+
+    #[test]
     fn auto_send_defaults_on_and_the_toggle_keeps_other_keys() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
-        fs::write(&path, br#"{"ingestToken":"abc","retention":{"mediaDays":7}}"#).unwrap();
+        fs::write(
+            &path,
+            br#"{"ingestToken":"abc","retention":{"mediaDays":7}}"#,
+        )
+        .unwrap();
         assert_eq!(load_config_from(&path).auto_send, None);
         set_config_value_in(&path, "autoSend", serde_json::Value::Bool(false)).unwrap();
         let config = load_config_from(&path);
@@ -1617,7 +2043,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -1640,7 +2069,8 @@ mod tests {
         assert_eq!(v2.directory(), Some("/p/a"));
         assert!(v2.is_open_root());
         let v1: OpenCodeSession =
-            serde_json::from_str(r#"{"id":"ses_b","parentID":"ses_a","directory":"/p/b"}"#).unwrap();
+            serde_json::from_str(r#"{"id":"ses_b","parentID":"ses_a","directory":"/p/b"}"#)
+                .unwrap();
         assert_eq!(v1.directory(), Some("/p/b"));
         assert!(!v1.is_open_root());
         assert_eq!(v1.label(), "ses_b");
@@ -1662,6 +2092,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_captures_folder_is_refused() {
+        let root = std::env::temp_dir().join(format!("scrawl-usable-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(!usable_captures_dir(&file.join("inside")));
+        assert!(usable_captures_dir(&root.join("new folder")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn captures_dir_takes_absolute_and_home_paths_only() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(configured_captures_dir("~"), Some(home.clone()));
+        assert_eq!(
+            configured_captures_dir(" ~/Scrawl Captures "),
+            Some(home.join("Scrawl Captures"))
+        );
+        let absolute = std::env::temp_dir().join("captures");
+        assert_eq!(
+            configured_captures_dir(&absolute.display().to_string()),
+            Some(absolute)
+        );
+        assert_eq!(configured_captures_dir("captures"), None);
+        assert_eq!(configured_captures_dir("~someone/captures"), None);
+        assert_eq!(configured_captures_dir("  "), None);
+    }
+
+    #[test]
     fn one_bad_setting_never_resets_the_others() {
         let fixture = Fixture::new();
         let path = fixture.0.join("config.json");
@@ -1678,7 +2137,11 @@ mod tests {
         assert_eq!(cfg.native_pill, None);
         assert!(cfg.usb_apps.is_empty());
         // Both spellings of one field: one is kept rather than neither.
-        fs::write(&path, r#"{"usbApps": ["a"], "tetherApps": ["b"], "agentHost": "pro"}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"usbApps": ["a"], "tetherApps": ["b"], "agentHost": "pro"}"#,
+        )
+        .unwrap();
         let cfg = load_config_from(&path);
         assert_eq!(cfg.agent_host.as_deref(), Some("pro"));
         assert_eq!(cfg.usb_apps.len(), 1);
@@ -1718,6 +2181,139 @@ mod tests {
         enable_experiment("enabledForThisTest");
         assert!(experiment("enabledForThisTest"));
     }
+
+    #[test]
+    fn server_addresses_parse_without_lookups() {
+        let addr = |s: &str| server_address(s).map(|a| a.to_string());
+        assert_eq!(
+            addr("http://127.0.0.1:4096\nmore").as_deref(),
+            Some("127.0.0.1:4096")
+        );
+        assert_eq!(
+            addr("http://localhost:4096/").as_deref(),
+            Some("127.0.0.1:4096")
+        );
+        assert_eq!(addr("http://[::1]:5000").as_deref(), Some("[::1]:5000"));
+        assert_eq!(addr("https://10.0.0.2").as_deref(), Some("10.0.0.2:443"));
+        assert_eq!(addr("http://studio.example.ts.net:4096"), None);
+        assert_eq!(addr("nonsense"), None);
+    }
+
+    #[test]
+    fn server_endpoint_reads_state_and_config_service_files() {
+        let fixture = Fixture::new();
+        let state_path = fixture.0.join("state-service.json");
+        let config_path = fixture.0.join("config-service.json");
+        fs::write(
+            &state_path,
+            r#"{"id":"s1","url":"http://127.0.0.1:49374","pid":123,"password":"secret-state"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &config_path,
+            r#"{"hostname":"127.0.0.1","port":4096,"password":"secret-config","env":{"API_KEY":"ignored"}}"#,
+        )
+        .unwrap();
+        let state = ServiceFile::load(&state_path).unwrap();
+        let config = ServiceFile::load(&config_path).unwrap();
+
+        // State registration wins over service config when both exist.
+        let (addr, pw) = resolve_server(&[state, config], None);
+        assert_eq!(addr, "127.0.0.1:49374".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("secret-state"));
+
+        // When state registration is absent, config's hostname/port and password are used.
+        let config = ServiceFile::load(&config_path).unwrap();
+        let (addr, pw) = resolve_server(&[config], None);
+        assert_eq!(addr, "127.0.0.1:4096".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("secret-config"));
+
+        // With no address in files, the default port and OPENCODE_PASSWORD are used.
+        let (addr, pw) = resolve_server(&[], Some("env-pw"));
+        assert_eq!(addr, "127.0.0.1:49374".parse().unwrap());
+        assert_eq!(pw.as_deref(), Some("env-pw"));
+    }
+
+    #[test]
+    fn http_get_authenticates_and_times_out_when_slow() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for i in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0_u8; 256];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let head = String::from_utf8_lossy(&req);
+                match i {
+                    0 => {
+                        assert!(
+                            head.contains("Authorization: Basic b3BlbmNvZGU6c2VjcmV0\r\n"),
+                            "{head}"
+                        );
+                        let body = br#"{"data":[]}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(body).unwrap();
+                    }
+                    1 => {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .unwrap();
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                }
+            }
+        });
+
+        let body = http_get(
+            address,
+            Some("secret"),
+            "/api/session",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(body, br#"{"data":[]}"#);
+
+        let err = http_get(
+            address,
+            Some("secret"),
+            "/api/session/missing",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP 404"), "{err:#}");
+
+        let started = Instant::now();
+        let err = http_get(
+            address,
+            Some("secret"),
+            "/api/session",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("didn't answer"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = server.join();
+    }
 }
 
 #[cfg(test)]
@@ -1727,7 +2323,8 @@ mod sync_live_check {
     #[test]
     #[ignore]
     fn sync_to_pro() {
-        let base = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Caches/scrawl-sync-live");
+        let base = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join("Library/Caches/scrawl-sync-live");
         let _ = std::fs::remove_dir_all(&base);
         let bundle = base.join("scrawl-synctest.scrawl");
         std::fs::create_dir_all(bundle.join("frames-full")).unwrap();
@@ -1746,8 +2343,18 @@ mod sync_live_check {
                 break;
             }
         }
-        let _ = super::ssh("pro").arg(format!("rm -rf {}", super::shell_quote(&base.to_string_lossy()))).status();
-        assert!(out.contains("8000000") && out.contains("frame-01.png") && !out.contains(super::MEDIA_PENDING), "{out}");
+        let _ = super::ssh("pro")
+            .arg(format!(
+                "rm -rf {}",
+                super::shell_quote(&base.to_string_lossy())
+            ))
+            .status();
+        assert!(
+            out.contains("8000000")
+                && out.contains("frame-01.png")
+                && !out.contains(super::MEDIA_PENDING),
+            "{out}"
+        );
     }
 }
 
@@ -1763,6 +2370,7 @@ pub(crate) mod fake_api {
             parent_id: None,
             time: OpenCodeSessionTime {
                 updated,
+                viewed: None,
                 archived: None,
             },
             location: Some(OpenCodeSessionLocation {
@@ -1772,30 +2380,15 @@ pub(crate) mod fake_api {
         }
     }
 
-    fn decode(text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' {
-                out.push(u8::from_str_radix(&text[i + 1..i + 3], 16).unwrap());
-                i += 3;
-            } else {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-        String::from_utf8(out).unwrap()
-    }
-
     /// Answers `GET /api/session/{id}` and `GET /api/session?…` like OpenCode 2: newest first,
     /// `parentID=null`, exact `directory`, `limit` (default 50), and a cursor carrying the filters.
     pub fn serve(sessions: &[OpenCodeSession], path: &str) -> Result<Vec<u8>> {
+        use crate::ax::percent_decode;
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         if let Some(id) = route.strip_prefix("/api/session/") {
             let session = sessions
                 .iter()
-                .find(|s| s.id == decode(id))
+                .find(|s| s.id == percent_decode(id))
                 .context("404 Not Found")?;
             return Ok(serde_json::to_vec(&serde_json::json!({ "data": session }))?);
         }
@@ -1803,7 +2396,7 @@ pub(crate) mod fake_api {
         let mut params: std::collections::HashMap<String, String> = query
             .split('&')
             .filter_map(|pair| pair.split_once('='))
-            .map(|(k, v)| (k.to_owned(), decode(v)))
+            .map(|(k, v)| (k.to_owned(), percent_decode(v)))
             .collect();
         let mut offset = 0;
         if let Some(cursor) = params.remove("cursor") {
@@ -1848,7 +2441,14 @@ mod session_lookup {
 
     fn many(count: usize) -> Vec<OpenCodeSession> {
         (0..count)
-            .map(|i| session(&format!("ses_{i:05}"), &format!("Chat {i}"), "/p/x", 100_000 - i as u64))
+            .map(|i| {
+                session(
+                    &format!("ses_{i:05}"),
+                    &format!("Chat {i}"),
+                    "/p/x",
+                    100_000 - i as u64,
+                )
+            })
             .collect()
     }
 

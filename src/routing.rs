@@ -11,6 +11,7 @@
 //! [`look`] gathers (`docs/routing.md`).
 
 pub mod look;
+pub mod served;
 pub mod smart;
 
 /// The experiment that routes Mac captures with [`smart`] (`handoff::experiment`).
@@ -181,16 +182,35 @@ pub fn browser_tab_url(bundle_id: &str) -> Option<String> {
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read as _;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    // Read as it's written: output larger than a pipe's buffer would otherwise stall the child.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                return Some(std::process::Output {
+                    status,
+                    stdout: stdout.join().ok()?,
+                    stderr: stderr.join().ok()?,
+                });
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
@@ -291,8 +311,7 @@ pub fn session_for_directory(
     whole_tree: bool,
 ) -> Result<Option<OpenCodeSession>> {
     use crate::handoff::{ROOT_SEARCH_PAGES, Scan, find_root_session, query_escape};
-    let home = dirs::home_dir();
-    if root == Path::new("/") || Some(root) == home.as_deref() {
+    if smart::is_home_or_root(root) {
         return Ok(None);
     }
     let directory = format!("&directory={}", query_escape(&root.to_string_lossy()));
@@ -323,8 +342,8 @@ pub fn session_for_directory(
 pub struct Hooks {
     pub sdk: fn(&str) -> Option<Registration>,
     pub listener_dir: fn(u16) -> Option<PathBuf>,
-    /// One `GET` against OpenCode's API.
-    pub api: fn(&str) -> Result<Vec<u8>>,
+    /// One `GET` against OpenCode's API, given up after the time given.
+    pub api: fn(&str, Duration) -> Result<Vec<u8>>,
 }
 
 impl Default for Hooks {
@@ -332,8 +351,30 @@ impl Default for Hooks {
         Self {
             sdk: crate::web::lookup,
             listener_dir: listener_directory,
-            api: crate::handoff::api_get,
+            api: crate::handoff::api_get_within,
         }
+    }
+}
+
+/// How long one capture's routing may spend reading sessions, all requests together.
+pub const SESSIONS_BUDGET: Duration = Duration::from_secs(3);
+
+/// `api` limited to `budget` in all, counted from its first request: each request gets what's
+/// left, and none starts after.
+pub fn within(
+    api: fn(&str, Duration) -> Result<Vec<u8>>,
+    budget: Duration,
+) -> impl FnMut(&str) -> Result<Vec<u8>> {
+    let mut deadline = None;
+    move |path| {
+        let deadline = *deadline.get_or_insert_with(|| Instant::now() + budget);
+        let left = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !left.is_zero(),
+            "OpenCode took over {} ms to list sessions",
+            budget.as_millis()
+        );
+        api(path, left)
     }
 }
 
@@ -347,11 +388,10 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
         url: Some(url.to_owned()),
         directory: dir.map(|d| d.display().to_string()),
     };
-    let mut api = hooks.api;
-    let by_directory = |dir: &Path, via: &str| {
+    let mut api = within(hooks.api, SESSIONS_BUDGET);
+    let by_directory = |api: &mut ApiGet, dir: &Path, via: &str| {
         let (root, git) = project_root(dir);
-        let mut api = hooks.api;
-        session_for_directory(&mut api, &root, git)
+        session_for_directory(api, &root, git)
             .map_err(|err| format!("couldn't list sessions: {err:#}"))?
             .map(|s| destination(&s, via, Some(&root)))
             .ok_or_else(|| format!("no open OpenCode session in {}", root.display()))
@@ -370,7 +410,7 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
             });
         }
         if let Some(dir) = reg.directory.as_deref() {
-            return by_directory(Path::new(dir), "sdk");
+            return by_directory(&mut api, Path::new(dir), "sdk");
         }
     }
     if !parsed.is_loopback() {
@@ -378,7 +418,11 @@ pub fn route(url: &str, hooks: &Hooks) -> std::result::Result<Destination, Strin
     }
     let dir = (hooks.listener_dir)(parsed.port)
         .ok_or_else(|| format!("no process found listening on port {}", parsed.port))?;
-    by_directory(&dir, "localhost")
+    by_directory(&mut api, &dir, "localhost")
+}
+
+fn routing_enabled() -> bool {
+    crate::handoff::auto_send() && std::env::var_os("SCRAWL_NO_OPENCODE").is_none()
 }
 
 /// Decides where a capture that just finished goes; `None` (logged) keeps it on the clipboard.
@@ -386,7 +430,7 @@ pub fn route_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<Destination> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
+    if !routing_enabled() {
         return None;
     }
     let url = capture_url(front_bundle_id, target_bundle_id)?;
@@ -411,14 +455,8 @@ pub fn look_capture(
     front_bundle_id: Option<&str>,
     target_bundle_id: Option<&str>,
 ) -> Option<look::Live> {
-    if !crate::handoff::auto_send() || std::env::var_os("SCRAWL_NO_OPENCODE").is_some() {
-        return None;
-    }
-    Some(look::look_live(
-        front_bundle_id,
-        target_bundle_id,
-        &look::Senses::default(),
-    ))
+    routing_enabled()
+        .then(|| look::look_live(front_bundle_id, target_bundle_id, &look::Senses::default()))
 }
 
 /// Smart routing's second half, once the bundle is built: decides, saves the evidence beside
@@ -438,7 +476,7 @@ pub fn judge_capture(
         scrawl_log(format!("routing: couldn't save {RECORD}: {err:#}"));
     }
     let outcome = match &judgement.decision {
-        smart::Decision::Send { to } => {
+        smart::Decision::Send { to, .. } => {
             format!("send to {} ({})", to.candidate.label(), to.candidate.id)
         }
         smart::Decision::Offer { choices } => format!(
@@ -488,7 +526,10 @@ pub fn explain_bundle(bundle: &Path, url: Option<&str>) -> Result<String> {
         .map(str::to_owned)
         .or_else(|| loaded.destination.as_ref().and_then(|d| d.url.clone()));
     if replayed {
-        let _ = writeln!(out, "Evidence  saved at capture time ({RECORD})");
+        let _ = writeln!(
+            out,
+            "Evidence  saved at capture time ({RECORD}); the bundle's clues read again with today's rules"
+        );
     } else {
         let _ = writeln!(
             out,
@@ -549,22 +590,9 @@ pub fn record_destination(dir: &Path, bundle: &mut ScrawlBundle, dest: Destinati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::{OpenCodeSessionLocation, OpenCodeSessionTime};
 
     fn session(id: &str, dir: &str, updated: u64) -> OpenCodeSession {
-        OpenCodeSession {
-            id: id.into(),
-            title: id.to_uppercase(),
-            parent_id: None,
-            time: OpenCodeSessionTime {
-                updated,
-                archived: None,
-            },
-            location: Some(OpenCodeSessionLocation {
-                directory: Some(dir.into()),
-            }),
-            directory: None,
-        }
+        crate::handoff::fake_api::session(id, &id.to_uppercase(), dir, updated)
     }
 
     #[test]
@@ -683,7 +711,10 @@ mod tests {
             (found, requests)
         };
         // Exact folder: one filtered request.
-        assert_eq!(pick(&sessions, "/p/app", false), (Some("ses_app".into()), 1));
+        assert_eq!(
+            pick(&sessions, "/p/app", false),
+            (Some("ses_app".into()), 1)
+        );
         // A subfolder needs a newest-first scan, which is capped: past it the exact match stands.
         let (found, requests) = pick(&sessions, "/p/app", true);
         assert_eq!(found.as_deref(), Some("ses_app"));
@@ -724,7 +755,7 @@ mod tests {
     fn listener(port: u16) -> Option<PathBuf> {
         (port == 4321).then(|| PathBuf::from("/p/app"))
     }
-    fn api(path: &str) -> Result<Vec<u8>> {
+    fn api(path: &str, _: Duration) -> Result<Vec<u8>> {
         crate::handoff::fake_api::serve(
             &[
                 session("ses_sdk", "/elsewhere", 5),
@@ -732,6 +763,61 @@ mod tests {
             ],
             path,
         )
+    }
+
+    fn down(_: &str, _: Duration) -> Result<Vec<u8>> {
+        anyhow::bail!("OpenCode API failed: Error: Could not reach server at http://127.0.0.1:4096")
+    }
+    /// Answers each request after 200 ms, or fails once the time it's given runs out.
+    fn slow(path: &str, left: Duration) -> Result<Vec<u8>> {
+        let delay = Duration::from_millis(200);
+        std::thread::sleep(delay.min(left));
+        anyhow::ensure!(left >= delay, "no answer");
+        let sessions: Vec<_> = (0..250)
+            .map(|i| session(&format!("ses_{i}"), "/q", 1_000 + i))
+            .chain([session("ses_app", "/p/app", 10)])
+            .collect();
+        crate::handoff::fake_api::serve(&sessions, path)
+    }
+
+    #[test]
+    fn a_down_or_slow_server_costs_routing_a_bounded_time() {
+        let hooks = Hooks {
+            sdk: no_sdk,
+            listener_dir: listener,
+            api: down,
+        };
+        let started = Instant::now();
+        let err = route("http://127.0.0.1:4321/", &hooks).unwrap_err();
+        assert!(err.contains("Could not reach server"), "{err}");
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Every request shares one budget, counted from the first: reading pages stops when
+        // it's spent instead of waiting out each request in turn.
+        let budget = Duration::from_millis(500);
+        let mut requests = 0;
+        let mut api = within(slow, budget);
+        let started = Instant::now();
+        let result = crate::routing::look::read_candidates(
+            &mut |path: &str| {
+                requests += 1;
+                api(path)
+            },
+            &[PathBuf::from("/p/app"), PathBuf::from("/p/other")],
+            &[],
+            look::SESSION_PAGES,
+        );
+        assert!(result.is_err());
+        // Two pages answer, the first folder's read gets the last 100 ms and fails, and the
+        // second is never asked: 500 ms, not the 800 ms four requests take.
+        let took = started.elapsed();
+        assert!((2..4).contains(&requests), "{requests}");
+        assert!(took < Duration::from_millis(700), "{took:?}");
+
+        // A server that answers in time routes as usual.
+        let hooks = Hooks { api: slow, ..hooks };
+        let local = route("http://127.0.0.1:4321/", &hooks).unwrap();
+        assert_eq!(local.session, "ses_app");
     }
 
     #[test]

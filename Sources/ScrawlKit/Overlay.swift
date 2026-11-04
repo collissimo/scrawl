@@ -11,6 +11,10 @@
     private var regions: [OverlayRegion: CGRect] = [:]
     private unowned let scrawl: Scrawl
     private var drawingTouch: UITouch?
+    private var presentationLink: CADisplayLink?
+    private var presentationTrace: StartupTrace?
+    private var afterPresentation: (@MainActor () -> Void)?
+    private var preparationStart: CFTimeInterval?
     var isActivelyDrawing: Bool { drawingTouch != nil }
     /// The red ink, under the strip. UIKit layers rather than SwiftUI, so a touch redraws only the
     /// stroke's live tip.
@@ -22,7 +26,12 @@
       windowLevel = .alert + 10
       backgroundColor = .clear
       let host = UIHostingController(rootView: OverlayView(scrawl: scrawl) { [weak self] region, frame in
-        self?.regions[region] = frame.isEmpty ? nil : frame
+        guard let self else { return }
+        regions[region] = frame.isEmpty ? nil : frame
+        if region == .strip, !frame.isEmpty, let start = preparationStart {
+          preparationStart = nil
+          scrawl.startupObserver?(.init(stage: "prewarmLayout", milliseconds: (CACurrentMediaTime() - start) * 1000, onMainThread: true))
+        }
       })
       host.view.backgroundColor = .clear
       rootViewController = host
@@ -31,17 +40,73 @@
       insertSubview(ink, at: 0)
       ink.onStroke = { [unowned scrawl] samples in scrawl.record(stroke: samples) }
       ink.onFade = { [unowned scrawl] strokes, uptime in scrawl.recordFade(of: strokes, at: uptime) }
+      isHidden = true
+    }
+
+    func prepareLayout() {
+      preparationStart = CACurrentMediaTime()
+      // A hidden UIWindow doesn't mount SwiftUI's glass hierarchy. Mount it transparently
+      // during the deliberate hold so its first body/layout aren't on recognition's frame.
+      alpha = 0
       isHidden = false
+      rootViewController?.loadViewIfNeeded()
+      rootViewController?.view.frame = bounds
+      rootViewController?.view.layoutIfNeeded()
+    }
+
+    func present(trace: StartupTrace?) {
+      let hasLaidOutControls = regions[.strip] != nil
+      isHidden = false
+      alpha = 1
+      // A transparently prepared strip already has content. Revealing the window does not
+      // need another SwiftUI layout; observe its next presentation opportunity directly.
+      if hasLaidOutControls {
+        trace?.mark("stripLayout")
+        presentationLink?.invalidate()
+        presentationTrace = trace
+        let link = CADisplayLink(target: self, selector: #selector(presented))
+        presentationLink = link
+        link.add(to: .main, forMode: .common)
+      }
+    }
+
+    @objc private func presented() {
+      presentationLink?.invalidate()
+      presentationLink = nil
+      if !isHidden, alpha > 0 { presentationTrace?.mark("firstDraw") }
+      presentationTrace = nil
+      let action = afterPresentation
+      afterPresentation = nil
+      // Let this display turn commit before cold AVFoundation/VideoToolbox initialization
+      // can contend with UIKit, even though the setup itself runs on background queues.
+      if let action { DispatchQueue.main.async(execute: action) }
+    }
+
+    func afterFirstPresentation(_ action: @escaping @MainActor () -> Void) {
+      if presentationLink != nil {
+        afterPresentation = action
+      } else {
+        action()
+      }
+    }
+
+    func dismiss() {
+      presentationLink?.invalidate()
+      presentationLink = nil
+      presentationTrace = nil
+      afterPresentation = nil
+      isHidden = true
     }
 
     @available(*, unavailable)
     required init?(coder _: NSCoder) { fatalError() }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+      guard alpha > 0, !isHidden else { return nil }
       if regions.values.contains(where: { $0.insetBy(dx: -8, dy: -8).contains(point) }) {
         return super.hitTest(point, with: event)
       }
-      if scrawl.isRecording, scrawl.isDrawing {
+      if scrawl.isRecording || scrawl.isStarting, scrawl.isDrawing {
         return self
       }
       return nil
@@ -49,7 +114,7 @@
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
       // One finger draws at a time; others are ignored until it lifts.
-      guard scrawl.isRecording, scrawl.isDrawing, drawingTouch == nil, let touch = touches.first else {
+      guard scrawl.isRecording || scrawl.isStarting, scrawl.isDrawing, drawingTouch == nil, let touch = touches.first else {
         if drawingTouch == nil { super.touchesBegan(touches, with: event) }
         return
       }
@@ -97,11 +162,15 @@
     var body: some View {
       // The ink is `OverlayWindow.ink`, under this view.
       StripPlacement(mode: stripMode, actions: actions, notice: scrawl.isRecording ? scrawl.notice : nil)
+        .environment(\.scrawlStartupTrace, scrawl.startupTrace)
     }
 
     private var stripMode: ScrawlStrip.Mode? {
-      if scrawl.isRecording, let startedAt = scrawl.startedAt {
+      if scrawl.isRecording || scrawl.isStarting, let startedAt = scrawl.startedAt {
         return .recording(startedAt: startedAt, isDrawing: scrawl.isDrawing)
+      }
+      if let preparedAt = scrawl.preparedAt {
+        return .recording(startedAt: preparedAt, isDrawing: false)
       }
       if scrawl.isDiscardPending {
         return .discarded
