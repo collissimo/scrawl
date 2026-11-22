@@ -1064,6 +1064,17 @@ pub fn selftest() -> Result<bool> {
 
     let sample = "Hallo Welt, das ist ein Test mit Umlauten: äöü ß.";
     session.type_text(sample)?;
+    // The path a dictation's text takes: the screen must settle with text in the prompt.
+    let started = Instant::now();
+    let settled = session.wait_settled(SETTLE_TIMEOUT);
+    ok &= settled.is_ok();
+    println!(
+        "settled with text in the prompt: {}",
+        match &settled {
+            Ok(_) => format!("after {:.2} s", started.elapsed().as_secs_f64()),
+            Err(error) => format!("no ({error:#})"),
+        }
+    );
     let captured = session.capture(CAPTURE_TIMEOUT)?;
     let exact = captured == sample;
     ok &= exact;
