@@ -261,6 +261,9 @@ impl Session {
         let args = [
             "--settings".to_owned(),
             settings.to_string_lossy().into_owned(),
+            // No plugins, mods, hooks or keybindings of the user's: a mod animating on screen
+            // keeps it from ever settling, and a keybinding could take Ctrl+G or the space.
+            "--safe-mode".into(),
             "--permission-mode".into(),
             "plan".into(),
             "--strict-mcp-config".into(),
