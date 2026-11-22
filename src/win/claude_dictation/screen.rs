@@ -194,10 +194,10 @@ pub fn preview(rows: &[String]) -> String {
     text.trim().trim_end_matches(LEVEL_BARS).trim().to_owned()
 }
 
-/// Waits for the screen to settle: not busy, and unchanged for `SETTLE` (`SETTLE_ON_ERROR`
-/// with a dictation error showing).
+/// Waits for the screen to settle: not busy, and the prompt box and the dictation state
+/// unchanged for `SETTLE` (`SETTLE_ON_ERROR` with a dictation error showing).
 pub struct Settle {
-    last: Option<String>,
+    last: Option<(Vec<String>, State)>,
     since: Instant,
 }
 
@@ -209,20 +209,30 @@ impl Settle {
         }
     }
 
-    /// Feeds the screen as it is at `now`; true once it has settled.
+    /// Feeds the screen as it is at `now`; true once it has settled. Only the prompt box (where
+    /// the dictated text lands) and the state read from the footer count, so anything animated
+    /// elsewhere (a mod's pet above the prompt, a clock in a status line) can't keep it from
+    /// settling. Without a prompt box the whole screen counts.
     pub fn observe(&mut self, rows: &[String], now: Instant) -> bool {
-        let text = rows.join("\n");
-        if self.last.as_deref() != Some(text.as_str()) {
-            self.last = Some(text);
-            self.since = now;
-        }
         let state = State::of(rows);
+        let layout = Layout::of(rows);
+        let watched = if layout.rules.len() >= 2 {
+            layout.prompt_box(rows)
+        } else {
+            rows
+        };
         let quiet_for = if state.error.is_some() {
             SETTLE_ON_ERROR
         } else {
             SETTLE
         };
-        !state.busy() && now.duration_since(self.since) >= quiet_for
+        let busy = state.busy();
+        let seen = (watched.to_vec(), state);
+        if self.last.as_ref() != Some(&seen) {
+            self.last = Some(seen);
+            self.since = now;
+        }
+        !busy && now.duration_since(self.since) >= quiet_for
     }
 }
 
@@ -372,5 +382,39 @@ mod tests {
             settle.observe(&failed, at(250)),
             "an error has no text to wait for"
         );
+    }
+
+    #[test]
+    fn an_animation_outside_the_prompt_box_does_not_hold_off_settling() {
+        // A mod (clawd-pet) animates above the prompt and its clock sits next to the footer;
+        // the screen as a whole then never holds still.
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let rule = "─".repeat(60);
+        let frame = |n: u64| {
+            let pet = if n % 2 == 0 {
+                "  ▄▄▀▀▀▄  Hi!"
+            } else {
+                "   ▀▄▄▀▀  zzz…"
+            };
+            lines(&format!(
+                "{pet}\n{rule}\n❯ Hallo Welt\n{rule}\n  ? for shortcuts   22:{n:02}"
+            ))
+        };
+        let mut settle = Settle::new(start);
+        let settled_at = (0..20)
+            .map(|n| n * 100)
+            .find(|&ms| settle.observe(&frame(ms / 100), at(ms)));
+        assert_eq!(settled_at, Some(600));
+
+        // A change inside the box still restarts it, animation or not.
+        let mut settle = Settle::new(start);
+        assert!(!settle.observe(&frame(0), at(0)));
+        let longer = lines(&format!(
+            "   ▀▄▄▀▀  zzz…\n{rule}\n❯ Hallo Welt, wie\n{rule}\n  ? for shortcuts   22:01"
+        ));
+        assert!(!settle.observe(&longer, at(500)));
+        assert!(!settle.observe(&longer, at(1_000)));
+        assert!(settle.observe(&longer, at(1_100)));
     }
 }
