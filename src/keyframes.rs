@@ -970,10 +970,7 @@ fn narrated_keyframes(
                 None if line.text.is_empty() => KeyframeReason::Initial,
                 None => KeyframeReason::Speech,
             };
-            let cursor = line.actions.iter().rev().find_map(|a| match &a.detail {
-                Detail::Clicks { points, .. } => points.last().copied(),
-                _ => None,
-            });
+            let cursor = line.cursor;
             let narrated = line.narrated(marks);
             let event = if narrated.actions.is_empty() {
                 match reason {
@@ -1251,6 +1248,54 @@ mod tests {
             keyframe.narration.as_ref().unwrap().actions,
             "tapped, clicked, pointed"
         );
+        assert_eq!(keyframe.cursor, None);
+    }
+
+    #[test]
+    fn narrated_drag_keyframe_skips_deselect_click_cursor() {
+        let frames: Vec<RgbaFrame> = (0..=16).map(|i| frame(i * 500, 20)).collect();
+        let words: Vec<WordTiming> = "Bitte entferne diesen Text hier."
+            .split(' ')
+            .enumerate()
+            .map(|(i, w)| WordTiming {
+                t0: 500 + i as u64 * 400,
+                t1: 500 + (i as u64 + 1) * 400,
+                text: w.into(),
+            })
+            .collect();
+        let transcript = TranscriptData {
+            source: "test".into(),
+            text: words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            words,
+            ..Default::default()
+        };
+        let drag = InteractionEvent::Drag {
+            t: 1_500,
+            t1: 2_500,
+            x0: 0.4,
+            y0: 0.2,
+            x1: 0.25,
+            y1: 0.2,
+            label: Some("text “Subtitle”".into()),
+            button: None,
+            path: Vec::new(),
+        };
+        let deselect = InteractionEvent::Click {
+            t: 5_000,
+            x: 0.1,
+            y: 0.5,
+            button: Some("left".into()),
+            label: Some("#main".into()),
+            role: Some("main".into()),
+        };
+        let keyframes = narrated(&frames, &mut [], &[drag, deselect], &transcript);
+        assert_eq!(keyframes.len(), 1);
+        assert_eq!(keyframes[0].t, 3_000);
+        assert_eq!(keyframes[0].cursor, None);
     }
 
     #[test]

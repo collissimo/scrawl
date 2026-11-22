@@ -720,7 +720,7 @@ fn context_value(raw: &str) -> String {
 }
 
 /// Agents given only the text fix what was said and skip the pictures, missing what only shows there.
-pub const LOOK_AT_IMAGES: &str = "Open contact-sheet.png and frames/ in that folder before changing anything: the marks and words only make sense on the images, which can show more than the text does.";
+pub const LOOK_AT_IMAGES: &str = "Inspect contact-sheet.png (attached or in that folder) before changing anything: the marks and words only make sense on the images, which can show more than the text does. Open individual frames/frame-NN.png only when a panel needs more detail.";
 
 pub fn summary_markdown(bundle: &ScrawlBundle, bundle_dir: &std::path::Path) -> String {
     let agent_context = crate::handoff::experiment(crate::handoff::AGENT_CONTEXT);
