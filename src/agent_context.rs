@@ -379,13 +379,13 @@ fn fold_repeats(items: Vec<(u64, String)>) -> Vec<(u64, String)> {
 
 /// A drag worth a line: one that names what it moved, or an unnamed one that went far.
 #[derive(Clone, Debug, PartialEq)]
-struct Drag {
-    verb: &'static str,
-    name: Option<String>,
-    direction: String,
+pub struct Drag {
+    pub verb: &'static str,
+    pub name: Option<String>,
+    pub direction: String,
 }
 
-fn drag_text(event: &InteractionEvent) -> Option<Drag> {
+pub(crate) fn drag_text(event: &InteractionEvent) -> Option<Drag> {
     let InteractionEvent::Drag {
         x0,
         y0,
@@ -463,35 +463,34 @@ impl DragRun {
     }
 
     fn line(self) -> (u64, String) {
-        let first = &self.drags[0];
-        let mut text = first.verb.to_owned();
-        if let Some(name) = &first.name {
-            text.push(' ');
-            text.push_str(&quote_label(name));
-        }
-        let count = self.drags.len();
-        let same_way = self.drags.iter().all(|d| d.direction == first.direction);
-        // A scrub's direction and count say nothing; the dev page reports where it landed.
-        if first.verb != "scrubbed" && first.verb != "long-pressed" {
-            if same_way && first.direction != "a little" {
-                text.push(' ');
-                text.push_str(&first.direction);
-            } else if !same_way {
-                text.push_str(" back and forth");
-            }
-        }
-        if count > 1 && first.verb != "scrubbed" {
-            text.push_str(&format!(" ×{count}"));
-        }
-        (self.t, text)
+        (self.t, format_drag_group(&self.drags))
     }
 }
 
-/// One drag as its line says it (`dragged right`, `scrubbed slider “Playback”`), or `None` for
-/// the hand's short unnamed moves.
-pub(crate) fn drag_line(event: &InteractionEvent) -> Option<String> {
-    let t = event.timestamp_ms();
-    drag_text(event).map(|drag| DragRun::new(drag, t, t).line().1)
+/// Formats one or more drags on the same target into a single phrase (`dragged “Title” left`,
+/// `dragged “Title” back and forth ×2`, `scrubbed slider “Playback”`).
+pub(crate) fn format_drag_group(drags: &[Drag]) -> String {
+    let first = &drags[0];
+    let mut text = first.verb.to_owned();
+    if let Some(name) = &first.name {
+        text.push(' ');
+        text.push_str(&quote_label(name));
+    }
+    let count = drags.len();
+    let same_way = drags.iter().all(|d| d.direction == first.direction);
+    // A scrub's direction and count say nothing; the dev page reports where it landed.
+    if first.verb != "scrubbed" && first.verb != "long-pressed" {
+        if same_way && first.direction != "a little" {
+            text.push(' ');
+            text.push_str(&first.direction);
+        } else if !same_way {
+            text.push_str(" back and forth");
+        }
+    }
+    if count > 1 && first.verb != "scrubbed" {
+        text.push_str(&format!(" ×{count}"));
+    }
+    text
 }
 
 /// What a mark is, as a keyframe's text says it (`circled “Area” (2 strokes)`).

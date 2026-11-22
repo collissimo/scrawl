@@ -737,7 +737,7 @@ pub struct SharedCaptureTelemetry {
     /// poller records clicks from polled button state.
     mouse_live: AtomicBool,
     last_shortcut_ms: AtomicU64,
-    drag_start: Mutex<Option<(u64, f32, f32, Option<String>, TargetFrame)>>,
+    drag_start: Mutex<Option<(u64, f32, f32, f64, f64, Option<String>, TargetFrame)>>,
     /// The `agentContext` experiment was on when this capture started: clicks and strokes are
     /// looked up in the Accessibility tree (`crate::ax`, macOS only).
     agent_context: AtomicBool,
@@ -1013,7 +1013,7 @@ impl SharedCaptureTelemetry {
             .drag_start
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((t_ms, nx, ny, None, start_frame));
+            Some((t_ms, nx, ny, screen_x, screen_y, None, start_frame));
         if self.probing() {
             crate::ax::Prober::shared().probe(crate::ax::Target::Pointer(t_ms), screen_x, screen_y);
         }
@@ -1021,7 +1021,7 @@ impl SharedCaptureTelemetry {
 
     /// A mouse button came up: records the click or drag that `pointer_down` began.
     fn pointer_up(&self, t_ms: u64, screen_x: f64, screen_y: f64, right: bool) {
-        let Some((t0, x0, y0, start_label, start_frame)) = self
+        let Some((t0, x0, y0, start_screen_x, start_screen_y, start_label, start_frame)) = self
             .drag_start
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1049,6 +1049,13 @@ impl SharedCaptureTelemetry {
                 role: None,
             }
         } else {
+            if self.probing() {
+                crate::ax::Prober::shared().probe(
+                    crate::ax::Target::PointerMid(t0),
+                    (start_screen_x + screen_x) / 2.0,
+                    (start_screen_y + screen_y) / 2.0,
+                );
+            }
             InteractionEvent::Drag {
                 t: t0,
                 t1: t_ms,

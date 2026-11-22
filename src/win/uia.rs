@@ -14,8 +14,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_CONTROLTYPE_ID, UIA_CheckBoxControlTypeId, UIA_CustomControlTypeId,
     UIA_DataItemControlTypeId, UIA_GroupControlTypeId, UIA_HyperlinkControlTypeId,
     UIA_ImageControlTypeId, UIA_ListItemControlTypeId, UIA_MenuItemControlTypeId,
-    UIA_RadioButtonControlTypeId, UIA_SplitButtonControlTypeId, UIA_TabItemControlTypeId,
-    UIA_TextControlTypeId, UIA_TreeItemControlTypeId,
+    UIA_RadioButtonControlTypeId, UIA_SliderControlTypeId, UIA_SplitButtonControlTypeId,
+    UIA_TabItemControlTypeId, UIA_TextControlTypeId, UIA_TreeItemControlTypeId,
 };
 
 use crate::ax::{Hit, clip};
@@ -47,6 +47,7 @@ fn is_control(kind: UIA_CONTROLTYPE_ID) -> bool {
         UIA_MenuItemControlTypeId,
         UIA_CheckBoxControlTypeId,
         UIA_RadioButtonControlTypeId,
+        UIA_SliderControlTypeId,
         UIA_TabItemControlTypeId,
         UIA_ListItemControlTypeId,
         UIA_TreeItemControlTypeId,
@@ -80,12 +81,12 @@ pub fn hit_test(x: f64, y: f64, budget: Duration) -> Option<Hit> {
             return None;
         }
         let kind = unsafe { element.CurrentControlType() }.ok()?;
-        // A button's text or icon names the button.
+        // A button's text or SVG icon names the button (up to 3 levels for nested icon/span wrappers).
         if is_part(kind)
             && let Ok(walker) = unsafe { automation.ControlViewWalker() }
         {
             let mut current = element.clone();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if over() {
                     break;
                 }

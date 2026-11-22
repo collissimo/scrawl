@@ -68,6 +68,7 @@ pub enum Detail {
         changed: Option<bool>,
     },
     Text(String),
+    Drag(crate::agent_context::Drag),
     Scroll(Vec<&'static str>),
     Scene,
     Note {
@@ -99,6 +100,8 @@ pub struct Line {
     pub t1: u64,
     /// When the keyframe of this line should be taken.
     pub frame_t: u64,
+    /// Cursor position when the chosen frame anchor is a click burst.
+    pub cursor: Option<[f32; 2]>,
     pub text: String,
     pub actions: Vec<Action>,
     /// Whole sentences with the marks drawn over each (indexes into the capture's marks).
@@ -345,12 +348,12 @@ pub fn fold_actions(
                 detail: Detail::Text(pointed(label.as_deref())),
             }),
             InteractionEvent::Drag { t, t1, .. } => {
-                if let Some(text) = crate::agent_context::drag_line(event) {
+                if let Some(drag) = crate::agent_context::drag_text(event) {
                     actions.push(Action {
                         kind: Kind::Drag,
                         t0: *t,
                         t1: *t1,
-                        detail: Detail::Text(text),
+                        detail: Detail::Drag(drag),
                     });
                 }
             }
@@ -434,11 +437,26 @@ fn attach(sentences: &mut Vec<Sentence>, actions: &[Action]) {
     }
 }
 
+/// A click the screen did not answer (pointing or clearing a selection) ranks below an active drag
+/// so a trailing deselect click never overrides the drag that highlighted what was spoken about.
+fn action_score(action: &Action) -> u32 {
+    match (&action.kind, &action.detail) {
+        (
+            Kind::Clicks,
+            Detail::Clicks {
+                changed: Some(false),
+                ..
+            },
+        ) => 45,
+        _ => action.kind.score(),
+    }
+}
+
 fn score_of(sentence: &Sentence, actions: &[Action]) -> u32 {
     sentence
         .actions
         .iter()
-        .map(|&i| actions[i].kind.score())
+        .map(|&i| action_score(&actions[i]))
         .max()
         .unwrap_or(0)
 }
@@ -480,14 +498,21 @@ fn choose_owners(
 ) -> Vec<bool> {
     let mut owners = vec![false; sentences.len()];
     let count = |owners: &[bool]| owners.iter().filter(|&&o| o).count();
-    let mut ranked: Vec<(usize, u32)> = sentences
+    // Spoken sentences with a deliberate gesture (click, point, drag) outrank silent pause actions
+    // when competing for the base keyframe budget, so a stray click burst in silence never merges
+    // a new spoken instruction back into an earlier moment.
+    let mut ranked: Vec<(usize, bool, u32)> = sentences
         .iter()
         .enumerate()
-        .map(|(i, s)| (i, score_of(s, actions)))
-        .filter(|&(i, score)| score > 0 && !inside[i])
+        .map(|(i, s)| {
+            let score = score_of(s, actions);
+            let spoken_gesture = !s.words.is_empty() && score >= 45;
+            (i, spoken_gesture, score)
+        })
+        .filter(|&(i, _, score)| score > 0 && !inside[i])
         .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    for &(i, score) in &ranked {
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
+    for &(i, _, score) in &ranked {
         if score >= Kind::Mark.score() {
             owners[i] = true;
         }
@@ -521,7 +546,7 @@ fn choose_owners(
             best = None;
         }
     }
-    for &(i, _) in &ranked {
+    for &(i, _, _) in &ranked {
         if count(&owners) >= budget.min(BASE_KEYFRAMES) {
             break;
         }
@@ -534,17 +559,40 @@ fn choose_owners(
     owners
 }
 
-fn frame_time(t0: u64, actions: &[Action], duration_ms: u64) -> u64 {
-    let moment = actions
-        .iter()
-        .rev()
-        .find(|a| a.kind == Kind::Mark)
-        .or_else(|| actions.iter().rev().find(|a| a.kind.score() > 0));
-    match moment {
-        None => t0,
-        Some(a) if a.kind == Kind::Mark => a.t1.min(duration_ms),
-        Some(a) => (a.t1 + SETTLE_MS).min(duration_ms),
+/// The action whose moment a keyframe should capture: the last mark if any, otherwise the
+/// highest-scoring action (tie-broken by latest).
+pub(crate) fn frame_anchor(actions: &[Action]) -> Option<&Action> {
+    if let Some(mark) = actions.iter().rev().find(|a| a.kind == Kind::Mark) {
+        return Some(mark);
     }
+    actions
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| action_score(a) > 0)
+        .max_by_key(|(i, a)| (action_score(a), *i))
+        .map(|(_, a)| a)
+}
+
+fn frame_time(t0: u64, actions: &[Action], duration_ms: u64) -> u64 {
+    let Some(anchor) = frame_anchor(actions) else {
+        return t0;
+    };
+    if anchor.kind == Kind::Mark {
+        return anchor.t1.min(duration_ms);
+    }
+    let settled = (anchor.t1 + SETTLE_MS).min(duration_ms);
+    // Keep a drag's frame before a quick following click clears its highlight.
+    if anchor.kind == Kind::Drag
+        && let Some(next_t) = actions
+            .iter()
+            .filter(|a| a.t0 > anchor.t1 && matches!(a.kind, Kind::Clicks | Kind::Drag))
+            .map(|a| a.t0)
+            .min()
+        && next_t < settled
+    {
+        return anchor.t1.max(next_t.saturating_sub(1)).min(duration_ms);
+    }
+    settled
 }
 
 /// The capture as keyframe lines. `scene_changes` are when the screen changed (without it every
@@ -572,6 +620,7 @@ pub fn build(
             t0: 0,
             t1: duration_ms,
             frame_t: duration_ms / 2,
+            cursor: None,
             text: String::new(),
             actions: Vec::new(),
             sentences: Vec::new(),
@@ -597,12 +646,30 @@ pub fn build(
                 .iter()
                 .flat_map(|s| s.actions.iter().map(|&i| actions[i].clone()))
                 .collect();
+            let spoken_actions: Vec<Action> = group
+                .iter()
+                .filter(|s| !s.words.is_empty())
+                .flat_map(|s| s.actions.iter().map(|&i| actions[i].clone()))
+                .collect();
+            // When a trailing silent action joined a spoken group, anchor on the spoken actions
+            // first so the frame stays on what was shown while speaking rather than jumping into a
+            // later pause or scroll.
+            let anchor_pool = if frame_anchor(&spoken_actions).is_some() {
+                &spoken_actions
+            } else {
+                &line_actions
+            };
+            let cursor = frame_anchor(anchor_pool).and_then(|a| match &a.detail {
+                Detail::Clicks { points, .. } => points.last().copied(),
+                _ => None,
+            });
             let t0 = group[0].t0;
             let words: Vec<String> = group.iter().flat_map(|s| s.words.clone()).collect();
             Line {
                 t0,
                 t1: group.iter().map(|s| s.t1).max().unwrap_or(t0),
-                frame_t: frame_time(t0, &line_actions, duration_ms),
+                frame_t: frame_time(t0, anchor_pool, duration_ms),
+                cursor,
                 text: join(&words),
                 sentences: group
                     .iter()
@@ -648,11 +715,29 @@ pub fn build_for(
 
 /// What was done over a line, as one bracket: `marked, clicked ×2, pointed at “Save”`.
 pub fn describe(actions: &[Action], marks: &[Mark]) -> String {
+    let has_specific = actions.iter().any(|action| match &action.detail {
+        Detail::Mark { mark, flag: false } => marks[*mark]
+            .on
+            .as_deref()
+            .is_some_and(|on| !crate::ax::is_container_target(on)),
+        Detail::Clicks { targets, .. } => targets
+            .iter()
+            .flatten()
+            .any(|t| !crate::ax::is_container_target(t)),
+        Detail::Drag(drag) => drag
+            .name
+            .as_deref()
+            .is_some_and(|n| !crate::ax::is_container_target(n)),
+        Detail::Text(text) if action.kind == Kind::Point => text
+            .strip_prefix("pointed at ")
+            .is_some_and(|t| !crate::ax::is_container_target(t)),
+        _ => false,
+    });
     let mut drawn: Vec<(String, usize)> = Vec::new();
     let mut clicks: Vec<(String, usize)> = Vec::new();
     let mut pointing: Vec<(String, usize)> = Vec::new();
     let mut notes: Vec<(String, usize)> = Vec::new();
-    let mut drags: Vec<String> = Vec::new();
+    let mut drag_groups: Vec<Vec<crate::agent_context::Drag>> = Vec::new();
     let mut directions: Vec<&str> = Vec::new();
     let mut scrolled = false;
     let add = |into: &mut Vec<(String, usize)>, text: String, n: usize| match into
@@ -677,6 +762,13 @@ pub fn describe(actions: &[Action], marks: &[Mark]) -> String {
                 ..
             } => {
                 for target in targets {
+                    if has_specific
+                        && target
+                            .as_deref()
+                            .is_some_and(crate::ax::is_container_target)
+                    {
+                        continue;
+                    }
                     if *changed == Some(false) {
                         add(&mut pointing, pointed(target.as_deref()), 1);
                     } else {
@@ -689,10 +781,26 @@ pub fn describe(actions: &[Action], marks: &[Mark]) -> String {
                 }
             }
             Detail::Text(text) if action.kind == Kind::Point => add(&mut pointing, text.clone(), 1),
-            Detail::Text(text) => {
-                if !drags.contains(text) {
-                    drags.push(text.clone());
+            Detail::Drag(drag) => {
+                if has_specific
+                    && drag
+                        .name
+                        .as_deref()
+                        .is_some_and(crate::ax::is_container_target)
+                {
+                    continue;
                 }
+                if let Some(group) = drag_groups
+                    .iter_mut()
+                    .find(|g| g[0].verb == drag.verb && g[0].name == drag.name)
+                {
+                    group.push(drag.clone());
+                } else {
+                    drag_groups.push(vec![drag.clone()]);
+                }
+            }
+            Detail::Text(text) => {
+                add(&mut pointing, text.clone(), 1);
             }
             Detail::Scroll(ds) => {
                 scrolled = true;
@@ -710,7 +818,11 @@ pub fn describe(actions: &[Action], marks: &[Mark]) -> String {
     parts.extend(drawn.into_iter().map(counted));
     parts.extend(clicks.into_iter().map(counted));
     parts.extend(pointing.into_iter().map(counted));
-    parts.extend(drags);
+    parts.extend(
+        drag_groups
+            .iter()
+            .map(|group| crate::agent_context::format_drag_group(group)),
+    );
     if scrolled {
         parts.push(if directions.is_empty() {
             "scrolled".to_owned()
@@ -1072,7 +1184,7 @@ mod tests {
                 (Kind::Drag, 13_000, 13_400, 0)
             ]
         );
-        assert_eq!(actions[2].detail, Detail::Text("dragged left".into()));
+        assert_eq!(describe(&actions[2..3], &[]), "dragged left");
     }
 
     #[test]
@@ -1430,5 +1542,156 @@ mod tests {
             summary(&lines[0], 0, &[]),
             "- #1 (0:00) [pointed at “Header”] “Das da.”"
         );
+    }
+
+    #[test]
+    fn a_trailing_deselect_click_or_scroll_does_not_steal_the_frame_from_a_drag() {
+        // Drag highlights text at 2..3.8 s, then an empty-space click at 6.4 s clears selection
+        // while the sentence is still finishing.
+        let case = Case {
+            events: &[
+                drag(2_000, 3_800, [0.41, 0.18], [0.25, 0.18], None),
+                named_click(6_400, "main", "#content"),
+            ],
+            scenes: Some(&[]),
+            ..Case::new(
+                say_at("Bitte entferne diesen Text hier.", 500, 1_300),
+                8_000,
+            )
+        };
+        let lines = case.lines();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].frame_t, 4_100);
+        assert_eq!(frame_anchor(&lines[0].actions).unwrap().kind, Kind::Drag);
+
+        // When a click follows within SETTLE_MS, clamp the frame just before the click.
+        let quick = Case {
+            events: &[
+                drag(
+                    4_000,
+                    4_300,
+                    [0.67, 0.43],
+                    [0.71, 0.43],
+                    Some("text “Days”"),
+                ),
+                click(4_500, 0.66, 0.43),
+            ],
+            scenes: Some(&[]),
+            ..Case::new(say("Hier in Tagen.", 3_500), 6_000)
+        };
+        assert_eq!(quick.lines()[0].frame_t, 4_499);
+
+        // Trailing scroll after an interactive click keeps the click's settled frame.
+        let scrolled = Case {
+            events: &[
+                named_click(2_000, "toggle button", "Active"),
+                InteractionEvent::Scroll {
+                    t: 3_500,
+                    x: 0.25,
+                    y: 0.45,
+                    dx: 0.0,
+                    dy: -1.0,
+                    label: None,
+                },
+            ],
+            scenes: Some(&[2_200]),
+            ..Case::new(say("Dieses Icon hier weg.", 1_000), 5_000)
+        };
+        assert_eq!(scrolled.lines()[0].frame_t, 2_300);
+        assert_eq!(
+            frame_anchor(&scrolled.lines()[0].actions).unwrap().kind,
+            Kind::Clicks
+        );
+    }
+
+    #[test]
+    fn back_and_forth_drags_collapse_and_container_noise_drops_beside_specific_targets() {
+        let case = Case {
+            events: &[
+                named_click(1_000, "main", "#content"),
+                named_click(1_500, "text", "Short hint text"),
+                named_click(2_000, "region", "Top section"),
+                drag(2_200, 2_500, [0.4, 0.2], [0.2, 0.2], Some("main #content")),
+                drag(
+                    2_600,
+                    2_900,
+                    [0.4, 0.16],
+                    [0.25, 0.16],
+                    Some("heading “Best picks” #title"),
+                ),
+                drag(
+                    3_000,
+                    3_300,
+                    [0.25, 0.16],
+                    [0.4, 0.16],
+                    Some("heading “Best picks” #title"),
+                ),
+            ],
+            scenes: Some(&[]),
+            ..Case::new(say("Diesen Text hier ändern.", 500), 5_000)
+        };
+        let text = case.text();
+        assert_eq!(
+            text,
+            [
+                "- #1 (0:03) [pointed at text “Short hint text”, dragged heading “Best picks” #title back and forth ×2] “Diesen Text hier ändern.”"
+            ]
+        );
+
+        // When only a container was hit, keep it rather than dropping everything.
+        let container_only = Case {
+            events: &[named_click(1_000, "main", "#content")],
+            scenes: Some(&[]),
+            ..Case::new(say("Hier.", 500), 3_000)
+        };
+        assert_eq!(
+            container_only.text(),
+            ["- #1 (0:01) [pointed at main “#content”] “Hier.”"]
+        );
+    }
+
+    #[test]
+    fn a_silent_click_burst_does_not_steal_a_keyframe_from_a_spoken_drag() {
+        let mut words = Vec::new();
+        let mut events = Vec::new();
+        // Five spoken sentences with drags, a silent click burst after #5, then spoken #6 with a drag.
+        for i in 0..5u64 {
+            let start = i * 5_000 + 500;
+            words.extend(say_at("Das hier bitte ändern.", start, 300));
+            events.push(drag(
+                start + 300,
+                start + 900,
+                [0.4, 0.2],
+                [0.2, 0.2],
+                Some("text “Row”"),
+            ));
+        }
+        // Silent toggle click in the gap (> ATTACH_MS from #5 and #6) that changes the screen.
+        events.push(named_click(26_000, "toggle button", "Active"));
+        let last_start = 32_000;
+        words.extend(say_at(
+            "Und die Überschrift hier ersetzen.",
+            last_start,
+            300,
+        ));
+        events.push(drag(
+            last_start + 400,
+            last_start + 1_100,
+            [0.42, 0.16],
+            [0.25, 0.16],
+            Some("heading “Title”"),
+        ));
+        let case = Case {
+            events: &events,
+            scenes: Some(&[26_200]),
+            ..Case::new(words, 36_000)
+        };
+        let lines = case.lines();
+        assert_eq!(lines.len(), BASE_KEYFRAMES);
+        // #5 keeps its spoken drag's frame rather than jumping into the merged silent click at 26 s.
+        assert_eq!(lines[4].frame_t, 20_500 + 900 + SETTLE_MS);
+        let last = lines.last().unwrap();
+        assert_eq!(last.text, "Und die Überschrift hier ersetzen.");
+        assert_eq!(last.frame_t, last_start + 1_100 + SETTLE_MS);
     }
 }

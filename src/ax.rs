@@ -39,7 +39,7 @@ unsafe extern "C" {
 }
 
 /// Longest label, identifier or file name kept.
-const MAX_CHARS: usize = 60;
+const MAX_CHARS: usize = 120;
 
 /// Each Accessibility message to an app gives up after this.
 #[cfg(target_os = "macos")]
@@ -303,11 +303,49 @@ pub(crate) fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Roles that name a broad container rather than a specific control or text run.
+const CONTAINER_ROLES: &[&str] = &[
+    "web area",
+    "scroll area",
+    "main",
+    "region",
+    "document",
+    "pane",
+    "group",
+    "window",
+    "section",
+    "generic",
+    "element",
+    "custom",
+];
+
+pub(crate) fn is_container_role(role: &str) -> bool {
+    let lower = role.trim().to_ascii_lowercase();
+    CONTAINER_ROLES.contains(&lower.as_str())
+}
+
+/// Whether a formatted target (`main #inhalt`, `region “Title”`) is only a generic container.
+pub(crate) fn is_container_target(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    CONTAINER_ROLES.iter().any(|&role| {
+        lower == role
+            || lower
+                .strip_prefix(role)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
 /// What a lookup was for, so its result can be put on the right click or stroke at finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     /// The click or drag that began at this capture time.
     Pointer(u64),
+    /// The midpoint of a drag that began at this capture time (catches drags started in a margin).
+    PointerMid(u64),
     /// The stroke that began at this capture time.
     Stroke(u64),
 }
@@ -414,7 +452,25 @@ pub fn apply(
                 }
             }
             InteractionEvent::Drag { t, label, .. } => {
-                if let Some(text) = hits.get(&Target::Pointer(*t)).and_then(Hit::on_text) {
+                let start = hits.get(&Target::Pointer(*t));
+                let mid = hits.get(&Target::PointerMid(*t));
+                let start_text = start.and_then(Hit::on_text);
+                let mid_text = mid.and_then(Hit::on_text);
+                let start_specific =
+                    start.is_some_and(|h| !is_container_role(&h.role) && start_text.is_some());
+                let mid_specific =
+                    mid.is_some_and(|h| !is_container_role(&h.role) && mid_text.is_some());
+                // Keep a specific start control (e.g. a slider or list item), but when a drag
+                // started in empty margin or on a broad landmark container, prefer the midpoint
+                // over what the drag actually crossed.
+                let chosen = if start_specific {
+                    start_text
+                } else if mid_specific {
+                    mid_text
+                } else {
+                    start_text.or(mid_text)
+                };
+                if let Some(text) = chosen {
                     *label = Some(text);
                 }
             }
@@ -618,5 +674,93 @@ mod tests {
             (x - 300.0).abs() < 0.5 && (y - 250.0).abs() < 0.5,
             "{x} {y}"
         );
+    }
+
+    #[test]
+    fn drags_started_in_margin_or_container_fall_back_to_midpoint_hit() {
+        let mut hits = HashMap::new();
+        // Drag 1: started in unlabeled margin, midpoint hit the text run.
+        hits.insert(
+            Target::Pointer(100),
+            Hit {
+                role: "group".into(),
+                ..Hit::default()
+            },
+        );
+        hits.insert(
+            Target::PointerMid(100),
+            Hit {
+                role: "text".into(),
+                label: Some("Subtitle to remove".into()),
+                ..Hit::default()
+            },
+        );
+        // Drag 2: started on generic landmark `main #content`, midpoint hit specific text.
+        hits.insert(
+            Target::Pointer(200),
+            Hit {
+                role: "main".into(),
+                identifier: Some("content".into()),
+                ..Hit::default()
+            },
+        );
+        hits.insert(
+            Target::PointerMid(200),
+            Hit {
+                role: "text".into(),
+                label: Some("Detailed note that stays readable".into()),
+                ..Hit::default()
+            },
+        );
+        // Drag 3: started on a specific slider control, midpoint wandered onto a generic pane.
+        hits.insert(
+            Target::Pointer(300),
+            Hit {
+                role: "slider".into(),
+                label: Some("Volume".into()),
+                ..Hit::default()
+            },
+        );
+        hits.insert(
+            Target::PointerMid(300),
+            Hit {
+                role: "pane".into(),
+                label: Some("Window".into()),
+                ..Hit::default()
+            },
+        );
+        let drag = |t| InteractionEvent::Drag {
+            t,
+            t1: t + 200,
+            x0: 0.4,
+            y0: 0.2,
+            x1: 0.2,
+            y1: 0.2,
+            label: None,
+            button: None,
+            path: Vec::new(),
+        };
+        let mut events = vec![drag(100), drag(200), drag(300)];
+        apply(&hits, &mut events, &mut []);
+        let labels: Vec<Option<&str>> = events
+            .iter()
+            .map(|e| match e {
+                InteractionEvent::Drag { label, .. } => label.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                Some("text “Subtitle to remove”"),
+                Some("text “Detailed note that stays readable”"),
+                Some("slider “Volume”"),
+            ]
+        );
+        assert!(is_container_target("main #content"));
+        assert!(is_container_target("region “Overview”"));
+        assert!(is_container_target("web area “Home”"));
+        assert!(!is_container_target("text “Hello”"));
+        assert!(!is_container_target("toggle button “Active”"));
     }
 }

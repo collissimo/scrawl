@@ -385,7 +385,10 @@ pub fn annotate_keyframe_marks_in_place(
     for stroke in strokes.iter().filter(|s| s.laser) {
         draw_laser(frame, stroke, keyframe.t);
     }
-    // Phone swipes that ended just before this moment (or produced it) leave a trail.
+    // Phone swipes and desktop mouse drags active at this moment leave a subtle trail so text
+    // selections and pointing drags stay visible even when the app shows no highlight.
+    let mut drew_desktop_drag = false;
+    let mut drag_points: Vec<[f32; 2]> = Vec::new();
     for event in events {
         if let InteractionEvent::Drag {
             t,
@@ -398,17 +401,25 @@ pub fn annotate_keyframe_marks_in_place(
             button,
             label,
         } = event
-            && button.as_deref() == Some("touch")
             && !is_long_press(label.as_deref())
             && *t <= keyframe.t
-            && keyframe.t.saturating_sub(*t1) <= 900
+            && (x1 - x0).hypot(y1 - y0) > 0.0
         {
-            let points: Vec<[f32; 2]> = if path.len() >= 2 {
-                path.iter().map(|[x, y]| [x * w, y * h]).collect()
-            } else {
-                vec![[x0 * w, y0 * h], [x1 * w, y1 * h]]
-            };
-            draw_touch_trail(frame, &points, k);
+            let is_touch = button.as_deref() == Some("touch");
+            let window = if is_touch { 900 } else { 1_500 };
+            if keyframe.t.saturating_sub(*t1) <= window {
+                let points: Vec<[f32; 2]> = if path.len() >= 2 {
+                    path.iter().map(|[x, y]| [x * w, y * h]).collect()
+                } else {
+                    vec![[x0 * w, y0 * h], [x1 * w, y1 * h]]
+                };
+                draw_touch_trail(frame, &points, k);
+                drag_points.push([*x0, *y0]);
+                drag_points.push([*x1, *y1]);
+                if !is_touch {
+                    drew_desktop_drag = true;
+                }
+            }
         }
     }
     let click = events
@@ -434,11 +445,12 @@ pub fn annotate_keyframe_marks_in_place(
         })
         .min_by_key(|(delta, _)| *delta)
         .map(|(_, point)| point);
-    if let Some([cx, cy]) = keyframe
-        .cursor
-        .or(click)
-        .filter(|p| p.iter().all(|v| v.is_finite()))
-    {
+    let ripple_pt = if drew_desktop_drag {
+        keyframe.cursor
+    } else {
+        keyframe.cursor.or(click)
+    };
+    if let Some([cx, cy]) = ripple_pt.filter(|p| p.iter().all(|v| v.is_finite())) {
         let show_ripple = keyframe.reason == KeyframeReason::Click
             || (click.is_some() && keyframe.reason != KeyframeReason::Laser);
         if show_ripple {
@@ -448,7 +460,7 @@ pub fn annotate_keyframe_marks_in_place(
 
     let in_top_left = |[x, y]: [f32; 2]| x < 0.30 && y < 0.18;
     let in_top_right = |[x, y]: [f32; 2]| x > 0.70 && y < 0.18;
-    let focus_pt = keyframe.cursor.or(click);
+    let focus_pt = ripple_pt;
     let stroke_in_tl = strokes.iter().enumerate().any(|(idx, s)| {
         !s.laser
             && (shown.iter().any(|m| m.strokes.contains(&idx))
@@ -459,8 +471,10 @@ pub fn annotate_keyframe_marks_in_place(
                 .into_iter()
                 .any(|(x, y, t)| t <= keyframe.t && in_top_left([x, y]))
     });
-    let busy_top_left = focus_pt.is_some_and(in_top_left) || stroke_in_tl;
-    let busy_top_right = focus_pt.is_some_and(in_top_right);
+    let drag_in_tl = drag_points.iter().copied().any(in_top_left);
+    let drag_in_tr = drag_points.iter().copied().any(in_top_right);
+    let busy_top_left = focus_pt.is_some_and(in_top_left) || stroke_in_tl || drag_in_tl;
+    let busy_top_right = focus_pt.is_some_and(in_top_right) || drag_in_tr;
     frame.badge_top_right = busy_top_left && !busy_top_right;
 }
 
@@ -1871,6 +1885,54 @@ mod tests {
         later.t = 6000;
         let stale = render_annotated_keyframe(&base, &later, &[], &[], &[swipe]);
         assert_eq!(blue(&stale), 0, "an old swipe should not be drawn");
+    }
+
+    #[test]
+    fn desktop_mouse_drags_leave_a_trail_without_drawing_nearby_deselect_click() {
+        let base = solid(1280, 800, [240, 240, 240, 255]);
+        let drag = InteractionEvent::Drag {
+            t: 2_000,
+            t1: 3_400,
+            x0: 0.45,
+            y0: 0.25,
+            x1: 0.25,
+            y1: 0.25,
+            label: None,
+            button: None,
+            path: Vec::new(),
+        };
+        // A nearby deselect click at (0.1, 0.7) should not get a ripple on a drag keyframe.
+        let deselect = InteractionEvent::Click {
+            t: 3_900,
+            x: 0.1,
+            y: 0.7,
+            button: Some("left".into()),
+            label: None,
+            role: None,
+        };
+        let mut kf = key(1);
+        kf.t = 3_600;
+        kf.reason = KeyframeReason::Click;
+        kf.cursor = None;
+        let after = render_annotated_keyframe(&base, &kf, &[], &[], &[drag, deselect]);
+        let blue_in = |x0: usize, y0: usize, x1: usize, y1: usize| {
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let i = (y * 1280 + x) * 4;
+                    after.rgba[i + 2] > 200 && after.rgba[i] < 120
+                })
+                .count()
+        };
+        assert!(
+            blue_in(300, 180, 600, 220) > 200,
+            "desktop drag trail missing"
+        );
+        assert_eq!(
+            blue_in(100, 530, 160, 590),
+            0,
+            "nearby deselect click should not draw a ripple on a drag keyframe"
+        );
     }
 
     /// A click is marked by a thin ring and a small dot: what was clicked stays visible.
